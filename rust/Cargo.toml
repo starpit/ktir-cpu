@@ -59,3 +59,10 @@ path = "src/lib.rs"
 # manifest.json. Does not affect the dependency-free default library build.
 [dev-dependencies]
 serde_json = "1"
+
+# Profiling target for the real-model run (cargo instruments -t time --bench
+# smollm2_bench). A plain `fn main` (no libtest harness) so the profiler sees the
+# model loop directly. Skips when the bundle is absent.
+[[bench]]
+name = "smollm2_bench"
+harness = false

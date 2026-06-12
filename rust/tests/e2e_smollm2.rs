@@ -65,6 +65,16 @@ fn smollm2_135m_runs_end_to_end() {
         }
     }
 
+    // The attention mask (`attn_mask` in the manifest) is a runtime input — not
+    // a source weight and not produced by any node, so it has no `t{id}.bin`.
+    // For single-token decode at `decode_position`, the query attends to every
+    // key 0..=decode_position (full causal visibility), so the additive mask is
+    // all zeros. `scratchy-target-spyre` supplies this same buffer in production.
+    if let Some(mask_id) = manifest["attn_mask"].as_u64() {
+        let (r, c, _) = shape[&mask_id];
+        buf.insert(mask_id, vec![0.0f32; r * c]);
+    }
+
     let nodes = manifest["nodes"].as_array().unwrap();
     let n_nodes = nodes.len();
     let mut cache: HashMap<String, ktir_cpu::ir::IRModule> = HashMap::new();
