@@ -51,9 +51,12 @@ pub enum MatmulTier {
     Nax,
 }
 
-/// The highest tier whose kernel codegen is implemented today. Rises to
-/// `Simdgroup` then `Nax` as those kernel slices (+ the Metal 4 runtime) land;
-/// until then the tiered selection degrades to the naive floor.
+/// The highest tier whose kernel codegen is wired into the matmul *dispatch*
+/// today. The validated NAX core (`run_nax_matmul_tile`, a single 16×32×16
+/// `mpp::tensor_ops::matmul2d` tile that matches the oracle exactly on the M5)
+/// exists but isn't yet a general tiled GEMM, so the dispatch floor stays
+/// `Naive`. Rises to `Simdgroup`/`Nax` once each tier's tiler lands; until then
+/// the tiered selection degrades to the naive floor.
 pub const HIGHEST_IMPLEMENTED: MatmulTier = MatmulTier::Naive;
 
 /// The matmul tier a Metal device *supports*, parsed from its name (mirrors
@@ -386,10 +389,292 @@ pub fn run_kernel(
     Ok(crate::codec::decode(&raw, out_len, out_dtype))
 }
 
+/// Compile MSL source as **Metal 4** (`MTLLanguageVersion::Version4_0`,
+/// `MathMode::Safe`) — the options Metal Performance Primitives (`mpp::tensor_ops`,
+/// the M5 NAX path) require. Compiled from source at runtime because the offline
+/// `xcrun metal` toolchain miscompiles MPP (per scratchy's findings). Returns
+/// `Ok(())` if the source compiles on the system device, else the compiler error.
+pub fn compile_metal4(source: &str) -> Result<(), String> {
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLMathMode,
+    };
+
+    let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    opts.setMathMode(MTLMathMode::Safe);
+    opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    device
+        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+// =========================================================================
+// NAX (M5 Neural Accelerator) single-tile GEMM
+// =========================================================================
+//
+// The M5's matmul tier. One simdgroup computes a fixed 16×32×16 output tile
+// with `mpp::tensor_ops::matmul2d` — the Metal Performance Primitives op that
+// dispatches to the NAX tensor engine. This is the irreducible NAX unit; a
+// general GEMM tiles the problem into these (a later slice). It exists now to
+// prove the engine produces correct results through our runtime and to measure
+// the speedup, gating whether `HIGHEST_IMPLEMENTED` can rise to `Nax`.
+//
+// Inputs/outputs are host `f32` (row-major); A and B are converted to `bfloat`
+// in threadgroup memory inside the shader, so the host never touches bf16. The
+// op runs with `transpose_b`, so B (logical K×N) is consumed as its transpose
+// Bᵀ (N×K) — the fill loop transposes while converting.
+
+/// Fixed NAX tile dims: `C[M×N] = A[M×K] · B[K×N]`.
+pub const NAX_TILE_M: usize = 16;
+pub const NAX_TILE_N: usize = 32;
+pub const NAX_TILE_K: usize = 16;
+
+/// MSL for the single-tile NAX GEMM (pure MPP, no external headers): cooperative
+/// fill of threadgroup A/B → load into `matmul2d` register cooperative tensors
+/// via the BaseNAXFrag lane layout → `run` → store with the same layout. Mirrors
+/// scratchy's proven register-fragment `mma` (the metal::tensor `run` overload
+/// has a different, unvalidated output layout — see the kernel body).
+const NAX_MATMUL_TILE_SRC: &str = "\
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#include <metal_tensor>
+using namespace metal;
+
+// C[16x32] = A[16x16] . B[16x32], all row-major device float.
+[[kernel]] void nax_matmul_tile(
+    device const float* a_in [[buffer(0)]],   // M x K = 16 x 16
+    device const float* b_in [[buffer(1)]],   // K x N = 16 x 32
+    device float* c_out      [[buffer(2)]],   // M x N = 16 x 32
+    uint lid [[thread_index_in_simdgroup]])
+{
+    threadgroup bfloat a_tg[16 * 16];   // [M, K] row-major
+    threadgroup bfloat b_tg[32 * 16];   // [N, K] = transpose(B), row-major
+    // Cooperative fill across the 32 simdgroup lanes.
+    for (uint i = lid; i < 16u * 16u; i += 32u) {
+        a_tg[i] = bfloat(a_in[i]);                  // A[m,k] at m*16+k
+    }
+    for (uint i = lid; i < 32u * 16u; i += 32u) {
+        uint n = i / 16u;                           // 0..31
+        uint k = i % 16u;                           // 0..15
+        b_tg[n * 16u + k] = bfloat(b_in[k * 32u + n]);   // Bt[n,k] = B[k,n]
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16,
+        /*transpose_a=*/false, /*transpose_b=*/true, /*relaxed_precision=*/false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+    // Register-fragment path (scratchy's proven `mma`): load A and B into the
+    // input cooperative tensors via the validated BaseNAXFrag lane layout, run,
+    // and store the destination with the SAME layout — internally consistent,
+    // unlike the metal::tensor `run` overload whose output layout differs.
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_c = gemm_op.template
+        get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+
+    // BaseNAXFrag lane→coord: within a 16x16 fragment, lane L element e maps to
+    // (row fm + (e>>2)*8, col fn + e%4). N=32/M-as-two-frags pack as [.., 8+..].
+    const short qid = (short)lid >> 2;
+    const short fm = (qid & 4) | (((short)lid >> 1) & 3);
+    const short fn = ((qid & 2) | ((short)lid & 1)) * 4;
+
+    for (short e = 0; e < 8; ++e) {
+        short r = fm + (e >> 2) * 8;
+        short c = fn + (e % 4);
+        ct_a[e] = a_tg[r * 16 + c];               // A[M,K], 1 fragment
+        ct_b[e]     = b_tg[r * 16 + c];           // B[N,K] n-frag 0 (n 0..15)
+        ct_b[8 + e] = b_tg[(r + 16) * 16 + c];    // B[N,K] n-frag 1 (n 16..31)
+        ct_c[e] = 0.0f;
+        ct_c[8 + e] = 0.0f;
+    }
+
+    gemm_op.run(ct_a, ct_b, ct_c);
+
+    for (short e = 0; e < 8; ++e) {
+        short r = fm + (e >> 2) * 8;
+        short c = fn + (e % 4);
+        c_out[r * 32 + c]      = ct_c[e];         // C[M,N] n 0..15
+        c_out[r * 32 + c + 16] = ct_c[8 + e];     // C[M,N] n 16..31
+    }
+}
+";
+
+/// Run one NAX tile: `C[16×32] = A[16×16] · B[16×32]` on the M5 tensor engine.
+/// `a` is row-major 16×16, `b` is row-major 16×32; returns row-major 16×32.
+/// `Err("no Metal device …")` when no GPU is available, so callers can skip.
+pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+        MTLResourceOptions, MTLSize,
+    };
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    assert_eq!(a.len(), NAX_TILE_M * NAX_TILE_K, "A must be 16×16");
+    assert_eq!(b.len(), NAX_TILE_K * NAX_TILE_N, "B must be 16×32");
+    let out_len = NAX_TILE_M * NAX_TILE_N;
+
+    let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    opts.setMathMode(MTLMathMode::Safe);
+    opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    let library = device
+        .newLibraryWithSource_options_error(&NSString::from_str(NAX_MATMUL_TILE_SRC), Some(&opts))
+        .map_err(|e| format!("metal: NAX MSL compile failed: {e:?}"))?;
+    let function = library
+        .newFunctionWithName(&NSString::from_str("nax_matmul_tile"))
+        .ok_or("metal: kernel nax_matmul_tile not found")?;
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
+    let queue = device.newCommandQueue().ok_or("metal: newCommandQueue returned nil")?;
+
+    let res = MTLResourceOptions::StorageModeShared;
+    let mk_in = |data: &[f32]| -> Result<_, String> {
+        let bytes: &[u8] = bytemuck_cast(data);
+        // SAFETY: `bytes` lives until the copy completes inside this call.
+        unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                    bytes.len(),
+                    res,
+                )
+                .ok_or_else(|| "metal: input buffer alloc failed".to_string())
+        }
+    };
+    let a_buf = mk_in(a)?;
+    let b_buf = mk_in(b)?;
+    let c_buf = device
+        .newBufferWithLength_options(out_len * 4, res)
+        .ok_or("metal: output buffer alloc failed")?;
+
+    let cb = queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+    let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
+    enc.setComputePipelineState(&pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
+    }
+    // One simdgroup (32 threads), one threadgroup.
+    enc.dispatchThreads_threadsPerThreadgroup(
+        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize { width: 32, height: 1, depth: 1 },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    let raw = unsafe {
+        std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len)
+    };
+    Ok(raw.to_vec())
+}
+
+/// Reinterpret an `&[f32]` as bytes without a dependency. (The runtime copies
+/// it immediately into a Metal buffer.)
+fn bytemuck_cast(data: &[f32]) -> &[u8] {
+    // SAFETY: f32 is plain-old-data; the returned slice covers exactly the same
+    // bytes and borrows for the same lifetime.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::parse_module;
+
+    /// Minimal Metal Performance Primitives probe — confirms the M5 NAX
+    /// toolchain (`mpp::tensor_ops::matmul2d` + the MPP framework include)
+    /// compiles through our `objc2-metal` runtime as Metal 4.
+    const MPP_PROBE: &str = "\
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+kernel void mpp_probe(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 16, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    (void)op;
+    c[gid.y * 16 + gid.x] = a[gid.x] + b[gid.y];
+}
+";
+
+    #[test]
+    fn mpp_tensor_ops_compiles_as_metal4() {
+        match compile_metal4(MPP_PROBE) {
+            Ok(()) => eprintln!("MPP (mpp::tensor_ops) compiles as Metal 4 on this device ✓"),
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("no Metal device — skipping MPP compile probe");
+            }
+            Err(e) => panic!("MPP shader failed to compile as Metal 4:\n{e}"),
+        }
+    }
+
+    /// The NAX tensor engine produces a correct GEMM through our runtime.
+    /// Small-integer inputs (exact in bf16) let us assert *exact* equality with
+    /// the naive oracle. Two identity probes pin the fragment layout: with
+    /// A = I, `B[k,n] = n` must yield `C[m,n] = n` (column mapping) and
+    /// `B[k,n] = k` must yield `C[m,n] = m` (row mapping) — together these catch
+    /// any cooperative-tensor axis swap or scramble in the BaseNAXFrag layout.
+    #[test]
+    fn nax_matmul_tile_matches_oracle() {
+        // A[m,k] = (m + k) % 3, B[k,n] = (k + 2*n) % 4  — products ≤ 6, sums
+        // over K=16 ≤ 96: all exact in bf16 and f32, and distinct per (m,n).
+        let a: Vec<f32> =
+            (0..NAX_TILE_M * NAX_TILE_K).map(|i| ((i / 16 + i % 16) % 3) as f32).collect();
+        let b: Vec<f32> = (0..NAX_TILE_K * NAX_TILE_N)
+            .map(|i| ((i / 32 + 2 * (i % 32)) % 4) as f32)
+            .collect();
+
+        let got = match run_nax_matmul_tile(&a, &b) {
+            Ok(v) => v,
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("no Metal device — skipping NAX matmul test");
+                return;
+            }
+            Err(e) => panic!("NAX matmul failed: {e}"),
+        };
+        let want = crate::blas::naive_sgemm(NAX_TILE_M, NAX_TILE_K, NAX_TILE_N, &a, &b);
+        assert_eq!(got, want, "NAX tile must match the naive oracle exactly");
+
+        // Identity probes — A = I; column then row coordinate.
+        let mut ai = vec![0.0f32; NAX_TILE_M * NAX_TILE_K];
+        for d in 0..NAX_TILE_M {
+            ai[d * NAX_TILE_K + d] = 1.0;
+        }
+        let col_probe = run_nax_matmul_tile(
+            &ai,
+            &(0..NAX_TILE_K * NAX_TILE_N).map(|i| (i % NAX_TILE_N) as f32).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let row_probe = run_nax_matmul_tile(
+            &ai,
+            &(0..NAX_TILE_K * NAX_TILE_N).map(|i| (i / NAX_TILE_N) as f32).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for m in 0..NAX_TILE_M {
+            for n in 0..NAX_TILE_N {
+                assert_eq!(col_probe[m * NAX_TILE_N + n], n as f32, "column map at ({m},{n})");
+                assert_eq!(row_probe[m * NAX_TILE_N + n], m as f32, "row map at ({m},{n})");
+            }
+        }
+        eprintln!("NAX matmul2d tile matches the oracle exactly (+ row/col layout) ✓");
+    }
 
     #[test]
     fn lowers_vector_add_to_msl() {
