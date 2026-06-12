@@ -66,7 +66,11 @@ pub fn register(d: &mut Dispatch) {
     // LC.COMPUTE_MATMUL); map both onto ComputeFloat, the closest present
     // variant. reduce is LC.ZERO (cost lives in its region's ops).
     d.register("linalg.matmul", LatencyCategory::ComputeFloat, matmul);
-    d.register("linalg.batch_matmul", LatencyCategory::ComputeFloat, batch_matmul);
+    d.register(
+        "linalg.batch_matmul",
+        LatencyCategory::ComputeFloat,
+        batch_matmul,
+    );
     d.register("linalg.generic", LatencyCategory::ComputeFloat, generic);
     d.register("linalg.reduce", LatencyCategory::Zero, reduce);
     d.register("linalg.transpose", LatencyCategory::Zero, transpose);
@@ -75,12 +79,24 @@ pub fn register(d: &mut Dispatch) {
     d.register("linalg.index", LatencyCategory::Zero, index);
     d.register("linalg.yield", LatencyCategory::Zero, yield_op);
     // Elementwise named ops: `linalg.add/sub/mul/div/max/min ins(%a, %b) outs(%c)`.
-    d.register("linalg.add", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a + b));
-    d.register("linalg.sub", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a - b));
-    d.register("linalg.mul", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a * b));
-    d.register("linalg.div", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a / b));
-    d.register("linalg.max", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, f32::max));
-    d.register("linalg.min", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, f32::min));
+    d.register("linalg.add", LatencyCategory::ComputeFloat, |o, c, _| {
+        elementwise(o, c, |a, b| a + b)
+    });
+    d.register("linalg.sub", LatencyCategory::ComputeFloat, |o, c, _| {
+        elementwise(o, c, |a, b| a - b)
+    });
+    d.register("linalg.mul", LatencyCategory::ComputeFloat, |o, c, _| {
+        elementwise(o, c, |a, b| a * b)
+    });
+    d.register("linalg.div", LatencyCategory::ComputeFloat, |o, c, _| {
+        elementwise(o, c, |a, b| a / b)
+    });
+    d.register("linalg.max", LatencyCategory::ComputeFloat, |o, c, _| {
+        elementwise(o, c, f32::max)
+    });
+    d.register("linalg.min", LatencyCategory::ComputeFloat, |o, c, _| {
+        elementwise(o, c, f32::min)
+    });
 }
 
 /// `%r = linalg.<op> ins(%a, %b) outs(%c)` — element-wise binary named op over
@@ -99,8 +115,17 @@ fn elementwise(
             op.op_type, a.shape, b.shape
         ));
     }
-    let data: Vec<f32> = a.data.iter().zip(b.data.iter()).map(|(&x, &y)| f(x, y)).collect();
-    Ok(Some(Value::Tile(Tile::compute(data, a.dtype, a.shape.clone()))))
+    let data: Vec<f32> = a
+        .data
+        .iter()
+        .zip(b.data.iter())
+        .map(|(&x, &y)| f(x, y))
+        .collect();
+    Ok(Some(Value::Tile(Tile::compute(
+        data,
+        a.dtype,
+        a.shape.clone(),
+    ))))
 }
 
 // ===========================================================================
@@ -108,19 +133,31 @@ fn elementwise(
 // ===========================================================================
 
 /// `%r = linalg.fill ins(%scalar) outs(%init)` — fill a tile with a scalar.
-fn fill(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn fill(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let scalar = ctx.get_value(&op.operands[0])?;
     let scalar_val = as_f32(scalar, "linalg.fill scalar")?;
     let out = expect_tile(ctx.get_value(&op.operands[1])?, "linalg.fill outs")?;
     let data = vec![scalar_val; out.data.len()];
-    Ok(Some(Value::Tile(Tile::compute(data, out.dtype, out.shape.clone()))))
+    Ok(Some(Value::Tile(Tile::compute(
+        data,
+        out.dtype,
+        out.shape.clone(),
+    ))))
 }
 
 /// `%r = linalg.broadcast ins(%x) outs(%init) dimensions = [...]`.
 ///
 /// Expands `dimensions` on the input then broadcasts to the outs shape. Mirrors
 /// `np.expand_dims` over sorted dims followed by `np.broadcast_to`.
-fn broadcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn broadcast(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let inp = expect_tile(ctx.get_value(&op.operands[0])?, "linalg.broadcast ins")?.clone();
     let out = expect_tile(ctx.get_value(&op.operands[1])?, "linalg.broadcast outs")?;
     let out_shape = out.shape.clone();
@@ -135,7 +172,9 @@ fn broadcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resu
     for &d in &dims {
         let d = d as usize;
         if d > shape.len() {
-            return Err(format!("linalg.broadcast: dim {d} out of range for shape {shape:?}"));
+            return Err(format!(
+                "linalg.broadcast: dim {d} out of range for shape {shape:?}"
+            ));
         }
         shape.insert(d, 1);
     }
@@ -146,7 +185,11 @@ fn broadcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resu
 }
 
 /// `%r = linalg.transpose ins(%x) outs(%y) permutation = [...]`.
-fn transpose(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn transpose(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let inp = expect_tile(ctx.get_value(&op.operands[0])?, "linalg.transpose ins")?.clone();
     let perm = int_list_attr(op, "permutation")
         .ok_or("linalg.transpose: missing permutation attribute")?
@@ -183,30 +226,42 @@ fn transpose(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resu
 // ===========================================================================
 
 /// `%r = linalg.matmul ins(%A, %B) outs(%C)` -> `C + A @ B`.
-fn matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn matmul(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let a = expect_tile(ctx.get_value(&op.operands[0])?, "linalg.matmul A")?.clone();
     let b = expect_tile(ctx.get_value(&op.operands[1])?, "linalg.matmul B")?.clone();
     let mut result = matmul2d(&a, &b)?;
 
     // Accumulate into outs (operands[2] = C) when present: result = C + A@B.
     if op.operands.len() > 2
-        && let Value::Tile(c) = ctx.get_value(&op.operands[2])? {
-            if c.shape != result.shape {
-                return Err(format!(
-                    "linalg.matmul: outs shape {:?} != A@B shape {:?}",
-                    c.shape, result.shape
-                ));
-            }
-            for (r, &cv) in std::rc::Rc::make_mut(&mut result.data).iter_mut().zip(c.data.iter()) {
-                *r += cv;
-            }
-            result.dtype = c.dtype;
+        && let Value::Tile(c) = ctx.get_value(&op.operands[2])?
+    {
+        if c.shape != result.shape {
+            return Err(format!(
+                "linalg.matmul: outs shape {:?} != A@B shape {:?}",
+                c.shape, result.shape
+            ));
         }
+        for (r, &cv) in std::rc::Rc::make_mut(&mut result.data)
+            .iter_mut()
+            .zip(c.data.iter())
+        {
+            *r += cv;
+        }
+        result.dtype = c.dtype;
+    }
     Ok(Some(Value::Tile(result)))
 }
 
 /// `%r = linalg.batch_matmul ins(%A, %B) outs(%C)` over the leading batch dim.
-fn batch_matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn batch_matmul(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let a = expect_tile(ctx.get_value(&op.operands[0])?, "linalg.batch_matmul A")?.clone();
     let b = expect_tile(ctx.get_value(&op.operands[1])?, "linalg.batch_matmul B")?.clone();
     if a.shape.len() != 3 || b.shape.len() != 3 {
@@ -233,12 +288,16 @@ fn batch_matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> R
     let mut result = Tile::compute(data, a.dtype, vec![batch, m, n]);
 
     if op.operands.len() > 2
-        && let Value::Tile(c) = ctx.get_value(&op.operands[2])? {
-            for (r, &cv) in std::rc::Rc::make_mut(&mut result.data).iter_mut().zip(c.data.iter()) {
-                *r += cv;
-            }
-            result.dtype = c.dtype;
+        && let Value::Tile(c) = ctx.get_value(&op.operands[2])?
+    {
+        for (r, &cv) in std::rc::Rc::make_mut(&mut result.data)
+            .iter_mut()
+            .zip(c.data.iter())
+        {
+            *r += cv;
         }
+        result.dtype = c.dtype;
+    }
     Ok(Some(Value::Tile(result)))
 }
 
@@ -273,7 +332,11 @@ fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
 /// region (`tree_fold`); shorthand (`{ arith.addf }`) synthesizes a one-op
 /// region so it takes the identical path. Relies on the combiner being
 /// associative (MLIR's `linalg.reduce` legalization already guarantees this).
-fn reduce(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn reduce(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let tile = match ctx.get_value(&op.operands[0])? {
         Value::Tile(t) => t.clone(),
         // Already a scalar — nothing to reduce, pass it through.
@@ -302,7 +365,11 @@ fn reduce(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<O
     if body_ops.is_empty() {
         bb0_names = vec!["__reduce_in__".to_string(), "__reduce_acc__".to_string()];
         body_ops = vec![
-            Operation::new(Some("__reduce_combined__"), &reduce_fn, &["__reduce_in__", "__reduce_acc__"]),
+            Operation::new(
+                Some("__reduce_combined__"),
+                &reduce_fn,
+                &["__reduce_in__", "__reduce_acc__"],
+            ),
             Operation::new(None, "linalg.yield", &["__reduce_combined__"]),
         ];
     }
@@ -319,7 +386,25 @@ fn reduce(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<O
         },
     };
 
-    let (folded_data, folded_shape) = tree_fold(&tile, dim, &bb0_names, &body_ops, ctx, env)?;
+    // Fast path: a simple `(in, acc) { %s = <op> in, acc; yield %s }` body whose
+    // op is a recognized commutative+associative combiner (the synthesized
+    // shorthand form, and the only form the real model emits) folds directly in
+    // the f32 buffer — no per-round region execution. The operand check ensures
+    // the op combines exactly the two block args, not an external value.
+    let fast_combine = if body_ops.len() == 2
+        && body_ops[1].op_type == "linalg.yield"
+        && body_ops[0].operands.len() == 2
+        && body_ops[0].operands.iter().all(|o| {
+            let o = o.trim_start_matches('%');
+            bb0_names.iter().any(|n| n.trim_start_matches('%') == o)
+        }) {
+        reduce_combiner(&body_ops[0].op_type)
+    } else {
+        None
+    };
+
+    let (folded_data, folded_shape) =
+        tree_fold(&tile, dim, &bb0_names, &body_ops, fast_combine, ctx, env)?;
 
     // Squeeze the reduced axis. With no dim, the fold collapsed onto axis 0 of a
     // flattened view, leaving a length-1 vector -> scalar.
@@ -345,6 +430,45 @@ fn reduce(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<O
     Ok(Some(result))
 }
 
+/// f32 combiner for a recognized **commutative + associative** reduce op, so the
+/// pairwise tree fold can combine the two halves directly instead of executing
+/// the combiner region op-by-op (slice -> build two Tiles -> dispatch the op ->
+/// extract the result, every round). Only order-insensitive ops qualify: the
+/// fold pairs halves and the operand order within a pair must not matter. `subf`
+/// and custom multi-op regions fall back to the faithful region path.
+///
+/// Each closure matches the corresponding `arith` handler exactly (incl. the
+/// NaN-propagating `maximumf`/`minimumf` vs the `*numf` fmax/fmin variants); the
+/// caller rounds the result to the tile dtype each round, mirroring how the
+/// region path's `Tile::compute` rounds after every combine.
+fn reduce_combiner(op_name: &str) -> Option<fn(f32, f32) -> f32> {
+    Some(match op_name {
+        "arith.addf" => |a, b| a + b,
+        "arith.mulf" => |a, b| a * b,
+        "arith.maxnumf" => f32::max,
+        "arith.minnumf" => f32::min,
+        "arith.maximumf" => |a: f32, b: f32| {
+            if a.is_nan() || b.is_nan() {
+                f32::NAN
+            } else if a >= b {
+                a
+            } else {
+                b
+            }
+        },
+        "arith.minimumf" => |a: f32, b: f32| {
+            if a.is_nan() || b.is_nan() {
+                f32::NAN
+            } else if a <= b {
+                a
+            } else {
+                b
+            }
+        },
+        _ => return None,
+    })
+}
+
 /// Reduce `tile` along `dim` by folding the combiner region pairwise.
 ///
 /// Splits the reduced axis in half, combines the two halves with one
@@ -356,6 +480,7 @@ fn tree_fold(
     dim: Option<usize>,
     bb0_names: &[String],
     body_ops: &[Operation],
+    fast_combine: Option<fn(f32, f32) -> f32>,
     ctx: &mut CoreContext,
     env: &ExecutionEnv,
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
@@ -372,6 +497,14 @@ fn tree_fold(
             (tile.data.to_vec(), tile.shape.clone(), d)
         }
     };
+
+    // Fast path: a recognized commutative+associative combiner folds directly in
+    // the f32 buffer with strided indexing — no per-round `slice_along` Tiles, no
+    // region dispatch. Bit-identical to the region path below (same pairwise tree
+    // order, same per-round dtype rounding).
+    if let Some(f) = fast_combine {
+        return Ok(fast_tree_fold(acc, shape, axis, tile.dtype, f));
+    }
 
     let mut n = shape[axis];
     while n > 1 {
@@ -393,7 +526,7 @@ fn tree_fold(
             other => {
                 return Err(format!(
                     "linalg.reduce: combiner yielded {other:?}, expected tile/scalar"
-                ))
+                ));
             }
         };
         let mut combined_shape = left_shape;
@@ -411,6 +544,52 @@ fn tree_fold(
     }
 
     Ok((acc, shape))
+}
+
+/// Direct strided implementation of the pairwise tree fold for a known
+/// commutative+associative combiner `f`. Mirrors `tree_fold`'s region path
+/// exactly — same halving, same odd-length carry, same per-round rounding to
+/// `dtype` — but combines straight from the flat buffer (`acc[outer, i, inner]`
+/// with `i+half`) instead of materializing two slice Tiles and dispatching the
+/// combiner op each round. This is what makes `linalg.reduce` cheap on the hot
+/// `addf`-sum path the real model emits.
+fn fast_tree_fold(
+    mut acc: Vec<f32>,
+    mut shape: Vec<usize>,
+    axis: usize,
+    dtype: DType,
+    f: fn(f32, f32) -> f32,
+) -> (Vec<f32>, Vec<usize>) {
+    let outer: usize = shape[..axis].iter().product();
+    let inner: usize = shape[axis + 1..].iter().product();
+    let mut n = shape[axis];
+    while n > 1 {
+        let half = n / 2;
+        let new_n = n - half; // ceil(n/2): `half` combined pairs + (odd ? 1 carry : 0)
+        let mut next = vec![0.0f32; outer * new_n * inner];
+        for o in 0..outer {
+            for i in 0..half {
+                let lhs = (o * n + i) * inner;
+                let rhs = (o * n + i + half) * inner;
+                let dst = (o * new_n + i) * inner;
+                for k in 0..inner {
+                    next[dst + k] = f(acc[lhs + k], acc[rhs + k]);
+                }
+            }
+            if n % 2 == 1 {
+                // Carry the unpaired last axis-slice (index n-1 == 2*half) into
+                // position `half`, matching the region path's concat.
+                let src = (o * n + (n - 1)) * inner;
+                let dst = (o * new_n + half) * inner;
+                next[dst..dst + inner].copy_from_slice(&acc[src..src + inner]);
+            }
+        }
+        crate::codec::round_to_dtype(&mut next, dtype);
+        acc = next;
+        n = new_n;
+        shape[axis] = n;
+    }
+    (acc, shape)
 }
 
 /// Run the combiner region once on two equal-shaped operands, returning the
@@ -452,7 +631,11 @@ fn run_combiner(
 /// (inserting size-1 axes for missing dims), binds the bb0 block-arg names, then
 /// runs the region body once over the full arrays and broadcasts the yielded
 /// value back to the outs shape.
-fn generic(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn generic(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let n_ins = match op.attributes.get("n_ins") {
         Some(Attr::Int(n)) => *n as usize,
         _ => 0,
@@ -519,7 +702,11 @@ fn generic(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<
             if n_ins < bb0_names.len() {
                 ctx.set_value(
                     &bb0_names[n_ins],
-                    Value::Tile(Tile::compute(outs_val.data.to_vec(), outs_val.dtype, out_shape.clone())),
+                    Value::Tile(Tile::compute(
+                        outs_val.data.to_vec(),
+                        outs_val.dtype,
+                        out_shape.clone(),
+                    )),
                 );
             }
             Ok(())
@@ -531,7 +718,10 @@ fn generic(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<
     let out_tile = match result {
         Some(Value::Tile(t)) => {
             let data = broadcast_to(&t.data, &t.shape, &out_shape).ok_or_else(|| {
-                format!("linalg.generic: yield shape {:?} not broadcastable to {out_shape:?}", t.shape)
+                format!(
+                    "linalg.generic: yield shape {:?} not broadcastable to {out_shape:?}",
+                    t.shape
+                )
             })?;
             Tile::compute(data, out_dtype, out_shape)
         }
@@ -545,7 +735,11 @@ fn generic(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<
 }
 
 /// `%r = linalg.index <dim>` — a broadcasting index array for iteration `dim`.
-fn index(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn index(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let dim = match op.attributes.get("dim") {
         Some(Attr::Int(d)) => *d as usize,
         _ => 0,
@@ -558,10 +752,16 @@ fn index(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
                 other => Err(format!("linalg.index: bad shape entry {other:?}")),
             })
             .collect::<Result<Vec<_>, _>>()?,
-        other => return Err(format!("linalg.index: {SHAPE_KEY} is {other:?}, expected shape tuple")),
+        other => {
+            return Err(format!(
+                "linalg.index: {SHAPE_KEY} is {other:?}, expected shape tuple"
+            ));
+        }
     };
     if dim >= out_shape.len() {
-        return Err(format!("linalg.index: dim {dim} out of range for shape {out_shape:?}"));
+        return Err(format!(
+            "linalg.index: dim {dim} out of range for shape {out_shape:?}"
+        ));
     }
     // arange(out_shape[dim]) reshaped to [1,...,out_shape[dim],...,1].
     let mut shape = vec![1usize; out_shape.len()];
@@ -572,7 +772,11 @@ fn index(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
 
 /// `linalg.yield %v` — park the yielded value under [`YIELD_KEY`] in the current
 /// scope so the enclosing region driver can recover it (see [`run_region`]).
-fn yield_op(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn yield_op(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if let Some(name) = op.operands.first() {
         let v = ctx.get_value(name)?.clone();
         ctx.set_value(YIELD_KEY, v);
@@ -699,7 +903,13 @@ fn broadcast_to(data: &[f32], from_shape: &[usize], to_shape: &[usize]) -> Optio
 
 /// Slice `data` (logical `shape`) along `axis` for `[lo, hi)`. Returns the
 /// sliced flat data and its shape.
-fn slice_along(data: &[f32], shape: &[usize], axis: usize, lo: usize, hi: usize) -> (Vec<f32>, Vec<usize>) {
+fn slice_along(
+    data: &[f32],
+    shape: &[usize],
+    axis: usize,
+    lo: usize,
+    hi: usize,
+) -> (Vec<f32>, Vec<usize>) {
     let mut out_shape = shape.to_vec();
     out_shape[axis] = hi - lo;
     let strides = row_major_strides(shape);
@@ -719,7 +929,12 @@ fn slice_along(data: &[f32], shape: &[usize], axis: usize, lo: usize, hi: usize)
 /// tree fold carries). Result extent along `axis` is `a_shape[axis] + b_extent`.
 fn concat_along(a: &[f32], a_shape: &[usize], b: &[f32], axis: usize) -> Vec<f32> {
     // Recover b's extent along `axis` from its element count and a's other axes.
-    let outer: usize = a_shape.iter().enumerate().filter(|(i, _)| *i != axis).map(|(_, &d)| d).product();
+    let outer: usize = a_shape
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != axis)
+        .map(|(_, &d)| d)
+        .product();
     let b_extent = b.len().checked_div(outer).unwrap_or(0);
 
     let mut out_shape = a_shape.to_vec();
@@ -828,7 +1043,11 @@ mod tests {
         let mut ctx = single_core_context();
         ctx.set_value("%s", Value::Scalar(Scalar::F32(7.0)));
         ctx.set_value("%init", tile(vec![0.0; 6], vec![2, 3]));
-        run(&[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])], &mut ctx).unwrap();
+        run(
+            &[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])],
+            &mut ctx,
+        )
+        .unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.data.to_vec(), vec![7.0; 6]);
         assert_eq!(t.shape, vec![2, 3]);
@@ -839,7 +1058,11 @@ mod tests {
         let mut ctx = single_core_context();
         ctx.set_value("%s", Value::Index(3));
         ctx.set_value("%init", tile(vec![0.0; 2], vec![2]));
-        run(&[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])], &mut ctx).unwrap();
+        run(
+            &[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])],
+            &mut ctx,
+        )
+        .unwrap();
         assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![3.0, 3.0]);
     }
 
@@ -900,7 +1123,10 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![3, 4]);
-        assert_eq!(t.data.to_vec(), vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]);
+        assert_eq!(
+            t.data.to_vec(),
+            vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]
+        );
     }
 
     #[test]
@@ -913,7 +1139,10 @@ mod tests {
             .with_attr("dimensions", Attr::IntList(vec![0]));
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
-        assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            t.data.to_vec(),
+            vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+        );
     }
 
     // --- matmul -----------------------------------------------------------
@@ -924,7 +1153,11 @@ mod tests {
         // A=[[1,2],[3,4]], B=[[5,6],[7,8]] -> [[19,22],[43,50]]
         ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
         ctx.set_value("%b", tile(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]));
-        run(&[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])], &mut ctx).unwrap();
+        run(
+            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &mut ctx,
+        )
+        .unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.data.to_vec(), vec![19.0, 22.0, 43.0, 50.0]);
@@ -936,7 +1169,15 @@ mod tests {
         ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
         ctx.set_value("%b", tile(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]));
         ctx.set_value("%c", tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
-        run(&[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b", "%c"])], &mut ctx).unwrap();
+        run(
+            &[Operation::new(
+                Some("%r"),
+                "linalg.matmul",
+                &["%a", "%b", "%c"],
+            )],
+            &mut ctx,
+        )
+        .unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.data.to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
     }
@@ -946,8 +1187,15 @@ mod tests {
         let mut ctx = single_core_context();
         // A [2x3], B [3x2] -> [2x2]
         ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        ctx.set_value("%b", tile(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]));
-        run(&[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])], &mut ctx).unwrap();
+        ctx.set_value(
+            "%b",
+            tile(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]),
+        );
+        run(
+            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &mut ctx,
+        )
+        .unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 2]);
         // row0: [58, 64], row1: [139, 154]
@@ -959,7 +1207,11 @@ mod tests {
         let mut ctx = single_core_context();
         ctx.set_value("%a", tile(vec![1.0, 2.0], vec![1, 2]));
         ctx.set_value("%b", tile(vec![1.0, 2.0, 3.0], vec![3, 1]));
-        let err = run(&[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])], &mut ctx).unwrap_err();
+        let err = run(
+            &[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])],
+            &mut ctx,
+        )
+        .unwrap_err();
         assert!(err.contains("inner dims disagree"));
     }
 
@@ -967,12 +1219,29 @@ mod tests {
     fn batch_matmul_two_batches() {
         let mut ctx = single_core_context();
         // batch0: [[1,2],[3,4]] @ I = same. batch1: I @ [[5,6],[7,8]] = same.
-        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 1.0], vec![2, 2, 2]));
-        ctx.set_value("%b", tile(vec![1.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0, 8.0], vec![2, 2, 2]));
-        run(&[Operation::new(Some("%r"), "linalg.batch_matmul", &["%a", "%b"])], &mut ctx).unwrap();
+        ctx.set_value(
+            "%a",
+            tile(vec![1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 1.0], vec![2, 2, 2]),
+        );
+        ctx.set_value(
+            "%b",
+            tile(vec![1.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0, 8.0], vec![2, 2, 2]),
+        );
+        run(
+            &[Operation::new(
+                Some("%r"),
+                "linalg.batch_matmul",
+                &["%a", "%b"],
+            )],
+            &mut ctx,
+        )
+        .unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 2, 2]);
-        assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            t.data.to_vec(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
     }
 
     // --- reduce -----------------------------------------------------------
@@ -1017,7 +1286,8 @@ mod tests {
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] reduce dim=1 -> [6, 15]
         ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        let mut op = Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
+        let mut op =
+            Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
         op.regions.push(addf_combiner_region());
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
@@ -1030,7 +1300,8 @@ mod tests {
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] reduce dim=0 -> [5,7,9]
         ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        let mut op = Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(0));
+        let mut op =
+            Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(0));
         op.regions.push(addf_combiner_region());
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
@@ -1043,7 +1314,8 @@ mod tests {
         let mut ctx = single_core_context();
         // [[1,2,3],[4,5,6]] dim=1 odd extent 3 -> [6,15] exercises odd carry on a 2-D fold.
         ctx.set_value("%x", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
-        let mut op = Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
+        let mut op =
+            Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
         op.regions.push(addf_combiner_region());
         run(&[op], &mut ctx).unwrap();
         assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![6.0, 15.0]);
@@ -1115,7 +1387,10 @@ mod tests {
         ctx.set_value("%init", tile(vec![0.0; 3], vec![3]));
         let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%y", "%init"])
             .with_attr("n_ins", Attr::Int(2))
-            .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%b".into(), "%out".into()]));
+            .with_attr(
+                "bb0_names",
+                Attr::StrList(vec!["%a".into(), "%b".into(), "%out".into()]),
+            );
         op.regions.push(vec![
             Operation::new(Some("%s"), "arith.addf", &["%a", "%b"]),
             Operation::new(None, "linalg.yield", &["%s"]),
@@ -1153,7 +1428,10 @@ mod tests {
         let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%init"])
             .with_attr("n_ins", Attr::Int(1))
             .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%out".into()]))
-            .with_attr("indexing_maps", Attr::StrList(vec!["1".into(), "0,1".into()]));
+            .with_attr(
+                "indexing_maps",
+                Attr::StrList(vec!["1".into(), "0,1".into()]),
+            );
         op.regions.push(vec![
             Operation::new(Some("%s"), "arith.addf", &["%a", "%out"]),
             Operation::new(None, "linalg.yield", &["%s"]),
@@ -1174,7 +1452,8 @@ mod tests {
         let mut op = Operation::new(Some("%r"), "linalg.generic", &["%x", "%init"])
             .with_attr("n_ins", Attr::Int(1))
             .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%out".into()]));
-        op.regions.push(vec![Operation::new(None, "linalg.yield", &["%a"])]);
+        op.regions
+            .push(vec![Operation::new(None, "linalg.yield", &["%a"])]);
         run(&[op], &mut ctx).unwrap();
         assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
@@ -1196,7 +1475,10 @@ mod tests {
     #[test]
     fn index_builds_arange() {
         let mut ctx = single_core_context();
-        ctx.set_value(SHAPE_KEY, Value::Tuple(vec![Value::Index(2), Value::Index(3)]));
+        ctx.set_value(
+            SHAPE_KEY,
+            Value::Tuple(vec![Value::Index(2), Value::Index(3)]),
+        );
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
@@ -1215,7 +1497,10 @@ mod tests {
     #[test]
     fn index_dim0() {
         let mut ctx = single_core_context();
-        ctx.set_value(SHAPE_KEY, Value::Tuple(vec![Value::Index(4), Value::Index(2)]));
+        ctx.set_value(
+            SHAPE_KEY,
+            Value::Tuple(vec![Value::Index(4), Value::Index(2)]),
+        );
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
