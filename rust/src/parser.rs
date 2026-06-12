@@ -21,9 +21,15 @@
 //!     [`Attr`] enum. The affine text is parsed by the recursive-descent parser
 //!     in [`crate::parser_ast`].
 //!
-//! DEFERRED (later slices): nested regions (scf bodies), `dense<...>` constant
-//! payloads, and the indirect / distributed construct ops. The Python original
-//! uses the `regex` crate's equivalent; this slice stays dependency-free with
+//!   * nested regions (scf bodies, linalg.reduce/generic combiners) — extracted
+//!     by `tokenize_ops` (`_line_opens_region`) and recursively parsed into
+//!     `op.regions`;
+//!   * general `{ key = value }` attribute blocks AND bare `key = value` attrs
+//!     (`permutation = [..]`, `dimensions = [..]`), plus `shape`/`dtype` derived
+//!     from a `tensor<...>` result type.
+//!
+//! DEFERRED: dynamic/SSA memref sizes (lazy `?`-dim resolution). The Python
+//! original uses the `regex` crate's equivalent; this stays dependency-free with
 //! manual scanning (regex is the production tool to adopt here).
 
 use crate::ir::{Attr, IRFunction, IRModule, Operation, Scalar, Value};
@@ -34,10 +40,7 @@ pub fn parse_module(text: &str) -> Result<IRModule, String> {
     let text = strip_comments(text);
     let mut module = IRModule::default();
     for (name, args, grid, body) in find_functions(&text)? {
-        let operations = tokenize_ops(&body)
-            .iter()
-            .filter_map(|op_text| parse_operation(op_text).transpose())
-            .collect::<Result<Vec<_>, _>>()?;
+        let operations = parse_operations(&body)?;
         module.add_function(IRFunction {
             name,
             arguments: args,
@@ -185,31 +188,59 @@ fn parse_grid(header: &str) -> (usize, usize, usize) {
     )
 }
 
+/// Parse a function/region body into operations, recursively parsing each
+/// op's region bodies into `op.regions`. Mirrors `_parse_operations`.
+fn parse_operations(body: &str) -> Result<Vec<Operation>, String> {
+    let mut ops = Vec::new();
+    for (op_text, regions) in tokenize_ops(body) {
+        let Some(mut op) = parse_operation(&op_text)? else {
+            continue;
+        };
+        for region_body in &regions {
+            op.regions.push(parse_operations(region_body)?);
+        }
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
 // --- phase 2: tokenize ops ----------------------------------------------
 
-/// Group body text into complete operation strings. Ports the brace-balance +
-/// type-terminal + SSA-start flush heuristic from `_tokenize_operations`.
-/// Region extraction (scf bodies) is deferred; this slice targets straight-line
-/// bodies.
-fn tokenize_ops(body: &str) -> Vec<String> {
-    let mut results = Vec::new();
-    let mut current: Vec<String> = Vec::new();
+/// A tokenized op: its text plus any region bodies (the `{ ... }` blocks that
+/// contain operations, e.g. `scf.for` / `linalg.reduce` combiner). Mirrors the
+/// `(op_text, [region_bodies])` pairs from `_tokenize_operations`.
+type TokenizedOp = (String, Vec<String>);
 
-    let flush = |current: &mut Vec<String>, results: &mut Vec<String>| {
+/// Group body text into complete operations, extracting region bodies. Ports
+/// `_tokenize_operations` including `_line_opens_region` /
+/// `_extract_region_from_lines`: a `{` that opens a block containing `%` SSA
+/// references is a region (recursively parsed); other `{ }` blocks are inline
+/// attribute blocks kept in the op text.
+fn tokenize_ops(body: &str) -> Vec<TokenizedOp> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut results: Vec<TokenizedOp> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_regions: Vec<String> = Vec::new();
+
+    let flush = |current: &mut Vec<String>,
+                 regions: &mut Vec<String>,
+                 results: &mut Vec<TokenizedOp>| {
         if !current.is_empty() {
-            results.push(current.join(" "));
+            results.push((current.join(" "), std::mem::take(regions)));
             current.clear();
         }
     };
 
-    for line in body.lines() {
-        let stripped = line.trim();
+    let mut i = 0;
+    while i < lines.len() {
+        let stripped = lines[i].trim();
 
         // Blank line flushes when braces are balanced.
         if stripped.is_empty() {
             if brace_balance(&current.join(" ")) == 0 {
-                flush(&mut current, &mut results);
+                flush(&mut current, &mut current_regions, &mut results);
             }
+            i += 1;
             continue;
         }
 
@@ -221,13 +252,86 @@ fn tokenize_ops(body: &str) -> Vec<String> {
             let prev_done = is_op_complete(&accumulated) || starts_ssa_assign(stripped);
             let next_cannot_start = stripped == "{";
             if prev_done && !next_cannot_start {
-                flush(&mut current, &mut results);
+                flush(&mut current, &mut current_regions, &mut results);
             }
         }
         current.push(stripped.to_string());
+
+        // Does this line open a region body? (ends with `{`, block has `%` refs)
+        if line_opens_region(stripped, &lines, i) {
+            // Drop the trailing `{` from the op text.
+            let last = current.last_mut().unwrap();
+            *last = last.trim_end_matches('{').trim_end().to_string();
+            if last.is_empty() {
+                current.pop();
+            }
+            if let Some((region_body, end_line, trailing)) = extract_region_from_lines(&lines, i) {
+                current_regions.push(region_body);
+                if !trailing.is_empty() {
+                    current.push(trailing);
+                }
+                i = end_line + 1;
+                continue;
+            }
+        }
+        i += 1;
     }
-    flush(&mut current, &mut results);
+    flush(&mut current, &mut current_regions, &mut results);
     results
+}
+
+/// A line opens a region iff it ends with `{` and the brace-balanced block it
+/// opens contains a `%` SSA reference (regions hold ops; attribute blocks don't).
+/// Mirrors `_line_opens_region`.
+fn line_opens_region(stripped: &str, lines: &[&str], idx: usize) -> bool {
+    if !stripped.ends_with('{') {
+        return false;
+    }
+    let mut depth = 1i32;
+    for line in &lines[idx + 1..] {
+        depth += brace_balance(line);
+        if line.contains('%') {
+            return true;
+        }
+        if depth <= 0 {
+            break;
+        }
+    }
+    false
+}
+
+/// Extract a region body from the line after the one ending in `{` to its
+/// matching `}`. Returns `(region_body, closing_line_index, trailing_text)`
+/// where trailing is any text after `}` on its line (belongs to the outer op).
+/// Mirrors `_extract_region_from_lines`.
+fn extract_region_from_lines(lines: &[&str], open_line: usize) -> Option<(String, usize, String)> {
+    let mut depth = 1i32;
+    let mut body_lines: Vec<String> = Vec::new();
+    let mut i = open_line + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        let stripped = line.trim();
+        for (ci, ch) in stripped.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let before = stripped[..ci].trim();
+                        if !before.is_empty() {
+                            body_lines.push(before.to_string());
+                        }
+                        let after = stripped[ci + 1..].trim().to_string();
+                        return Some((body_lines.join("\n"), i, after));
+                    }
+                }
+                _ => {}
+            }
+        }
+        body_lines.push(line.to_string());
+        i += 1;
+    }
+    None
 }
 
 fn brace_balance(text: &str) -> i32 {
@@ -343,6 +447,25 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
             &operands,
             &mut attributes,
         )?;
+    } else {
+        // General attributes: the `{ key = value, ... }` block AND bare
+        // `key = value` attributes (MLIR named ops carry `permutation = [..]`,
+        // `dimensions = [..]` bare). Mirrors `_extract_attributes` +
+        // `_parse_bare_attr`. Bare attrs fill in keys the block doesn't have.
+        attributes = parse_attr_block(after_op);
+        for (k, v) in parse_bare_attrs(after_op) {
+            attributes.entry(k).or_insert(v);
+        }
+        // Derive `shape`/`dtype` from a `tensor<...>` result type when the op
+        // doesn't carry them explicitly (tensor.splat/empty/generate read these).
+        // Mirrors the `_result_shape`/`_result_dtype` population in
+        // `_parse_general_operation`.
+        if let Some(rt) = &result_type
+            && let Some((shape, dt)) = parse_tensor_type(rt)
+        {
+            attributes.entry("shape".to_string()).or_insert(Attr::IntList(shape));
+            attributes.entry("dtype".to_string()).or_insert(Attr::Str(dt));
+        }
     }
 
     Ok(Some(Operation {
@@ -531,6 +654,23 @@ fn parse_memory_space(text: &str) -> (String, Option<i64>) {
 
 /// Extract the element dtype (last `x`-segment) from a `memref<...>` type
 /// string, e.g. `memref<4096xf16>` -> `f16`. Mirrors the memref-type split.
+/// Parse a `tensor<DxDx...xELT>` type into `(shape, dtype)`. Returns `None` for
+/// non-tensor types or types with dynamic `?` dims (those need the SSA-size
+/// resolution path). E.g. `tensor<1x4xf16>` -> `([1, 4], "f16")`.
+fn parse_tensor_type(ty: &str) -> Option<(Vec<i64>, String)> {
+    let inner = ty.trim().strip_prefix("tensor<")?.strip_suffix('>')?;
+    let parts: Vec<&str> = inner.split('x').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let (dtype, dims) = parts.split_last().unwrap();
+    let mut shape = Vec::with_capacity(dims.len());
+    for d in dims {
+        shape.push(d.trim().parse::<i64>().ok()?); // `?` dynamic dims -> None
+    }
+    Some((shape, dtype.trim().to_string()))
+}
+
 fn parse_memref_dtype(result_type: &str) -> Option<String> {
     let inner = result_type
         .trim()
@@ -746,6 +886,187 @@ fn remove_brace_blocks(text: &str) -> String {
         }
     }
     s
+}
+
+/// Parse the outermost `{ key = value, ... }` attribute block of an op into a
+/// typed attribute map. Mirrors `parse_attr_block`. Entries whose value can't be
+/// classified are stored as `Attr::Str` (verbatim). No block -> empty map.
+fn parse_attr_block(after_op: &str) -> std::collections::HashMap<String, Attr> {
+    let mut attrs = std::collections::HashMap::new();
+    let bytes = after_op.as_bytes();
+    let Some(open) = after_op.find('{') else {
+        return attrs;
+    };
+    let Some(close) = matching(bytes, open, b'{', b'}') else {
+        return attrs;
+    };
+    for entry in split_top_level(&after_op[open + 1..close], ',') {
+        let entry = entry.trim();
+        let Some(eq) = entry.find('=') else { continue };
+        let key = entry[..eq].trim();
+        let val = entry[eq + 1..].trim();
+        if key.is_empty() || val.is_empty() {
+            continue;
+        }
+        if let Some(attr) = parse_attr_value(val) {
+            attrs.insert(key.to_string(), attr);
+        }
+    }
+    attrs
+}
+
+/// Scan for bare `key = value` attributes at top level (outside `()`, `{}`,
+/// `<>`) — MLIR named ops attach `permutation = [..]`, `dimensions = [..]`, etc.
+/// without an enclosing `{ }`. Mirrors `_parse_bare_attr`. At depth 0 a `=` is
+/// always an attribute assignment (the result `%x =` is already stripped, and
+/// `>=`/`<=` only occur inside `<>` at depth > 0).
+fn parse_bare_attrs(text: &str) -> std::collections::HashMap<String, Attr> {
+    let mut attrs = std::collections::HashMap::new();
+    let b = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'{' | b'<' | b'[' => depth += 1,
+            b')' | b'}' | b'>' | b']' => depth -= 1,
+            b'=' if depth == 0 && b.get(i + 1) != Some(&b'=') && i > 0 && b[i - 1] != b'=' => {
+                // Walk back over whitespace to capture the key identifier.
+                let mut ks = i;
+                while ks > 0 && b[ks - 1].is_ascii_whitespace() {
+                    ks -= 1;
+                }
+                let ke = ks;
+                while ks > 0 && (b[ks - 1].is_ascii_alphanumeric() || matches!(b[ks - 1], b'_' | b'.')) {
+                    ks -= 1;
+                }
+                let key = &text[ks..ke];
+                // Read the value after `=`.
+                let mut vs = i + 1;
+                while vs < b.len() && b[vs].is_ascii_whitespace() {
+                    vs += 1;
+                }
+                let (raw, end) = read_attr_value(text, vs);
+                if !key.is_empty()
+                    && let Some(attr) = parse_attr_value(raw)
+                {
+                    attrs.insert(key.to_string(), attr);
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    attrs
+}
+
+/// Read a bare attribute value starting at `start`: a balanced `[..]` list, a
+/// balanced `keyword<..>` (affine map/set, memory space), or a plain token up to
+/// the next whitespace / `,` / top-level `:`. Returns `(value_str, end_index)`.
+fn read_attr_value(text: &str, start: usize) -> (&str, usize) {
+    let b = text.as_bytes();
+    if start >= b.len() {
+        return ("", start);
+    }
+    if b[start] == b'['
+        && let Some(close) = matching(b, start, b'[', b']') {
+            return (&text[start..=close], close + 1);
+        }
+    // keyword<...> (affine_map<>, affine_set<>, #ktdp...<>): balance <> while
+    // skipping `->` and `>=` so constraint operators don't close early.
+    if let Some(lt) = text[start..].find('<') {
+        let head = &text[start..start + lt];
+        if head.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '#')) && !head.is_empty() {
+            let mut depth = 0i32;
+            let vb = text.as_bytes();
+            let mut j = start + lt;
+            while j < vb.len() {
+                match vb[j] {
+                    b'<' => depth += 1,
+                    b'>' if vb.get(j + 1) == Some(&b'=') => {} // `>=`, not a close
+                    b'-' if vb.get(j + 1) == Some(&b'>') => j += 1, // skip `->`
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return (&text[start..=j], j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+    }
+    // Plain token up to whitespace / comma / colon.
+    let end = text[start..]
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ':')
+        .map(|o| start + o)
+        .unwrap_or(b.len());
+    (&text[start..end], end)
+}
+
+/// Split `s` on `sep` at top level only — commas inside `[]`, `<>`, `()` or `{}`
+/// are not separators (affine maps, lists, nested types contain them).
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '<' | '(' | '{' => depth += 1,
+            ']' | '>' | ')' | '}' => depth -= 1,
+            _ if c == sep && depth == 0 => {
+                out.push(s[start..i].to_string());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// Classify a single attribute value into an [`Attr`].
+fn parse_attr_value(val: &str) -> Option<Attr> {
+    let val = val.trim();
+    // `affine_map<...>` / `affine_set<...>`
+    if val.starts_with("affine_map<") {
+        return parse_affine_map(val).ok().map(Attr::AffineMap);
+    }
+    if val.starts_with("affine_set<") {
+        return parse_affine_set(val).ok().map(Attr::AffineSet);
+    }
+    // `[a, b, ...]` list -> IntList unless any element is float-shaped.
+    if let Some(inner) = val.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let items: Vec<String> = split_top_level(inner, ',')
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.iter().any(|s| s.contains('.') || s.contains('e') || s.contains('E')) {
+            let vals: Option<Vec<f64>> = items.iter().map(|s| s.parse().ok()).collect();
+            return vals.map(Attr::FloatList);
+        }
+        let vals: Option<Vec<i64>> = items.iter().map(|s| s.parse().ok()).collect();
+        return vals.map(Attr::IntList);
+    }
+    match val {
+        "true" => return Some(Attr::Bool(true)),
+        "false" => return Some(Attr::Bool(false)),
+        _ => {}
+    }
+    if let Ok(i) = val.parse::<i64>() {
+        return Some(Attr::Int(i));
+    }
+    if (val.contains('.') || val.contains('e') || val.contains('E'))
+        && let Ok(f) = val.parse::<f64>()
+    {
+        return Some(Attr::Float(f));
+    }
+    // Strip a trailing `: type` annotation MLIR attaches to typed attrs.
+    let s = val.split(':').next().unwrap_or(val).trim();
+    Some(Attr::Str(s.to_string()))
 }
 
 /// Parse the literal of `arith.constant <lit> : <type>` into a value `Attr`.

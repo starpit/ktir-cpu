@@ -235,7 +235,6 @@ const REDUCE_GENERIC: &str = include_str!("../../examples/ktir/reduce_generic.ml
 // elsewhere); only the MLIR-text path is missing. Skipped until the parser
 // lifts reduce regions + `dimensions`.
 #[test]
-#[ignore = "GAP: parser defers linalg.reduce combiner region + `dimensions` attr; text-driven reduce collapses wrong axis"]
 fn reduce_explicit_region_sum() {
     let module = parse_module(REDUCE_GENERIC).expect("parse reduce_generic");
     let data = f16_vec(&[1.0, 2.0, 3.0, 4.0]); // shape [1, 4]
@@ -252,7 +251,6 @@ fn reduce_explicit_region_sum() {
 }
 
 #[test]
-#[ignore = "GAP: parser defers linalg.reduce combiner region + `dimensions` attr; text-driven reduce collapses wrong axis"]
 fn reduce_explicit_region_zeros() {
     let module = parse_module(REDUCE_GENERIC).expect("parse reduce_generic");
     let data = vec![0.0f32; 4]; // shape [1, 4]
@@ -276,15 +274,13 @@ fn reduce_explicit_region_zeros() {
 
 const SDPA_2D: &str = include_str!("../../examples/triton-ktir/sdpa_2d.mlir");
 
-// GAP: sdpa uses `linalg.transpose ... permutation = [1, 0]`. The transpose
-// handler is implemented, but the baseline parser does not extract the
-// `permutation` attribute (it only lifts attributes for construct_memory_view /
-// construct_access_tile), so execution errors with "missing permutation
-// attribute". The kernel also relies on softmax over nested reduce regions
-// (same parser-region gap as reduce_generic). Skipped until the parser lifts
-// linalg.transpose `permutation`.
+// Parses fully now (transpose `permutation`, reduce regions/`dimensions`, and
+// tensor result-shape derivation all land). Remaining gap is semantic: the
+// softmax-over-rows reduce in this kernel yields a `[1]` where the subsequent
+// `linalg.matmul` expects `[32,1]` ("outs shape [1] != A@B shape [32,32]") —
+// a row-wise reduce/broadcast shape mismatch in this multi-step kernel.
 #[test]
-#[ignore = "GAP: parser does not extract linalg.transpose `permutation` attr -> 'missing permutation attribute'"]
+#[ignore = "GAP: sdpa softmax row-reduce yields [1] vs matmul-expected [32,1] (multi-step shape)"]
 fn sdpa_2d() {
     let module = parse_module(SDPA_2D).expect("parse sdpa_2d");
     let (n_rows, head_dim) = (32usize, 64usize);

@@ -56,6 +56,33 @@ pub fn register(d: &mut Dispatch) {
     d.register("linalg.fill", LatencyCategory::Zero, fill);
     d.register("linalg.index", LatencyCategory::Zero, index);
     d.register("linalg.yield", LatencyCategory::Zero, yield_op);
+    // Elementwise named ops: `linalg.add/sub/mul/div/max/min ins(%a, %b) outs(%c)`.
+    d.register("linalg.add", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a + b));
+    d.register("linalg.sub", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a - b));
+    d.register("linalg.mul", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a * b));
+    d.register("linalg.div", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, |a, b| a / b));
+    d.register("linalg.max", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, f32::max));
+    d.register("linalg.min", LatencyCategory::ComputeFloat, |o, c, _| elementwise(o, c, f32::min));
+}
+
+/// `%r = linalg.<op> ins(%a, %b) outs(%c)` — element-wise binary named op over
+/// two tiles of equal shape. (The `outs` operand only supplies the result
+/// shape/dtype; named elementwise ops overwrite, not accumulate.)
+fn elementwise(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    f: fn(f32, f32) -> f32,
+) -> Result<Option<Value>, String> {
+    let a = expect_tile(ctx.get_value(&op.operands[0])?, "linalg elementwise A")?;
+    let b = expect_tile(ctx.get_value(&op.operands[1])?, "linalg elementwise B")?;
+    if a.shape != b.shape {
+        return Err(format!(
+            "linalg.{}: shape mismatch {:?} vs {:?}",
+            op.op_type, a.shape, b.shape
+        ));
+    }
+    let data: Vec<f32> = a.data.iter().zip(&b.data).map(|(&x, &y)| f(x, y)).collect();
+    Ok(Some(Value::Tile(Tile::compute(data, a.dtype, a.shape.clone()))))
 }
 
 // ===========================================================================
@@ -263,10 +290,16 @@ fn reduce(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<O
         ];
     }
 
-    // dim: axis to reduce; absent -> collapse all to a scalar.
+    // Axis to reduce; absent -> collapse all to a scalar. MLIR text carries it
+    // as `dimensions = [d]` (IntList); the programmatic form uses `dim` (Int).
+    // Multi-axis (`dimensions = [d0, d1, ...]`) is the Python xfail — take the
+    // first only.
     let dim = match op.attributes.get("dim") {
         Some(Attr::Int(d)) => Some(*d as usize),
-        _ => None,
+        _ => match op.attributes.get("dimensions") {
+            Some(Attr::IntList(v)) if !v.is_empty() => Some(v[0] as usize),
+            _ => None,
+        },
     };
 
     let (folded_data, folded_shape) = tree_fold(&tile, dim, &bb0_names, &body_ops, ctx, env)?;
