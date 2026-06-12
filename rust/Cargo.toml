@@ -1,0 +1,16 @@
+[package]
+name = "ktir-cpu"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
+
+# Slice 1 is intentionally dependency-free to keep the foundation portable and
+# the build instant. Planned additions as the port grows:
+#   ndarray  -> Tile data storage (replaces the flat Vec<f32> in tile.rs)
+#   half     -> f16 element type (currently widened to f32 at the load boundary)
+#   regex    -> KTIRParser tokenizer (parser/mod.rs)
+[dependencies]
+
+[lib]
+name = "ktir_cpu"
+path = "src/lib.rs"
