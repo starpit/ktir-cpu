@@ -8,7 +8,8 @@
 //! interpreter's function-result handling lands with the grid/interpreter slice.)
 
 use super::{Dispatch, LatencyCategory};
-use crate::interpreter::Scope;
+use crate::context::CoreContext;
+use crate::env::ExecutionEnv;
 use crate::ir::{Operation, Value};
 
 pub fn register(d: &mut Dispatch) {
@@ -16,6 +17,6 @@ pub fn register(d: &mut Dispatch) {
     d.register("func.return", LatencyCategory::Zero, ret);
 }
 
-fn ret(_op: &Operation, _scope: &mut Scope) -> Result<Option<Value>, String> {
+fn ret(_op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
     Ok(None)
 }

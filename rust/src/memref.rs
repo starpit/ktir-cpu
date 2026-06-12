@@ -7,6 +7,8 @@
 //! memory interpretation (`MemRef`), address computation (`TileRef`), and the
 //! coordinate descriptors (`AccessTile`) that load/store consume.
 
+use std::collections::HashMap;
+
 use crate::affine::{AffineMap, AffineSet, BoxSet};
 use crate::dtypes::DType;
 use crate::memory::STICK_BYTES;
@@ -70,7 +72,7 @@ impl MemRef {
     /// Mirrors the `byte_address` property.
     pub fn byte_address(&self) -> i64 {
         match self.space {
-            MemorySpace::Hbm => self.base_ptr * STICK_BYTES as i64,
+            MemorySpace::Hbm => self.base_ptr * STICK_BYTES,
             MemorySpace::Lx { .. } => self.base_ptr,
         }
     }
@@ -79,7 +81,7 @@ impl MemRef {
     /// HBM: `(stick_index, intra_byte_offset)`; LX: `(byte_addr, 0)`.
     pub fn split_addr(&self, byte_addr: i64) -> (i64, i64) {
         match self.space {
-            MemorySpace::Hbm => (byte_addr / STICK_BYTES as i64, byte_addr % STICK_BYTES as i64),
+            MemorySpace::Hbm => (byte_addr / STICK_BYTES, byte_addr % STICK_BYTES),
             MemorySpace::Lx { .. } => (byte_addr, 0),
         }
     }
@@ -199,6 +201,39 @@ pub struct AccessTile {
     pub coordinate_set: Option<AffineSet>,
     /// Parsed `access_tile_order`; None if omitted.
     pub coordinate_order: Option<AffineMap>,
+}
+
+/// Per-dimension descriptor for an indirect access tile. Mirrors the `kind`
+/// tagged dict entries in Python's `dim_subscripts`.
+#[derive(Clone, Debug)]
+pub enum DimSubscript {
+    /// Dimension indexed directly by an intermediate variable.
+    Direct { var_index: usize },
+    /// Dimension indexed by an affine expression over the variable point.
+    DirectExpr { map: AffineMap },
+    /// Dimension indexed indirectly via a lookup into `index_views[view]`.
+    Indirect { view: usize },
+}
+
+/// Indirect access tile for gather/scatter — result of
+/// `construct_indirect_access_tile`. Each output dimension is indexed directly
+/// (via an intermediate variable) or indirectly (via an index memory view).
+#[derive(Clone, Debug)]
+pub struct IndirectAccessTile {
+    /// Primary memory view being gathered/scattered (e.g. X).
+    pub parent_ref: MemRef,
+    /// Output access-tile shape.
+    pub shape: Vec<usize>,
+    /// Per-output-dim descriptor.
+    pub dim_subscripts: Vec<DimSubscript>,
+    /// Index memrefs for the indirect dims (used for byte addressing).
+    pub index_views: Vec<MemRef>,
+    /// Domain of the intermediate variables.
+    pub variables_space_set: AffineSet,
+    /// Iteration order over the variable space; `None` = default.
+    pub variables_space_order: Option<AffineMap>,
+    /// Extra per-dim metadata (parser-populated), kept open for the impl phase.
+    pub extra: HashMap<String, Vec<i64>>,
 }
 
 #[cfg(test)]

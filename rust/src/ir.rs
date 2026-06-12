@@ -13,7 +13,9 @@ use std::collections::HashMap;
 
 use crate::affine::{AffineMap, AffineSet};
 use crate::dtypes::DType;
-use crate::memref::{AccessTile, DistributedMemRef, MemRef, TileRef};
+use crate::memref::{
+    AccessTile, DistributedMemRef, DistributedTileRef, IndirectAccessTile, MemRef, TileRef,
+};
 use crate::tile::Tile;
 
 /// A scalar SSA value (e.g. `arith.constant`, a loop induction variable).
@@ -58,8 +60,9 @@ pub enum Value {
     MemRef(MemRef),
     DistMemRef(DistributedMemRef),
     TileRef(TileRef),
+    DistTileRef(DistributedTileRef),
     AccessTile(AccessTile),
-    // Future: DistTileRef(DistributedTileRef), IndirectAccessTile(IndirectAccessTile)
+    IndirectAccessTile(IndirectAccessTile),
 }
 
 /// A parsed operation attribute. Replaces the `Any` values in Python's
@@ -69,7 +72,9 @@ pub enum Attr {
     Int(i64),
     IntList(Vec<i64>),
     Float(f64),
+    FloatList(Vec<f64>),
     Str(String),
+    StrList(Vec<String>),
     Bool(bool),
     Dtype(DType),
     AffineMap(AffineMap),

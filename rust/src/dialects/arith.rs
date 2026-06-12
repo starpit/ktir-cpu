@@ -9,8 +9,9 @@
 //! accept either a NumPy array or a Python scalar.
 
 use super::{Dispatch, LatencyCategory};
+use crate::context::CoreContext;
 use crate::dtypes::DType;
-use crate::interpreter::Scope;
+use crate::env::ExecutionEnv;
 use crate::ir::{Attr, Operation, Scalar, Value};
 use crate::tile::Tile;
 
@@ -23,7 +24,7 @@ pub fn register(d: &mut Dispatch) {
 }
 
 /// `%c = arith.constant <value> : <type>` — value carried in the `value` attr.
-fn constant(op: &Operation, _scope: &mut Scope) -> Result<Option<Value>, String> {
+fn constant(op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
     let v = op
         .attributes
         .get("value")
@@ -37,16 +38,16 @@ fn constant(op: &Operation, _scope: &mut Scope) -> Result<Option<Value>, String>
     Ok(Some(val))
 }
 
-fn addf(op: &Operation, scope: &mut Scope) -> Result<Option<Value>, String> {
-    binary_float(op, scope, "arith.addf", |a, b| a + b)
+fn addf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+    binary_float(op, ctx, "arith.addf", |a, b| a + b)
 }
 
-fn mulf(op: &Operation, scope: &mut Scope) -> Result<Option<Value>, String> {
-    binary_float(op, scope, "arith.mulf", |a, b| a * b)
+fn mulf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+    binary_float(op, ctx, "arith.mulf", |a, b| a * b)
 }
 
-fn addi(op: &Operation, scope: &mut Scope) -> Result<Option<Value>, String> {
-    let (a, b) = two_operands(op, scope, "arith.addi")?;
+fn addi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+    let (a, b) = two_operands(op, ctx, "arith.addi")?;
     let (x, y) = (scalar_i64(a, "arith.addi")?, scalar_i64(b, "arith.addi")?);
     Ok(Some(Value::Scalar(Scalar::I64(x + y))))
 }
@@ -55,25 +56,25 @@ fn addi(op: &Operation, scope: &mut Scope) -> Result<Option<Value>, String> {
 
 fn two_operands<'s>(
     op: &Operation,
-    scope: &'s Scope,
+    ctx: &'s CoreContext,
     name: &str,
 ) -> Result<(&'s Value, &'s Value), String> {
     if op.operands.len() != 2 {
         return Err(format!("{name} expects 2 operands, got {}", op.operands.len()));
     }
-    let a = scope.get(&op.operands[0])?;
-    let b = scope.get(&op.operands[1])?;
+    let a = ctx.get_value(&op.operands[0])?;
+    let b = ctx.get_value(&op.operands[1])?;
     Ok((a, b))
 }
 
 /// Float binary op accepting scalar+scalar or tile+tile (element-wise).
 fn binary_float(
     op: &Operation,
-    scope: &mut Scope,
+    ctx: &mut CoreContext,
     name: &str,
     f: fn(f32, f32) -> f32,
 ) -> Result<Option<Value>, String> {
-    let (a, b) = two_operands(op, scope, name)?;
+    let (a, b) = two_operands(op, ctx, name)?;
     match (a, b) {
         (Value::Scalar(x), Value::Scalar(y)) => {
             let (x, y) = (

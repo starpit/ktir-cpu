@@ -464,7 +464,8 @@ pub fn constant_attr_to_value(attr: &Attr) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::dialects::Dispatch;
-    use crate::interpreter::{execute_ops, Scope};
+    use crate::env::{ExecutionEnv, GridExecutor};
+    use crate::interpreter::{execute_ops, single_core_context};
     use crate::ir::Value;
 
     const VECTOR_ADD: &str = include_str!(
@@ -524,9 +525,11 @@ mod tests {
         let f = module.get_function("f").unwrap();
 
         let dispatch = Dispatch::new();
-        let mut scope = Scope::new();
-        execute_ops(&f.operations, &dispatch, &mut scope).unwrap();
-        match scope.get("%d").unwrap() {
+        let grid = GridExecutor::new(f.grid);
+        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let mut ctx = single_core_context();
+        execute_ops(&f.operations, &mut ctx, &env).unwrap();
+        match ctx.get_value("%d").unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 10.0), // (2+3)*2
             other => panic!("expected F32(10.0), got {other:?}"),
         }

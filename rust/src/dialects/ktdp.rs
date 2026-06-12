@@ -16,8 +16,9 @@
 
 use super::{Dispatch, LatencyCategory};
 use crate::affine::AffineMap;
+use crate::context::CoreContext;
 use crate::dtypes::DType;
-use crate::interpreter::Scope;
+use crate::env::ExecutionEnv;
 use crate::ir::{Attr, Operation, Scalar, Value};
 use crate::memref::{AccessTile, MemRef, MemorySpace, ParentRef, TileRef};
 
@@ -31,11 +32,11 @@ pub fn register(d: &mut Dispatch) {
 /// Builds a logical `MemRef`. Mirrors `tile_view`. Slice limitation: shape /
 /// strides must be static (the Python parser also stores dynamic dims as SSA
 /// names resolved at runtime — that resolution lands with grid/scope support).
-fn construct_memory_view(op: &Operation, scope: &mut Scope) -> Result<Option<Value>, String> {
+fn construct_memory_view(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("construct_memory_view: missing pointer operand".into());
     }
-    let base_ptr = scalar_i64(scope.get(&op.operands[0])?, "construct_memory_view ptr")?;
+    let base_ptr = scalar_i64(ctx.get_value(&op.operands[0])?, "construct_memory_view ptr")?;
 
     let shape = int_list(op, "shape")?
         .iter()
@@ -72,11 +73,11 @@ fn construct_memory_view(op: &Operation, scope: &mut Scope) -> Result<Option<Val
 /// Single-allocation path: evaluate `base_map` at the indices to get base
 /// coords, fold them through the parent strides into a byte offset, and wrap
 /// the resulting `TileRef` in an `AccessTile`. Mirrors `tile_access`.
-fn construct_access_tile(op: &Operation, scope: &mut Scope) -> Result<Option<Value>, String> {
+fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("construct_access_tile: missing parent operand".into());
     }
-    let parent = match scope.get(&op.operands[0])? {
+    let parent = match ctx.get_value(&op.operands[0])? {
         Value::MemRef(m) => m.clone(),
         Value::DistMemRef(_) => {
             return Err(
@@ -90,7 +91,7 @@ fn construct_access_tile(op: &Operation, scope: &mut Scope) -> Result<Option<Val
 
     let indices: Vec<i64> = op.operands[1..]
         .iter()
-        .map(|name| scope.get(name).and_then(|v| scalar_i64(v, "construct_access_tile index")))
+        .map(|name| ctx.get_value(name).and_then(|v| scalar_i64(v, "construct_access_tile index")))
         .collect::<Result<_, _>>()?;
 
     let access_shape = int_list(op, "shape")?
@@ -181,7 +182,15 @@ fn scalar_i64(v: &Value, ctx: &str) -> Result<i64, String> {
 mod tests {
     use super::*;
     use crate::dialects::Dispatch;
-    use crate::interpreter::{execute_ops, Scope};
+    use crate::env::{ExecutionEnv, GridExecutor};
+    use crate::interpreter::{execute_ops, single_core_context};
+
+    fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
+        let dispatch = Dispatch::new();
+        let grid = GridExecutor::new((1, 1, 1));
+        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        execute_ops(ops, ctx, &env)
+    }
 
     fn build_view() -> Operation {
         // %v = construct_memory_view %p {shape=[64,32], strides=[32,1], HBM, f16}
@@ -194,10 +203,10 @@ mod tests {
 
     #[test]
     fn construct_view_builds_memref() {
-        let mut scope = Scope::new();
-        scope.set("%p", Value::Index(4)); // stick index 4
-        execute_ops(&[build_view()], &Dispatch::new(), &mut scope).unwrap();
-        match scope.get("%v").unwrap() {
+        let mut ctx = single_core_context();
+        ctx.set_value("%p", Value::Index(4)); // stick index 4
+        run(&[build_view()], &mut ctx).unwrap();
+        match ctx.get_value("%v").unwrap() {
             Value::MemRef(m) => {
                 assert_eq!(m.shape, vec![64, 32]);
                 assert_eq!(m.byte_address(), 4 * 128);
@@ -209,16 +218,16 @@ mod tests {
 
     #[test]
     fn access_tile_offset_via_base_map() {
-        let mut scope = Scope::new();
-        scope.set("%p", Value::Index(0)); // base at byte 0 for a clean offset check
-        scope.set("%i", Value::Index(2));
-        scope.set("%j", Value::Index(3));
-        // identity base_map over (i, j); offset = (2*32 + 3*1) elems * 2 bytes = 134
+        let mut ctx = single_core_context();
+        ctx.set_value("%p", Value::Index(0)); // base at byte 0 for a clean offset check
+        ctx.set_value("%i", Value::Index(2));
+        ctx.set_value("%j", Value::Index(3));
+        // identity base_map over (i, j); offset = (2*32 + 3*1) elems * 2 bytes
         let at = Operation::new(Some("%t"), "ktdp.construct_access_tile", &["%v", "%i", "%j"])
             .with_attr("shape", Attr::IntList(vec![1, 1]))
             .with_attr("base_map", Attr::AffineMap(AffineMap::identity(2)));
-        execute_ops(&[build_view(), at], &Dispatch::new(), &mut scope).unwrap();
-        match scope.get("%t").unwrap() {
+        run(&[build_view(), at], &mut ctx).unwrap();
+        match ctx.get_value("%t").unwrap() {
             Value::AccessTile(a) => match &a.parent_ref {
                 ParentRef::Tile(tr) => assert_eq!(tr.base_ptr, (2 * 32 + 3) * 2),
                 _ => panic!("expected single-allocation TileRef parent"),
@@ -229,14 +238,13 @@ mod tests {
 
     #[test]
     fn distributed_parent_is_flagged_unported() {
-        let mut scope = Scope::new();
-        // a DistMemRef value can't be built without partitions; just assert the
-        // single-allocation happy path doesn't accidentally accept non-memref.
-        scope.set("%v", Value::Index(7));
+        let mut ctx = single_core_context();
+        // assert the single-allocation path rejects a non-memref parent.
+        ctx.set_value("%v", Value::Index(7));
         let at = Operation::new(Some("%t"), "ktdp.construct_access_tile", &["%v"])
             .with_attr("shape", Attr::IntList(vec![1]))
             .with_attr("base_map", Attr::AffineMap(AffineMap::identity(0)));
-        let err = execute_ops(&[at], &Dispatch::new(), &mut scope).unwrap_err();
+        let err = run(&[at], &mut ctx).unwrap_err();
         assert!(err.contains("expected MemRef"));
     }
 }

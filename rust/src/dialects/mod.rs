@@ -17,12 +17,15 @@ pub mod ktdp;
 
 use std::collections::HashMap;
 
+use crate::context::CoreContext;
+use crate::env::ExecutionEnv;
 use crate::ir::{Operation, Value};
-use crate::interpreter::Scope;
 
-/// Handler signature. Mirrors Python's `(op, context, env) -> Any`, with the
-/// per-core scope standing in for `context`/`env` in this slice.
-pub type HandlerFn = fn(&Operation, &mut Scope) -> Result<Option<Value>, String>;
+/// Handler signature. Mirrors Python's `HandlerFn = (op, context, env) -> Any`:
+/// reads operands via `ctx.get_value`, runs nested regions via the dispatch
+/// table in `env`, and returns the value to bind to `op.result` (or `None`).
+pub type HandlerFn =
+    fn(&Operation, &mut CoreContext, &ExecutionEnv) -> Result<Option<Value>, String>;
 
 /// Op-name -> handler table, plus the parallel latency-category table that the
 /// Python registry keeps in lockstep.
