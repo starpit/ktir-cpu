@@ -95,6 +95,54 @@ pub fn effective_matmul_tier(device_name: &str) -> MatmulTier {
         .unwrap_or(MatmulTier::Naive)
 }
 
+/// Which matmul implementation to dispatch for a given problem on a given
+/// device. NAX is the M5 GPU tensor engine (bf16); Accelerate is Apple's AMX
+/// matrix coprocessor (f32). See [`choose_matmul_backend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatmulBackend {
+    /// Apple Accelerate `cblas_sgemm` (AMX, f32). The right pick for small or
+    /// occupancy-starved GEMMs and on any non-NAX device.
+    Accelerate,
+    /// The general NAX GEMM ([`NaxGemm`], bf16). Wins at scale on the M5.
+    Nax,
+}
+
+/// Minimum 128×256 output blocks before NAX beats Accelerate — below this the
+/// GPU is occupancy-starved (too few threadgroups to fill the cores). Calibrated
+/// from the M5 GPU-only sweep in `bench_nax_vs_blas`: 8 blocks (512³) ran below
+/// Accelerate, 32 blocks (1024³) ran ~2× above it.
+pub const NAX_MIN_BLOCKS: usize = 16;
+/// Minimum K depth before NAX beats Accelerate — shallow K can't amortize the
+/// per-dispatch and pipeline-fill cost. Same calibration source.
+pub const NAX_MIN_K: usize = 512;
+
+/// Choose the matmul backend for `C(m×k·k×n)` on the named device.
+///
+/// NAX only exists on M5+ *and* only helps at scale: the M5 throughput sweep
+/// shows small GEMMs are far slower on the GPU than on Accelerate's AMX (e.g.
+/// 256³ ≈ 0.19 TFLOP/s vs AMX's ~2), because too few output blocks leave the
+/// cores idle. So we route to NAX only when there are enough blocks to fill the
+/// GPU ([`NAX_MIN_BLOCKS`]) and K is deep enough to amortize ([`NAX_MIN_K`]);
+/// otherwise, and on every non-NAX device, we use Accelerate.
+///
+/// Note the backends differ in precision (NAX bf16 vs Accelerate f32), so this
+/// gate belongs to the experimental Metal/Spyre-faithful execution path, NOT
+/// the f32 parity interpreter (which always uses Accelerate via `blas.rs`).
+/// The threshold assumes GPU-resident operands; a one-shot host call pays
+/// copy/readback that pushes the crossover higher (fusion keeps data resident
+/// and lowers it back down).
+pub fn choose_matmul_backend(device_name: &str, m: usize, k: usize, n: usize) -> MatmulBackend {
+    if effective_matmul_tier(device_name) != MatmulTier::Nax {
+        return MatmulBackend::Accelerate;
+    }
+    let blocks = m.div_ceil(128) * n.div_ceil(256);
+    if blocks >= NAX_MIN_BLOCKS && k >= NAX_MIN_K {
+        MatmulBackend::Nax
+    } else {
+        MatmulBackend::Accelerate
+    }
+}
+
 /// Parse the `M<n>` generation from an Apple GPU name like `"Apple M5 Pro"`.
 /// Returns `None` for non-Apple-Silicon names. Forward-compatible: an `M6`
 /// reads as 6 (>= 5 -> Nax), unlike scratchy's fixed M1..M5 match.
@@ -1294,6 +1342,26 @@ kernel void mpp_probe(
         // Non-Apple stays at the naive floor.
         assert_eq!(effective_matmul_tier("Intel UHD Graphics 630"), Naive);
         assert!(!tier_implemented(Simdgroup));
+    }
+
+    #[test]
+    fn matmul_backend_gating() {
+        use MatmulBackend::{Accelerate, Nax};
+        // On the M5 (NAX-capable), large GEMMs route to NAX, small to Accelerate.
+        assert_eq!(choose_matmul_backend("Apple M5", 1024, 1024, 1024), Nax);
+        assert_eq!(choose_matmul_backend("Apple M5 Max", 2048, 2048, 2048), Nax);
+        // Below the block/K thresholds -> Accelerate even on the M5.
+        assert_eq!(choose_matmul_backend("Apple M5", 256, 256, 256), Accelerate); // few blocks
+        assert_eq!(choose_matmul_backend("Apple M5", 512, 512, 512), Accelerate); // 8 blocks < 16
+        assert_eq!(choose_matmul_backend("Apple M5", 2048, 64, 2048), Accelerate); // K=64 < 512
+        assert_eq!(choose_matmul_backend("Apple M5", 64, 4096, 64), Accelerate); // 1 block
+        // Boundary: exactly at the thresholds qualifies.
+        assert_eq!(choose_matmul_backend("Apple M5", 512, 512, 1024), Nax); // 4*4=16 blocks, K=512
+        assert_eq!(choose_matmul_backend("Apple M5", 1024, 512, 1024), Nax); // 8*4=32 blocks, K=512
+        // Non-NAX devices always use Accelerate, regardless of size.
+        assert_eq!(choose_matmul_backend("Apple M4", 4096, 4096, 4096), Accelerate);
+        assert_eq!(choose_matmul_backend("Apple M1", 4096, 4096, 4096), Accelerate);
+        assert_eq!(choose_matmul_backend("Intel UHD Graphics 630", 4096, 4096, 4096), Accelerate);
     }
 
     #[test]
