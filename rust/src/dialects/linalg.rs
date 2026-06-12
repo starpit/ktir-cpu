@@ -180,18 +180,10 @@ fn batch_matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> R
     let n = b.shape[2];
     let mut data = vec![0.0f32; batch * m * n];
     for bi in 0..batch {
-        let a_off = bi * m * k;
-        let b_off = bi * k * n;
-        let r_off = bi * m * n;
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f32;
-                for kk in 0..k {
-                    acc += a.data[a_off + i * k + kk] * b.data[b_off + kk * n + j];
-                }
-                data[r_off + i * n + j] = acc;
-            }
-        }
+        let a_slice = &a.data[bi * m * k..(bi + 1) * m * k];
+        let b_slice = &b.data[bi * k * n..(bi + 1) * k * n];
+        let c = crate::blas::sgemm_rowmajor(m, k, n, a_slice, b_slice);
+        data[bi * m * n..(bi + 1) * m * n].copy_from_slice(&c);
     }
     let mut result = Tile::compute(data, a.dtype, vec![batch, m, n]);
 
@@ -221,16 +213,8 @@ fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
         ));
     }
     let n = b.shape[1];
-    let mut data = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0.0f32;
-            for kk in 0..k {
-                acc += a.data[i * k + kk] * b.data[kk * n + j];
-            }
-            data[i * n + j] = acc;
-        }
-    }
+    // Backend-agnostic GEMM: naive by default, Accelerate under --features accelerate.
+    let data = crate::blas::sgemm_rowmajor(m, k, n, &a.data, &b.data);
     Ok(Tile::compute(data, a.dtype, vec![m, n]))
 }
 

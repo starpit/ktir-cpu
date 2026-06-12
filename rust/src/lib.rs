@@ -11,7 +11,12 @@
 //! comm seam lives in `comm` (only the top-level driver suspends). Dialect
 //! implementations and the memory load/store data path build against these.
 
+// Links Apple's Accelerate BLAS backend when the feature is on (see blas.rs).
+#[cfg(feature = "accelerate")]
+extern crate blas_src;
+
 pub mod affine;
+pub mod blas;
 pub mod codec;
 pub mod comm;
 pub mod comm_sched;

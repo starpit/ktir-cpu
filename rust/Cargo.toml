@@ -4,12 +4,26 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
 
-# Slice 1 is intentionally dependency-free to keep the foundation portable and
-# the build instant. Planned additions as the port grows:
-#   ndarray  -> Tile data storage (replaces the flat Vec<f32> in tile.rs)
-#   half     -> f16 element type (currently widened to f32 at the load boundary)
-#   regex    -> KTIRParser tokenizer (parser/mod.rs)
+# The default build is intentionally dependency-free: portable, instant, and the
+# parity oracle. Acceleration is opt-in via the `accelerate` feature.
+#
+# Future (not gating the default build):
+#   ndarray -> Tile storage (the tile.rs dtype fork); half -> f16; regex -> parser.
+[features]
+default = []
+# Route linalg matmul/dot through Apple's Accelerate BLAS (cblas_sgemm, AMX).
+# macOS only; deterministic and — since NumPy is also BLAS-backed — tends to
+# *improve* matmul parity with the reference rather than degrade it. Enable with
+#   cargo build --features accelerate
+# The naive Rust matmul remains the cross-platform default and parity oracle.
+accelerate = ["dep:blas-src", "dep:cblas-sys"]
+
 [dependencies]
+# Optional, only pulled in under --features accelerate. blas-src provides the
+# Accelerate backend (links the system framework); cblas-sys provides the
+# cblas_sgemm declaration.
+blas-src = { version = "0.10", optional = true, features = ["accelerate"] }
+cblas-sys = { version = "0.1", optional = true }
 
 [lib]
 name = "ktir_cpu"
