@@ -10,7 +10,7 @@
 //! scheduler that fills it is implement-phase.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 use std::rc::Rc;
 
 use crate::ir::Value;
@@ -26,9 +26,9 @@ pub struct CoreContext {
     /// All cores' LX, for remote `get_lx` during comm.
     all_lx: Vec<Rc<RefCell<LXScratchpad>>>,
     /// Region-scoped SSA map; index 0 is the function body. Inner scopes shadow.
-    scope_stack: Vec<HashMap<String, Value>>,
+    scope_stack: Vec<FxHashMap<String, Value>>,
     /// SSA name -> LX bytes; single source of truth for `lx.used`.
-    lx_bytes: HashMap<String, i64>,
+    lx_bytes: FxHashMap<String, i64>,
     /// Bump-allocator watermarks; `len == scope_stack.len() - 1`.
     lx_next_ptr_stack: Vec<i64>,
     /// Pending cross-core sends `(dst_core, tile)`, drained by the comm
@@ -51,8 +51,8 @@ impl CoreContext {
             hbm,
             lx,
             all_lx,
-            scope_stack: vec![HashMap::new()],
-            lx_bytes: HashMap::new(),
+            scope_stack: vec![FxHashMap::default()],
+            lx_bytes: FxHashMap::default(),
             lx_next_ptr_stack: Vec::new(),
             outbox: Vec::new(),
         }
@@ -88,10 +88,12 @@ impl CoreContext {
     }
 
     /// Look up an SSA value, searching scopes top-to-bottom. Mirrors `get_value`.
+    /// Hot path — looks up by a borrowed `&str` (no allocation; the map keys are
+    /// stripped of the leading `%`, so we strip the query the same way).
     pub fn get_value(&self, name: &str) -> Result<&Value, String> {
-        let key = normalize(name);
+        let key = name.trim_start_matches('%');
         for scope in self.scope_stack.iter().rev() {
-            if let Some(v) = scope.get(&key) {
+            if let Some(v) = scope.get(key) {
                 return Ok(v);
             }
         }
@@ -99,14 +101,14 @@ impl CoreContext {
     }
 
     pub fn has_value(&self, name: &str) -> bool {
-        let key = normalize(name);
-        self.scope_stack.iter().any(|s| s.contains_key(&key))
+        let key = name.trim_start_matches('%');
+        self.scope_stack.iter().any(|s| s.contains_key(key))
     }
 
     /// Enter a region: snapshot the LX watermark, push a fresh scope.
     pub fn push_scope(&mut self) {
         self.lx_next_ptr_stack.push(self.lx.borrow().next_ptr);
-        self.scope_stack.push(HashMap::new());
+        self.scope_stack.push(FxHashMap::default());
     }
 
     /// Exit the current region: untrack its values, rewind LX to the watermark.
@@ -141,7 +143,7 @@ impl CoreContext {
 
     /// Free LX for `name`. No-op if untracked. Mirrors `untrack_lx`.
     pub fn untrack_lx(&mut self, name: &str) {
-        if let Some(sz) = self.lx_bytes.remove(&normalize(name)) {
+        if let Some(sz) = self.lx_bytes.remove(name.trim_start_matches('%')) {
             self.lx.borrow_mut().used -= sz;
         }
     }
@@ -158,7 +160,7 @@ impl CoreContext {
 
     /// Reset for the next execution round. Mirrors `clear_values`.
     pub fn clear_values(&mut self) {
-        self.scope_stack = vec![HashMap::new()];
+        self.scope_stack = vec![FxHashMap::default()];
         self.lx_bytes.clear();
         self.lx_next_ptr_stack.clear();
         self.lx.borrow_mut().clear();

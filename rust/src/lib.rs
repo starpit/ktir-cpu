@@ -24,6 +24,7 @@ pub mod context;
 pub mod dialects;
 pub mod dtypes;
 pub mod env;
+pub mod fxhash;
 pub mod interpreter;
 pub mod ir;
 pub mod latency;

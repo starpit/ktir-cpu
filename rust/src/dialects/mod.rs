@@ -20,7 +20,7 @@ pub mod math;
 pub mod scf;
 pub mod tensor;
 
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 
 use crate::context::CoreContext;
 use crate::env::ExecutionEnv;
@@ -40,16 +40,16 @@ pub type HandlerFn =
 /// Op-name -> handler table, plus the parallel latency-category table that the
 /// Python registry keeps in lockstep.
 pub struct Dispatch {
-    handlers: HashMap<&'static str, HandlerFn>,
-    latency: HashMap<&'static str, LatencyCategory>,
+    handlers: FxHashMap<&'static str, HandlerFn>,
+    latency: FxHashMap<&'static str, LatencyCategory>,
 }
 
 impl Dispatch {
     /// Build the table by letting each dialect register its ops.
     pub fn new() -> Self {
         let mut d = Dispatch {
-            handlers: HashMap::new(),
-            latency: HashMap::new(),
+            handlers: FxHashMap::default(),
+            latency: FxHashMap::default(),
         };
         arith::register(&mut d);
         func::register(&mut d);

@@ -12,7 +12,7 @@
 //! — the scheduler is single-threaded/cooperative, so no `Arc`/`Mutex` needed.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fxhash::FxHashMap;
 use std::rc::Rc;
 
 /// HBM "stick" (cache block) size in bytes. Mirrors `HBMSimulator.STICK_BYTES`.
@@ -23,7 +23,7 @@ pub const STICK_BYTES: i64 = 128;
 pub struct HBMSimulator {
     pub size_bytes: i64,
     /// base byte address -> raw allocation bytes
-    allocations: HashMap<i64, Vec<u8>>,
+    allocations: FxHashMap<i64, Vec<u8>>,
     /// next unallocated byte address (stick-aligned); starts at 0x10000
     pub next_ptr: i64,
 }
@@ -38,7 +38,7 @@ impl HBMSimulator {
     pub fn new(size_gb: i64) -> Self {
         HBMSimulator {
             size_bytes: size_gb * 1024 * 1024 * 1024,
-            allocations: HashMap::new(),
+            allocations: FxHashMap::default(),
             next_ptr: 0x10000,
             }
     }
@@ -72,7 +72,7 @@ pub struct LXScratchpad {
     pub capacity: i64,
     pub used: i64,
     pub core_id: usize,
-    allocations: HashMap<i64, Vec<u8>>,
+    allocations: FxHashMap<i64, Vec<u8>>,
     pub next_ptr: i64,
 }
 
@@ -82,7 +82,7 @@ impl LXScratchpad {
             capacity: size_mb * 1024 * 1024,
             used: 0,
             core_id,
-            allocations: HashMap::new(),
+            allocations: FxHashMap::default(),
             next_ptr: 0,
         }
     }
@@ -131,7 +131,7 @@ impl SpyreMemoryHierarchy {
 // --- shared byte-buffer helpers (port of _find_allocation/_read_flat/_write_flat) ---
 
 /// Find the allocation containing `ptr`, returning `(base, len)`.
-fn find_allocation(allocs: &HashMap<i64, Vec<u8>>, ptr: i64) -> Option<(i64, usize)> {
+fn find_allocation(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64) -> Option<(i64, usize)> {
     if let Some(buf) = allocs.get(&ptr) {
         return Some((ptr, buf.len()));
     }
@@ -141,7 +141,7 @@ fn find_allocation(allocs: &HashMap<i64, Vec<u8>>, ptr: i64) -> Option<(i64, usi
         .map(|(&base, buf)| (base, buf.len()))
 }
 
-fn read_bytes(allocs: &HashMap<i64, Vec<u8>>, ptr: i64, len: usize) -> Vec<u8> {
+fn read_bytes(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     if let Some((base, _)) = find_allocation(allocs, ptr) {
         let buf = &allocs[&base];
@@ -153,7 +153,7 @@ fn read_bytes(allocs: &HashMap<i64, Vec<u8>>, ptr: i64, len: usize) -> Vec<u8> {
     out // zero-padded past allocation end (matches Python)
 }
 
-fn write_bytes(allocs: &mut HashMap<i64, Vec<u8>>, ptr: i64, data: &[u8]) {
+fn write_bytes(allocs: &mut FxHashMap<i64, Vec<u8>>, ptr: i64, data: &[u8]) {
     if let Some((base, buflen)) = find_allocation(allocs, ptr) {
         let off = (ptr - base) as usize;
         let needed = off + data.len();

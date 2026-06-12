@@ -151,6 +151,18 @@ fn store(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
 /// `coordinate_order` when present (mirrors `css.enumerate` + `cso.eval`).
 fn enumerated_coords(access: &AccessTile) -> Option<Vec<Vec<i64>>> {
     let css = access.coordinate_set.as_ref()?;
+    // Fast-path bypass: a coordinate set covering the full `[0, shape)` box with
+    // an identity iteration order selects exactly the whole tile in row-major
+    // order — identical to a plain contiguous load/store. Returning `None` takes
+    // that fast path instead of enumerating every point (the O(2^n) `is_full`
+    // vertex check vs O(∏ shape) enumeration + element-wise gather/scatter).
+    let order_is_identity = access
+        .coordinate_order
+        .as_ref()
+        .is_none_or(|m| m.is_identity());
+    if order_is_identity && css.is_full(&access.shape) {
+        return None;
+    }
     let mut coords = css.enumerate(&access.shape, &[]);
     if let Some(order) = &access.coordinate_order {
         coords = coords.iter().map(|pt| order.eval(pt, &[])).collect();
