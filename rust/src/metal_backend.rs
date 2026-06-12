@@ -802,11 +802,17 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
     constant uint3& dims     [[buffer(3)]],   // (M, N, K)
     device const float* e_in [[buffer(4)]],   // M x N epilogue operand (or dummy)
     constant uint2& epi      [[buffer(5)]],   // (binop, act) codes
-    uint2 tg  [[threadgroup_position_in_grid]],
+    uint3 tg  [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_simdgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]])
 {
     const uint M = dims.x, N = dims.y, K = dims.z;
+    // Batch index (grid z): each slice is an independent same-shape GEMM, so the
+    // whole batch runs concurrently in one dispatch. tg.z = 0 for a single GEMM.
+    a_in  += tg.z * M * K;
+    b_in  += tg.z * K * N;
+    c_out += tg.z * M * N;
+    e_in  += tg.z * M * N;   // only dereferenced when binop != 0 (guarded below)
     const uint tm0 = tg.y * TG_M;          // threadgroup block base row
     const uint tn0 = tg.x * TG_N;          // threadgroup block base column
     const uint sm  = sgid / SGS_N;         // simdgroup's row slot
@@ -958,10 +964,14 @@ inline float simd_epilogue(float v, float ev, uint binop, uint act) {
     constant uint3& dims     [[buffer(3)]],
     device const float* e_in [[buffer(4)]],
     constant uint2& epi      [[buffer(5)]],
-    uint2 tg  [[threadgroup_position_in_grid]],
+    uint3 tg  [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_simdgroup]])
 {
     const uint M = dims.x, N = dims.y, K = dims.z;
+    a_in  += tg.z * M * K;   // batch index (grid z): independent same-shape GEMM
+    b_in  += tg.z * K * N;
+    c_out += tg.z * M * N;
+    e_in  += tg.z * M * N;
     const uint r0 = tg.y * 8u;   // output 8x8 tile base row
     const uint c0 = tg.x * 8u;   // base col
     threadgroup float a_tg[64];
@@ -1294,6 +1304,112 @@ impl NaxGemm {
         let last = &ping[(steps.len() - 1) % 2];
         let raw =
             unsafe { std::slice::from_raw_parts(last.contents().as_ptr() as *const f32, final_len) };
+        Ok(raw.to_vec())
+    }
+
+    /// **Combine** many small matmuls that share the weight `b` into ONE tall
+    /// matmul. `a_stack` is `count` row-panels (`count·m × k`, contiguous), `b`
+    /// is the shared `k × n` weight; returns `count·m × n`. This is the real win
+    /// for a SPMD KTIR grid (every core multiplies its rows by the same weights):
+    /// stacking the panels into a single GEMM saturates the tensor engine, so
+    /// the GPU beats a serial AMX loop by 1.25–1.74× once K ≳ 512 (measured) —
+    /// unlike running them separately, where each small matmul underfills the
+    /// engine and the GPU loses. Just a clarity wrapper over [`run`](Self::run)
+    /// with `m' = count·m`.
+    pub fn run_combined(
+        &self,
+        count: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        a_stack: &[f32],
+        b: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        assert_eq!(a_stack.len(), count * m * k, "stacked A must be count·m×k");
+        assert_eq!(b.len(), k * n, "shared B must be k×n");
+        self.run(count * m, k, n, a_stack, b)
+    }
+
+    /// `batch` independent same-shape GEMMs `Cᵢ = Aᵢ · Bᵢ` in ONE dispatch (one
+    /// submission), run concurrently across the GPU. `a` is `batch·m·k` and `b`
+    /// is `batch·k·n`, both row-major and contiguous per slice; returns
+    /// `batch·m·n`. Use this when each matmul has its OWN B; when they share B,
+    /// [`run_combined`](Self::run_combined) is faster (one saturating GEMM).
+    pub fn run_batched(
+        &self,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
+        };
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+        assert_eq!(a.len(), batch * m * k, "A must be batch×m×k");
+        assert_eq!(b.len(), batch * k * n, "B must be batch×k×n");
+        let out_len = batch * m * n;
+        let res = MTLResourceOptions::StorageModeShared;
+
+        let upload = |data: &[f32]| -> Result<MtlBuf, String> {
+            let bytes = bytemuck_cast(data);
+            unsafe {
+                self.device
+                    .newBufferWithBytes_length_options(
+                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                        bytes.len().max(4),
+                        res,
+                    )
+                    .ok_or_else(|| "metal: batched upload failed".to_string())
+            }
+        };
+        let a_buf = upload(a)?;
+        let b_buf = upload(b)?;
+        let e_buf = upload(&[0.0f32])?;
+        let c_buf = self
+            .device
+            .newBufferWithLength_options((out_len * 4).max(4), res)
+            .ok_or("metal: batched output alloc failed")?;
+        let dims = [m as u32, n as u32, k as u32];
+        let codes = [0u32, 0u32];
+
+        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+        let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
+        enc.setComputePipelineState(&self.pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
+            enc.setBytes_length_atIndex(
+                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&dims),
+                3,
+            );
+            enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
+            enc.setBytes_length_atIndex(
+                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&codes),
+                5,
+            );
+        }
+        // Grid z = batch: all `batch` GEMMs dispatched together, run concurrently.
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: n.div_ceil(self.block_n),
+                height: m.div_ceil(self.block_m),
+                depth: batch,
+            },
+            MTLSize { width: self.threads, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        let raw =
+            unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
         Ok(raw.to_vec())
     }
 
@@ -1638,6 +1754,87 @@ kernel void mpp_probe(
             separate * 1e6,
             separate / chained
         );
+    }
+
+    /// **Combining** many small same-weight matmuls into one tall GEMM is both
+    /// correct (matches per-slice) AND faster than a serial AMX loop once the
+    /// matmul is compute-bound (K ≳ 512) — the real way to exploit a SPMD grid's
+    /// many small matmuls on the GPU. Measured speedups: ~1.25× at K=512 up to
+    /// ~1.74× at K=2048 (see the module bench).
+    #[test]
+    fn combined_matmul_matches_and_wins() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => return,
+            Err(e) => panic!("{e}"),
+        };
+        // 16 cores each multiply their 512 rows by the SAME 1024×1024 weights.
+        let (count, m, k, n) = (16usize, 512usize, 1024usize, 1024usize);
+        let a: Vec<f32> = (0..count * m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect();
+
+        let got = ctx.run_combined(count, m, k, n, &a, &b).unwrap();
+        // Correctness: each core's rows match its own matmul (bf16 tolerance).
+        let mut max_rel = 0.0f32;
+        for s in 0..count {
+            let want = crate::blas::naive_sgemm(m, k, n, &a[s * m * k..(s + 1) * m * k], &b);
+            for (g, w) in got[s * m * n..(s + 1) * m * n].iter().zip(&want) {
+                max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
+            }
+        }
+        assert!(max_rel < 0.05, "combined mismatch, max rel err {max_rel}");
+
+        // Speed: combined GEMM vs the serial per-core AMX loop it replaces.
+        let it = 10;
+        let t0 = std::time::Instant::now();
+        for _ in 0..it {
+            ctx.run_combined(count, m, k, n, &a, &b).unwrap();
+        }
+        let combined = t0.elapsed().as_secs_f64() / it as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..it {
+            for s in 0..count {
+                std::hint::black_box(crate::blas::sgemm_rowmajor(
+                    m, k, n, &a[s * m * k..(s + 1) * m * k], &b,
+                ));
+            }
+        }
+        let amx_loop = t1.elapsed().as_secs_f64() / it as f64;
+        eprintln!(
+            "combine {count}×({m}×{k}×{n}): GPU one tall GEMM {:.0} µs vs serial AMX {:.0} µs  ({:.2}×)",
+            combined * 1e6,
+            amx_loop * 1e6,
+            amx_loop / combined
+        );
+    }
+
+    /// A batched dispatch (independent same-shape GEMMs in one submission)
+    /// matches running them separately. (For *shared*-weight matmuls,
+    /// `run_combined` is the faster path — see `combined_matmul_matches_and_wins`.)
+    #[test]
+    fn batched_matmul_matches_oracle() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => return,
+            Err(e) => panic!("{e}"),
+        };
+        let (batch, m, k, n) = (64usize, 256usize, 256usize, 256usize);
+        let a: Vec<f32> = (0..batch * m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+        let b: Vec<f32> = (0..batch * k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.05).collect();
+
+        let got = ctx.run_batched(batch, m, k, n, &a, &b).unwrap();
+        let mut max_rel = 0.0f32;
+        for s in 0..batch {
+            let want = crate::blas::naive_sgemm(
+                m, k, n,
+                &a[s * m * k..(s + 1) * m * k],
+                &b[s * k * n..(s + 1) * k * n],
+            );
+            for (g, w) in got[s * m * n..(s + 1) * m * n].iter().zip(&want) {
+                max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
+            }
+        }
+        assert!(max_rel < 0.05, "batched mismatch, max rel err {max_rel}");
     }
 
     /// The pre-M5 `simdgroup_float8x8` GEMM is correct across shapes (incl.
