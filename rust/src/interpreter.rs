@@ -304,6 +304,17 @@ pub fn execute_function(
     func_name: &str,
     args: &[(&str, Arg)],
 ) -> Result<HashMap<String, Output>, String> {
+    // Fast path (NAX tensor engine): a multi-core, comm-free, straight-line SPMD
+    // grid whose cores share a matmul weight runs lock-step on the GPU, combining
+    // the grid's per-core matmul panels into one GEMM instead of one Accelerate
+    // call per tile. `execute_function_gpu` returns Err whenever it doesn't apply
+    // (single core, comm ops, region-bearing ops, or no NAX device), so this is a
+    // pure accelerator with a transparent fall-through to the comm scheduler.
+    #[cfg(metal)]
+    if let Ok(out) = execute_function_gpu(module, func_name, args) {
+        return Ok(out);
+    }
+
     let func = module.get_function(func_name)?;
     let (gx, gy, gz) = func.grid;
     let num_cores = gx * gy * gz;
