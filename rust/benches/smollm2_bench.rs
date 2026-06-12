@@ -43,6 +43,15 @@ fn main() {
         }
     }
 
+    // The attention mask (`attn_mask`) is a runtime input — not a source, not
+    // produced by any node, no t{id}.bin — so seed it with the all-zeros causal
+    // mask for single-token decode (matches tests/e2e_smollm2.rs and the
+    // production runner). Without this, node 6 panics ("no entry found").
+    if let Some(mid) = manifest["attn_mask"].as_u64() {
+        let (r, c) = shape[&mid];
+        sources.insert(mid, vec![0.0f32; r * c]);
+    }
+
     let nodes = manifest["nodes"].as_array().unwrap();
     let mut cache: HashMap<String, ktir_cpu::ir::IRModule> = HashMap::new();
     for node in nodes {

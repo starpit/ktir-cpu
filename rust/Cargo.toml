@@ -66,3 +66,8 @@ serde_json = "1"
 [[bench]]
 name = "smollm2_bench"
 harness = false
+
+# Keep symbol info in the optimized bench build so cargo flamegraph / instruments
+# attribute samples to functions instead of raw addresses.
+[profile.bench]
+debug = true
