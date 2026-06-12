@@ -32,6 +32,8 @@ pub mod ir;
 pub mod latency;
 pub mod memory;
 pub mod memref;
+#[cfg(feature = "metal")]
+pub mod metal_backend;
 pub mod ops_memory;
 pub mod parser;
 pub mod parser_ast;

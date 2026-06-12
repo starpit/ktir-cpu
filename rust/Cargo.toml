@@ -12,6 +12,11 @@ description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
 [features]
 default = []
 
+# Experimental KTIR -> Metal Shading Language backend (codegen only for now;
+# GPU dispatch is a later slice). Pure string emission — no deps, no GPU needed
+# to build/test the codegen. macOS-oriented.
+metal = []
+
 # BLAS matmul for NON-macOS platforms — pick one. (macOS uses Apple Accelerate
 # automatically, with no feature flag; see the target deps below.) Linux has no
 # universally-present BLAS, so the backend is an explicit choice here.
