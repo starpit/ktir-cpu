@@ -12,6 +12,7 @@
 //! implementations and the memory load/store data path build against these.
 
 pub mod affine;
+pub mod codec;
 pub mod comm;
 pub mod context;
 pub mod dialects;

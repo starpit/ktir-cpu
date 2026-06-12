@@ -13,9 +13,16 @@
 //! input/output marshalling in `execute_function` are implement-phase fills
 //! against these locked seams.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use crate::codec;
 use crate::context::CoreContext;
-use crate::env::ExecutionEnv;
-use crate::ir::{Operation, Value};
+use crate::dialects::Dispatch;
+use crate::dtypes::DType;
+use crate::env::{ExecutionEnv, GridExecutor};
+use crate::ir::{IRModule, Operation, Scalar, Value};
+use crate::memory::{SpyreMemoryHierarchy, STICK_BYTES};
 
 /// Execute one operation: dispatch, then bind its result (tracking LX for
 /// Tiles). Mirrors `_execute_op`. Comm ops (which suspend) are driven by the
@@ -80,8 +87,6 @@ pub fn execute_region(
 /// hierarchy — the common setup for executing a `grid = [1]` function or a unit
 /// test. Returns `(context, dispatch)` ready for `execute_ops`.
 pub fn single_core_context() -> CoreContext {
-    use crate::memory::SpyreMemoryHierarchy;
-    use std::rc::Rc;
     let mem = SpyreMemoryHierarchy::new(1);
     CoreContext::new(
         0,
@@ -90,6 +95,98 @@ pub fn single_core_context() -> CoreContext {
         mem.get_lx(0),
         mem.lx_scratchpads.clone(),
     )
+}
+
+/// A function argument: a tensor (marshalled into HBM) or a scalar (bound
+/// directly). Mirrors the `np.ndarray` vs scalar split in `execute_function`.
+#[derive(Clone, Debug)]
+pub enum Arg {
+    Tensor { data: Vec<f32>, shape: Vec<usize>, dtype: DType },
+    Scalar(Scalar),
+}
+
+/// A tensor read back from HBM after execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Output {
+    pub data: Vec<f32>,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+
+/// Execute a function with tensor + scalar arguments and return every tensor
+/// argument read back from HBM. Port of `KTIRInterpreter.execute_function`
+/// (without latency tracking yet, and with the comm-free multi-core driver —
+/// each core runs the body independently against shared HBM; the comm
+/// scheduler lands in a later slice).
+pub fn execute_function(
+    module: &IRModule,
+    func_name: &str,
+    args: &[(&str, Arg)],
+) -> Result<HashMap<String, Output>, String> {
+    let func = module.get_function(func_name)?;
+    let (gx, gy, gz) = func.grid;
+    let num_cores = gx * gy * gz;
+
+    let mem = SpyreMemoryHierarchy::new(num_cores.max(1));
+    let grid = GridExecutor::new(func.grid);
+    let dispatch = Dispatch::new();
+    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+
+    // Allocate tensor inputs in HBM (stick index bound as the pointer); scalars
+    // bind directly. Record tensor metadata for read-back.
+    let mut input_ptrs: Vec<(String, Value)> = Vec::new();
+    let mut tensor_meta: Vec<(String, i64, usize, Vec<usize>, DType)> = Vec::new(); // name, stick, n, shape, dtype
+    for (name, arg) in args {
+        match arg {
+            Arg::Tensor { data, shape, dtype } => {
+                let bytes = codec::encode(data, *dtype);
+                let stick = {
+                    let mut hbm = mem.hbm.borrow_mut();
+                    let stick = hbm.allocate(bytes.len() as i64);
+                    hbm.write_bytes(stick * STICK_BYTES, &bytes);
+                    stick
+                };
+                input_ptrs.push((name.to_string(), Value::Index(stick)));
+                tensor_meta.push((
+                    name.to_string(),
+                    stick,
+                    shape.iter().product(),
+                    shape.clone(),
+                    *dtype,
+                ));
+            }
+            Arg::Scalar(s) => input_ptrs.push((name.to_string(), Value::Scalar(*s))),
+        }
+    }
+
+    // Drive each core independently (no cross-core comm in this slice).
+    for core_id in 0..num_cores.max(1) {
+        let grid_pos = grid.linear_to_grid(core_id);
+        let mut ctx = CoreContext::new(
+            core_id,
+            grid_pos,
+            Rc::clone(&mem.hbm),
+            mem.get_lx(core_id),
+            mem.lx_scratchpads.clone(),
+        );
+        for (name, val) in &input_ptrs {
+            ctx.set_value(name, val.clone());
+        }
+        execute_ops(&func.operations, &mut ctx, &env)
+            .map_err(|e| format!("core {core_id}: {e}"))?;
+    }
+
+    // Read tensor args back from HBM.
+    let mut outputs = HashMap::new();
+    for (name, stick, n, shape, dtype) in tensor_meta {
+        let nbytes = n * dtype.bytes_per_elem();
+        let bytes = mem.hbm.borrow().read_bytes(stick * STICK_BYTES, nbytes);
+        outputs.insert(
+            name,
+            Output { data: codec::decode(&bytes, n, dtype), shape, dtype },
+        );
+    }
+    Ok(outputs)
 }
 
 #[cfg(test)]
