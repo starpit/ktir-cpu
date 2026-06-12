@@ -619,13 +619,16 @@ fn bytemuck_cast(data: &[f32]) -> &[u8] {
 
 /// MSL for the general NAX GEMM. `dims = (M, N, K)`.
 ///
-/// Two levels of tiling. **Threadgroup**: 4 simdgroups (128 threads) arranged
-/// 2×2 cooperatively stage the A[64×16] and Bᵀ[128×16] panels for a 64×128
-/// output block — 128 threads share each device load. **Register**: each
-/// simdgroup then computes its 32×64 sub-block as a 2×2 grid of 16×32
-/// `matmul2d` tiles, loading 2 A row-fragments and 2 B column-fragment-pairs
-/// per K-step and running all 4 products from them. Ragged M/N/K are zero-padded
-/// on stage and guarded on store.
+/// Three levels of tiling. **Threadgroup**: SGS_M×SGS_N simdgroups (here 4×4 =
+/// 16 simdgroups, 512 threads) cooperatively stage the A[128×16] and Bᵀ[256×16]
+/// panels for a 128×256 output block — all threads share each device load.
+/// **Register**: each simdgroup computes its 32×64 sub-block as a 2×2 grid of
+/// 16×32 `matmul2d` tiles, loading 2 A row-fragments and 2 B column-fragment-
+/// pairs per K-step and running all 4 products from them. **Pipeline**:
+/// double-buffered panels — the next K-step's device loads are prefetched into
+/// the other threadgroup half while the current panel feeds the matmuls, hiding
+/// load latency behind compute. Ragged M/N/K are zero-padded on stage and
+/// guarded on store.
 const NAX_MATMUL_SRC: &str = "\
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -658,8 +661,10 @@ constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
     const uint n0  = tn0 + sn * SG_N;      // this simdgroup's base column
     const uint tid = sgid * 32u + lid;     // flat thread id in threadgroup
 
-    threadgroup bfloat a_tg[TG_M * BK];    // [TG_M, K-step] staging
-    threadgroup bfloat b_tg[TG_N * BK];    // [TG_N, K-step] = transpose(B) staging
+    // Double-buffered staging: while one panel feeds the matmuls, the next is
+    // prefetched into the other half, so device-load latency overlaps compute.
+    threadgroup bfloat a_tg[2 * TG_M * BK];   // [2][TG_M, K-step]
+    threadgroup bfloat b_tg[2 * TG_N * BK];   // [2][TG_N, K-step] = transpose(B)
 
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         16, 32, 16,
@@ -685,32 +690,50 @@ constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
         c10[e] = 0.0f; c10[8 + e] = 0.0f;  c11[e] = 0.0f; c11[8 + e] = 0.0f;
     }
 
-    for (uint k0 = 0; k0 < K; k0 += BK) {
-        // All threads in the threadgroup cooperatively stage the shared panels.
-        for (uint i = tid; i < TG_M * BK; i += TG_THREADS) {
-            uint r = i / BK, c = i % BK;              // r: M (in block), c: K
-            uint gm = tm0 + r, gk = k0 + c;
-            a_tg[i] = (gm < M && gk < K) ? bfloat(a_in[gm * K + gk]) : bfloat(0);
-        }
-        for (uint i = tid; i < TG_N * BK; i += TG_THREADS) {
-            uint n = i / BK, c = i % BK;              // n: N (in block), c: K
-            uint gn = tn0 + n, gk = k0 + c;
-            b_tg[i] = (gn < N && gk < K) ? bfloat(b_in[gk * N + gn]) : bfloat(0);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint ar = sm * SG_M;   // this simdgroup's row offset into a_tg panel
+    const uint bn = sn * SG_N;    // this simdgroup's col offset into b_tg panel
+    const uint nk = (K + BK - 1u) / BK;  // number of K-steps
 
-        // This simdgroup's sub-panel base within the shared staging.
-        uint ar = sm * SG_M;     // row offset into a_tg
-        uint bn = sn * SG_N;     // col offset into b_tg
+    // Stage one K-panel (rows of A, transposed cols of B) at K-offset `kc` into
+    // buffer half `buf`. Zero-pads ragged M/N/K. (Macro so it inlines cleanly.)
+#define STAGE_PANEL(buf, kc)                                                    \
+    do {                                                                       \
+        threadgroup bfloat* ap = a_tg + (buf) * (TG_M * BK);                   \
+        threadgroup bfloat* bp = b_tg + (buf) * (TG_N * BK);                   \
+        for (uint i = tid; i < TG_M * BK; i += TG_THREADS) {                   \
+            uint r = i / BK, c = i % BK;                                       \
+            uint gm = tm0 + r, gk = (kc) + c;                                  \
+            ap[i] = (gm < M && gk < K) ? bfloat(a_in[gm * K + gk]) : bfloat(0);\
+        }                                                                      \
+        for (uint i = tid; i < TG_N * BK; i += TG_THREADS) {                   \
+            uint n = i / BK, c = i % BK;                                       \
+            uint gn = tn0 + n, gk = (kc) + c;                                  \
+            bp[i] = (gn < N && gk < K) ? bfloat(b_in[gk * N + gn]) : bfloat(0);\
+        }                                                                      \
+    } while (0)
+
+    STAGE_PANEL(0u, 0u);                       // prime buffer 0 with K-step 0
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ki = 0; ki < nk; ++ki) {
+        uint cur = ki & 1u;
+        // Prefetch the next panel into the other buffer; its device loads are
+        // in flight while this step's matmuls run.
+        if (ki + 1u < nk) {
+            STAGE_PANEL(cur ^ 1u, (ki + 1u) * BK);
+        }
+        // Load this simdgroup's fragments from the current buffer and accumulate.
+        threadgroup bfloat* ap = a_tg + cur * (TG_M * BK);
+        threadgroup bfloat* bp = b_tg + cur * (TG_N * BK);
         for (short e = 0; e < 8; ++e) {
             short r = fm + (e >> 2) * 8;
             short c = fn + (e % 4);
-            a0[e] = a_tg[(ar + r) * BK + c];
-            a1[e] = a_tg[(ar + r + 16) * BK + c];
-            b0[e]     = b_tg[(bn + r) * BK + c];
-            b0[8 + e] = b_tg[(bn + r + 16) * BK + c];
-            b1[e]     = b_tg[(bn + r + 32) * BK + c];
-            b1[8 + e] = b_tg[(bn + r + 48) * BK + c];
+            a0[e] = ap[(ar + r) * BK + c];
+            a1[e] = ap[(ar + r + 16) * BK + c];
+            b0[e]     = bp[(bn + r) * BK + c];
+            b0[8 + e] = bp[(bn + r + 16) * BK + c];
+            b1[e]     = bp[(bn + r + 32) * BK + c];
+            b1[8 + e] = bp[(bn + r + 48) * BK + c];
         }
         gemm_op.run(a0, b0, c00);
         gemm_op.run(a0, b1, c01);
@@ -718,6 +741,7 @@ constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
         gemm_op.run(a1, b1, c11);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+#undef STAGE_PANEL
 
     // Store this simdgroup's 2x2 tile block (rows m0+{0,16}, cols n0+{0,16,32,48}).
     for (short e = 0; e < 8; ++e) {
