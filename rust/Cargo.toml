@@ -39,12 +39,17 @@ objc2-foundation = { version = "0.3", optional = true }
 blas-src = { version = "0.10", optional = true, default-features = false }
 openblas-src = { version = "0.10", optional = true, default-features = false }
 
-# macOS: Apple Accelerate ships with the OS, so link it unconditionally and use
-# it by default — zero feature flags. (Required here; optional above so non-macOS
-# builds only pull a BLAS library when a provider feature asks for one.)
+# macOS: Apple Accelerate AND the Metal/NAX backend ship with / target the OS,
+# so link them unconditionally and use them by default — zero feature flags.
+# build.rs emits cfg(metal) on macOS so the emulator dispatches large matmuls to
+# the NAX tensor engine automatically. (objc2-* are macOS-only; on other targets
+# the optional `metal` feature above pulls them for explicit cross builds.)
 [target.'cfg(target_os = "macos")'.dependencies]
 blas-src = { version = "0.10", default-features = false, features = ["accelerate"] }
 cblas-sys = "0.1"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
 
 [lib]
 name = "ktir_cpu"

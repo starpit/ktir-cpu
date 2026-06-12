@@ -33,6 +33,24 @@ use crate::interpreter::execute_region;
 use crate::ir::{Attr, Operation, Scalar, Value};
 use crate::tile::Tile;
 
+/// Row-major `C(m×k·k×n)` for the emulator, on the highest-performance backend
+/// available. With the `metal` feature this dispatches through the size-gated
+/// NAX-or-Accelerate selector ([`crate::metal_backend::metal_gemm_or_blas`]):
+/// large GEMMs run on the M5 NAX tensor engine (bf16, ~2× Accelerate), small
+/// ones on Accelerate (f32) — so unit-test-scale matmuls keep exact f32 parity
+/// while production-scale ones get the GPU. Without `metal`, it's the BLAS path
+/// (Accelerate on macOS, naive elsewhere).
+fn gemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+    #[cfg(metal)]
+    {
+        crate::metal_backend::metal_gemm_or_blas(m, k, n, a, b)
+    }
+    #[cfg(not(metal))]
+    {
+        crate::blas::sgemm_rowmajor(m, k, n, a, b)
+    }
+}
+
 /// Sentinel scope key under which `linalg.yield` parks its yielded value so the
 /// region driver can recover it after `execute_region` (which itself returns
 /// `()`). Chosen to never collide with a real SSA name.
@@ -209,7 +227,7 @@ fn batch_matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> R
     for bi in 0..batch {
         let a_slice = &a.data[bi * m * k..(bi + 1) * m * k];
         let b_slice = &b.data[bi * k * n..(bi + 1) * k * n];
-        let c = crate::blas::sgemm_rowmajor(m, k, n, a_slice, b_slice);
+        let c = gemm(m, k, n, a_slice, b_slice);
         data[bi * m * n..(bi + 1) * m * n].copy_from_slice(&c);
     }
     let mut result = Tile::compute(data, a.dtype, vec![batch, m, n]);
@@ -240,8 +258,7 @@ fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
         ));
     }
     let n = b.shape[1];
-    // Backend-agnostic GEMM: naive by default, Accelerate under --features accelerate.
-    let data = crate::blas::sgemm_rowmajor(m, k, n, &a.data, &b.data);
+    let data = gemm(m, k, n, &a.data, &b.data);
     Ok(Tile::compute(data, a.dtype, vec![m, n]))
 }
 

@@ -819,7 +819,7 @@ constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
 /// once so repeated `run` calls (and benchmarks) exclude compile cost. Created
 /// with [`NaxGemm::new`]; `Err` if no Metal device or MPP won't compile (e.g.
 /// a pre-M5 GPU without the NAX tensor engine).
-#[cfg(feature = "metal")]
+#[cfg(metal)]
 pub struct NaxGemm {
     device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
     pipeline:
@@ -827,7 +827,7 @@ pub struct NaxGemm {
     queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
 }
 
-#[cfg(feature = "metal")]
+#[cfg(metal)]
 impl NaxGemm {
     /// Compile the general NAX GEMM kernel on the system default device.
     pub fn new() -> Result<Self, String> {
@@ -1000,9 +1000,51 @@ impl NaxGemm {
 
 /// Convenience: compile + run a general NAX GEMM once. For repeated calls or
 /// benchmarks build a [`NaxGemm`] and reuse it (compiles the kernel once).
-#[cfg(feature = "metal")]
+#[cfg(metal)]
 pub fn run_nax_matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     NaxGemm::new()?.run(m, k, n, a, b)
+}
+
+/// The system default Metal device's name (e.g. `"Apple M5 Pro"`), or `""` if
+/// there is no device.
+#[cfg(metal)]
+pub fn device_name() -> String {
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    MTLCreateSystemDefaultDevice().map(|d| d.name().to_string()).unwrap_or_default()
+}
+
+#[cfg(metal)]
+thread_local! {
+    /// Cached device name (cheap, resolved once per thread).
+    static GEMM_DEVICE: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
+    /// Lazily-compiled NAX GEMM context, built the first time the gate picks NAX
+    /// (so we never pay the kernel compile when only Accelerate is used). `None`
+    /// if compilation fails (e.g. a pre-M5 GPU without the tensor engine).
+    static GEMM_NAX: std::cell::OnceCell<Option<NaxGemm>> = const { std::cell::OnceCell::new() };
+}
+
+/// The production GEMM entry point for the emulator: `C(m×k·k×n)` row-major,
+/// dispatched to the highest-performance available backend.
+///
+/// On an M5, large GEMMs (per [`choose_matmul_backend`]) run on the NAX tensor
+/// engine (bf16, ~4 TFLOP/s, ~2× Accelerate); small ones and everything on
+/// non-NAX devices run on Accelerate/`sgemm_rowmajor` (f32). The NAX context is
+/// compiled once and cached per thread; if NAX is chosen but unavailable or
+/// errors, it falls back to Accelerate. So this is always correct and never
+/// slower than the BLAS path by more than one (cached) capability probe.
+#[cfg(metal)]
+pub fn metal_gemm_or_blas(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+    let name = GEMM_DEVICE.with(|c| c.get_or_init(device_name).clone());
+    if matches!(choose_matmul_backend(&name, m, k, n), MatmulBackend::Nax)
+        && let Some(out) = GEMM_NAX.with(|c| {
+            c.get_or_init(|| NaxGemm::new().ok())
+                .as_ref()
+                .and_then(|g| g.run(m, k, n, a, b).ok())
+        })
+    {
+        return out;
+    }
+    crate::blas::sgemm_rowmajor(m, k, n, a, b)
 }
 
 #[cfg(test)]
