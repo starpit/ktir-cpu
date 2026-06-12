@@ -51,13 +51,21 @@ pub enum MatmulTier {
     Nax,
 }
 
-/// The highest tier whose kernel codegen is wired into the matmul *dispatch*
-/// today. The validated NAX core (`run_nax_matmul_tile`, a single 16×32×16
-/// `mpp::tensor_ops::matmul2d` tile that matches the oracle exactly on the M5)
-/// exists but isn't yet a general tiled GEMM, so the dispatch floor stays
-/// `Naive`. Rises to `Simdgroup`/`Nax` once each tier's tiler lands; until then
-/// the tiered selection degrades to the naive floor.
-pub const HIGHEST_IMPLEMENTED: MatmulTier = MatmulTier::Naive;
+/// The highest tier whose kernel we actually emit today. The general tiled NAX
+/// GEMM ([`NaxGemm`] / [`run_nax_matmul`], `mpp::tensor_ops::matmul2d`) is
+/// implemented and validated on the M5, so this is `Nax`. Note the tiers are
+/// NOT all implemented in order — `Simdgroup` has no kernel yet — so
+/// [`effective_matmul_tier`] selects the best *implemented* tier a device
+/// supports rather than a simple linear cap (see [`tier_implemented`]).
+pub const HIGHEST_IMPLEMENTED: MatmulTier = MatmulTier::Nax;
+
+/// Whether a tier's GPU kernel is emitted today. `Naive` (the CPU/BLAS floor)
+/// and `Nax` (the M5 tensor engine) are implemented; the pre-NAX `Simdgroup`
+/// (`simdgroup_matrix`) kernel is a future slice, so a non-NAX Apple GPU falls
+/// back to `Naive` rather than claiming a tier we can't run.
+pub fn tier_implemented(tier: MatmulTier) -> bool {
+    matches!(tier, MatmulTier::Naive | MatmulTier::Nax)
+}
 
 /// The matmul tier a Metal device *supports*, parsed from its name (mirrors
 /// scratchy's `detect_device` name-parse → `AppleSiliconGen` → `is_nax_capable`):
@@ -75,9 +83,16 @@ pub fn device_matmul_tier(device_name: &str) -> MatmulTier {
     MatmulTier::Naive
 }
 
-/// The tier actually used for a device: its capability, capped at what we emit.
+/// The tier actually used for a device: the highest *implemented* tier that
+/// the device's capability supports. Because `Simdgroup` isn't implemented yet,
+/// a pre-NAX Apple GPU (capability `Simdgroup`) resolves to `Naive`, while an
+/// M5 (capability `Nax`) resolves to `Nax`.
 pub fn effective_matmul_tier(device_name: &str) -> MatmulTier {
-    device_matmul_tier(device_name).min(HIGHEST_IMPLEMENTED)
+    let cap = device_matmul_tier(device_name);
+    [MatmulTier::Nax, MatmulTier::Simdgroup, MatmulTier::Naive]
+        .into_iter()
+        .find(|&t| t <= cap && tier_implemented(t))
+        .unwrap_or(MatmulTier::Naive)
 }
 
 /// Parse the `M<n>` generation from an Apple GPU name like `"Apple M5 Pro"`.
@@ -587,6 +602,334 @@ fn bytemuck_cast(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
+// =========================================================================
+// General tiled NAX GEMM — arbitrary M, N, K
+// =========================================================================
+//
+// One simdgroup per threadgroup computes one 16×32 output tile of C; the grid
+// is ceil(M/16) × ceil(N/32) threadgroups. Each threadgroup walks K in steps of
+// 16, staging A[16×16] and Bᵀ[32×16] sub-tiles into threadgroup memory (with
+// bounds guards that zero-pad ragged edges), loading them into the `matmul2d`
+// register cooperative tensors via the BaseNAXFrag layout, and accumulating
+// into a persistent destination tensor across the K loop. The final tile is
+// stored with per-element guards so partial M/N edges write only valid cells.
+//
+// This is the validated single-tile core (`run_nax_matmul_tile`) generalized:
+// same fragment layout, now with a K-accumulation loop and edge handling.
+
+/// MSL for the general NAX GEMM. `dims = (M, N, K)`.
+///
+/// Two levels of tiling. **Threadgroup**: 4 simdgroups (128 threads) arranged
+/// 2×2 cooperatively stage the A[64×16] and Bᵀ[128×16] panels for a 64×128
+/// output block — 128 threads share each device load. **Register**: each
+/// simdgroup then computes its 32×64 sub-block as a 2×2 grid of 16×32
+/// `matmul2d` tiles, loading 2 A row-fragments and 2 B column-fragment-pairs
+/// per K-step and running all 4 products from them. Ragged M/N/K are zero-padded
+/// on stage and guarded on store.
+const NAX_MATMUL_SRC: &str = "\
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+
+constant constexpr uint BK   = 16;
+constant constexpr uint TG_M = 64;    // threadgroup block rows  (2 simdgroups x 32)
+constant constexpr uint TG_N = 128;   // threadgroup block cols  (2 simdgroups x 64)
+constant constexpr uint SG_M = 32;    // simdgroup sub-block rows
+constant constexpr uint SG_N = 64;    // simdgroup sub-block cols
+
+[[kernel]] void nax_matmul(
+    device const float* a_in [[buffer(0)]],   // M x K row-major
+    device const float* b_in [[buffer(1)]],   // K x N row-major
+    device float* c_out      [[buffer(2)]],   // M x N row-major
+    constant uint3& dims     [[buffer(3)]],   // (M, N, K)
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint M = dims.x, N = dims.y, K = dims.z;
+    const uint tm0 = tg.y * TG_M;          // threadgroup block base row
+    const uint tn0 = tg.x * TG_N;          // threadgroup block base column
+    const uint sm  = sgid / 2u;            // simdgroup's row slot (0,1)
+    const uint sn  = sgid % 2u;            // simdgroup's col slot (0,1)
+    const uint m0  = tm0 + sm * SG_M;      // this simdgroup's base row
+    const uint n0  = tn0 + sn * SG_N;      // this simdgroup's base column
+    const uint tid = sgid * 32u + lid;     // flat thread id in threadgroup (0..127)
+
+    threadgroup bfloat a_tg[TG_M * BK];    // [TG_M, K-step] staging
+    threadgroup bfloat b_tg[TG_N * BK];    // [TG_N, K-step] = transpose(B) staging
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16,
+        /*transpose_a=*/false, /*transpose_b=*/true, /*relaxed_precision=*/false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+    auto a0 = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto a1 = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto b0 = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto b1 = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto c00 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+    auto c01 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+    auto c10 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+    auto c11 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+
+    const short qid = (short)lid >> 2;
+    const short fm = (qid & 4) | (((short)lid >> 1) & 3);
+    const short fn = ((qid & 2) | ((short)lid & 1)) * 4;
+
+    for (short e = 0; e < 8; ++e) {
+        c00[e] = 0.0f; c00[8 + e] = 0.0f;  c01[e] = 0.0f; c01[8 + e] = 0.0f;
+        c10[e] = 0.0f; c10[8 + e] = 0.0f;  c11[e] = 0.0f; c11[8 + e] = 0.0f;
+    }
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        // All 128 threads cooperatively stage the threadgroup panels.
+        for (uint i = tid; i < TG_M * BK; i += 128u) {
+            uint r = i / BK, c = i % BK;              // r: M (in block), c: K
+            uint gm = tm0 + r, gk = k0 + c;
+            a_tg[i] = (gm < M && gk < K) ? bfloat(a_in[gm * K + gk]) : bfloat(0);
+        }
+        for (uint i = tid; i < TG_N * BK; i += 128u) {
+            uint n = i / BK, c = i % BK;              // n: N (in block), c: K
+            uint gn = tn0 + n, gk = k0 + c;
+            b_tg[i] = (gn < N && gk < K) ? bfloat(b_in[gk * N + gn]) : bfloat(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // This simdgroup's sub-panel base within the shared staging.
+        uint ar = sm * SG_M;     // row offset into a_tg (0 or 32)
+        uint bn = sn * SG_N;     // col offset into b_tg (0 or 64)
+        for (short e = 0; e < 8; ++e) {
+            short r = fm + (e >> 2) * 8;
+            short c = fn + (e % 4);
+            a0[e] = a_tg[(ar + r) * BK + c];
+            a1[e] = a_tg[(ar + r + 16) * BK + c];
+            b0[e]     = b_tg[(bn + r) * BK + c];
+            b0[8 + e] = b_tg[(bn + r + 16) * BK + c];
+            b1[e]     = b_tg[(bn + r + 32) * BK + c];
+            b1[8 + e] = b_tg[(bn + r + 48) * BK + c];
+        }
+        gemm_op.run(a0, b0, c00);
+        gemm_op.run(a0, b1, c01);
+        gemm_op.run(a1, b0, c10);
+        gemm_op.run(a1, b1, c11);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store this simdgroup's 2x2 tile block (rows m0+{0,16}, cols n0+{0,16,32,48}).
+    for (short e = 0; e < 8; ++e) {
+        short r = fm + (e >> 2) * 8;
+        short c = fn + (e % 4);
+        uint r0 = m0 + (uint)r;
+        uint r1 = r0 + 16u;
+        uint c0a = n0 + (uint)c;          uint c0b = c0a + 16u;   // tj=0 -> cols 0..31
+        uint c1a = n0 + 32u + (uint)c;    uint c1b = c1a + 16u;   // tj=1 -> cols 32..63
+        if (r0 < M) {
+            if (c0a < N) c_out[r0 * N + c0a] = c00[e];
+            if (c0b < N) c_out[r0 * N + c0b] = c00[8 + e];
+            if (c1a < N) c_out[r0 * N + c1a] = c01[e];
+            if (c1b < N) c_out[r0 * N + c1b] = c01[8 + e];
+        }
+        if (r1 < M) {
+            if (c0a < N) c_out[r1 * N + c0a] = c10[e];
+            if (c0b < N) c_out[r1 * N + c0b] = c10[8 + e];
+            if (c1a < N) c_out[r1 * N + c1a] = c11[e];
+            if (c1b < N) c_out[r1 * N + c1b] = c11[8 + e];
+        }
+    }
+}
+";
+
+/// A compiled, reusable NAX GEMM context — builds the device/pipeline/queue
+/// once so repeated `run` calls (and benchmarks) exclude compile cost. Created
+/// with [`NaxGemm::new`]; `Err` if no Metal device or MPP won't compile (e.g.
+/// a pre-M5 GPU without the NAX tensor engine).
+#[cfg(feature = "metal")]
+pub struct NaxGemm {
+    device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    pipeline:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+    queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+}
+
+#[cfg(feature = "metal")]
+impl NaxGemm {
+    /// Compile the general NAX GEMM kernel on the system default device.
+    pub fn new() -> Result<Self, String> {
+        use objc2_foundation::NSString;
+        use objc2_metal::{
+            MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+        };
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+        let opts = objc2_metal::MTLCompileOptions::new();
+        opts.setMathMode(MTLMathMode::Safe);
+        opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        let library = device
+            .newLibraryWithSource_options_error(&NSString::from_str(NAX_MATMUL_SRC), Some(&opts))
+            .map_err(|e| format!("metal: NAX GEMM compile failed: {e:?}"))?;
+        let function = library
+            .newFunctionWithName(&NSString::from_str("nax_matmul"))
+            .ok_or("metal: kernel nax_matmul not found")?;
+        let pipeline = device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
+        let queue = device.newCommandQueue().ok_or("metal: newCommandQueue returned nil")?;
+        Ok(Self { device, pipeline, queue })
+    }
+
+    /// `C(m×n) = A(m×k) · B(k×n)`, all row-major. A/B/C are f32 on the host;
+    /// the kernel computes in bf16 (the NAX engine's input precision), so the
+    /// result agrees with an f32 oracle only to bf16 tolerance.
+    pub fn run(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
+        };
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        assert_eq!(a.len(), m * k, "A must be m×k");
+        assert_eq!(b.len(), k * n, "B must be k×n");
+        let out_len = m * n;
+        let res = MTLResourceOptions::StorageModeShared;
+
+        let mk_in = |data: &[f32]| -> Result<_, String> {
+            let bytes: &[u8] = bytemuck_cast(data);
+            // SAFETY: `bytes` lives until the copy completes inside this call.
+            unsafe {
+                self.device
+                    .newBufferWithBytes_length_options(
+                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                        bytes.len().max(1),
+                        res,
+                    )
+                    .ok_or_else(|| "metal: input buffer alloc failed".to_string())
+            }
+        };
+        let a_buf = mk_in(a)?;
+        let b_buf = mk_in(b)?;
+        let c_buf = self
+            .device
+            .newBufferWithLength_options((out_len * 4).max(1), res)
+            .ok_or("metal: output buffer alloc failed")?;
+        let dims = [m as u32, n as u32, k as u32];
+        // SAFETY: copies 12 bytes that live for the duration of this call.
+        let dims_buf = unsafe {
+            self.device
+                .newBufferWithBytes_length_options(
+                    NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
+                    std::mem::size_of_val(&dims),
+                    res,
+                )
+                .ok_or("metal: dims buffer alloc failed")?
+        };
+
+        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+        let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
+        enc.setComputePipelineState(&self.pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
+        }
+        // One threadgroup (4 simdgroups, 128 threads) per 64×128 output block.
+        let m_blocks = m.div_ceil(64);
+        let n_blocks = n.div_ceil(128);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
+            MTLSize { width: 128, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+
+        let raw =
+            unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
+        Ok(raw.to_vec())
+    }
+
+    /// Pure GPU kernel time (seconds) for one GEMM, from the command buffer's
+    /// hardware timestamps — excludes buffer allocation, host→device copies,
+    /// and readback. Buffers are allocated once and reused across `iters`
+    /// dispatches (one command buffer), so this isolates kernel throughput from
+    /// per-call CPU overhead. Returns the *total* GPU time over `iters`.
+    pub fn gpu_time_seconds(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        iters: u32,
+    ) -> Result<f64, String> {
+        use objc2_metal::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+            MTLDevice, MTLResourceOptions, MTLSize,
+        };
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        let res = MTLResourceOptions::StorageModeShared;
+        let mk_in = |data: &[f32]| -> Result<_, String> {
+            let bytes: &[u8] = bytemuck_cast(data);
+            // SAFETY: `bytes` lives until the copy completes inside this call.
+            unsafe {
+                self.device
+                    .newBufferWithBytes_length_options(
+                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                        bytes.len().max(1),
+                        res,
+                    )
+                    .ok_or_else(|| "alloc".to_string())
+            }
+        };
+        let a_buf = mk_in(a)?;
+        let b_buf = mk_in(b)?;
+        let c_buf = self.device.newBufferWithLength_options((m * n * 4).max(1), res).ok_or("alloc")?;
+        let dims = [m as u32, n as u32, k as u32];
+        let dims_buf = unsafe {
+            self.device
+                .newBufferWithBytes_length_options(
+                    NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
+                    std::mem::size_of_val(&dims),
+                    res,
+                )
+                .ok_or("alloc")?
+        };
+        let m_blocks = m.div_ceil(64);
+        let n_blocks = n.div_ceil(128);
+
+        let cb = self.queue.commandBuffer().ok_or("cb")?;
+        for _ in 0..iters {
+            let enc = cb.computeCommandEncoder().ok_or("enc")?;
+            enc.setComputePipelineState(&self.pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
+                MTLSize { width: 128, height: 1, depth: 1 },
+            );
+            enc.endEncoding();
+        }
+        cb.commit();
+        cb.waitUntilCompleted();
+        // Hardware GPU timestamps (CFTimeInterval seconds) for the whole buffer.
+        Ok(cb.GPUEndTime() - cb.GPUStartTime())
+    }
+}
+
+/// Convenience: compile + run a general NAX GEMM once. For repeated calls or
+/// benchmarks build a [`NaxGemm`] and reuse it (compiles the kernel once).
+#[cfg(feature = "metal")]
+pub fn run_nax_matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
+    NaxGemm::new()?.run(m, k, n, a, b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +1017,120 @@ kernel void mpp_probe(
             }
         }
         eprintln!("NAX matmul2d tile matches the oracle exactly (+ row/col layout) ✓");
+    }
+
+    /// The general tiled NAX GEMM is correct across shapes — including ragged
+    /// M/N/K that exercise the zero-pad edge guards and multi-tile K
+    /// accumulation. Small-integer inputs are exact in bf16, so we assert exact
+    /// equality with the naive oracle.
+    #[test]
+    fn nax_matmul_general_matches_oracle() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("no Metal device — skipping general NAX GEMM test");
+                return;
+            }
+            Err(e) => panic!("NAX GEMM compile failed: {e}"),
+        };
+        // Exact tile (16,16,32); ragged in every dim; multi-K; K not /16; thin.
+        let shapes = [
+            (16usize, 16usize, 32usize),
+            (1, 1, 1),
+            (17, 33, 5),    // ragged M, N, K all
+            (48, 16, 64),   // multi-tile, clean
+            (50, 20, 70),   // multi-tile, ragged
+            (7, 100, 3),    // wide N
+            (100, 7, 3),    // tall M
+        ];
+        for (m, k, n) in shapes {
+            // Small ints exact in bf16: a in 0..3, b in 0..4. Sum over K stays
+            // well under bf16's 256 exact-integer limit for these K.
+            let a: Vec<f32> = (0..m * k).map(|i| (i % 3) as f32).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i % 4) as f32).collect();
+            let got = ctx.run(m, k, n, &a, &b).unwrap();
+            let want = crate::blas::naive_sgemm(m, k, n, &a, &b);
+            assert_eq!(got, want, "NAX GEMM mismatch at shape ({m},{k},{n})");
+        }
+        eprintln!("general NAX GEMM matches the oracle across {} shapes ✓", shapes.len());
+    }
+
+    /// Random (non-bf16-exact) data: the NAX GEMM agrees with the f32 oracle to
+    /// bf16 tolerance. Documents the precision the engine actually delivers.
+    #[test]
+    fn nax_matmul_general_bf16_tolerance() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => return,
+            Err(e) => panic!("{e}"),
+        };
+        let (m, k, n) = (64usize, 48usize, 96usize);
+        // Deterministic pseudo-random in [-1, 1].
+        let prng = |i: usize| ((i.wrapping_mul(2654435761) % 2000) as f32 / 1000.0) - 1.0;
+        let a: Vec<f32> = (0..m * k).map(prng).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| prng(i + 7)).collect();
+        let got = ctx.run(m, k, n, &a, &b).unwrap();
+        let want = crate::blas::naive_sgemm(m, k, n, &a, &b);
+        let mut max_rel = 0.0f32;
+        for (g, w) in got.iter().zip(&want) {
+            let denom = w.abs().max(1.0);
+            max_rel = max_rel.max((g - w).abs() / denom);
+        }
+        // bf16 has 8 mantissa bits; K=48 accumulation in f32 keeps error modest.
+        assert!(max_rel < 0.05, "max relative error {max_rel} exceeds bf16 tolerance");
+        eprintln!("NAX GEMM vs f32 oracle: max relative error {max_rel:.4} (bf16) ✓");
+    }
+
+    /// Real benchmark: NAX vs naive vs the linked BLAS (Accelerate on macOS) on
+    /// a sizeable GEMM. Prints GFLOP/s for each so the speedup is concrete.
+    /// `--ignored` because it's a perf measurement, not a correctness gate.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn bench_nax_vs_blas() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping benchmark: {e}");
+                return;
+            }
+        };
+        let (m, k, n) = (1024usize, 1024usize, 1024usize);
+        let prng = |i: usize| (i.wrapping_mul(2654435761) % 1000) as f32 / 1000.0;
+        let a: Vec<f32> = (0..m * k).map(prng).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| prng(i + 3)).collect();
+        let flops = 2.0 * m as f64 * k as f64 * n as f64;
+
+        let bench = |label: &str, iters: u32, mut f: Box<dyn FnMut()>| {
+            f(); // warm up
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            let secs = t0.elapsed().as_secs_f64() / iters as f64;
+            eprintln!("{label:>12}: {:7.2} ms   {:7.1} GFLOP/s", secs * 1e3, flops / secs / 1e9);
+        };
+
+        // GPU-only kernel time (excludes alloc/copy/readback): 50 dispatches on
+        // reused buffers, timed by hardware timestamps. Isolates kernel speed.
+        let gpu_total = ctx.gpu_time_seconds(m, k, n, &a, &b, 50).unwrap();
+        let gpu_each = gpu_total / 50.0;
+        eprintln!(
+            "{:>12}: {:7.2} ms   {:7.1} GFLOP/s   (GPU kernel only)",
+            "NAX-gpu", gpu_each * 1e3, flops / gpu_each / 1e9
+        );
+
+        let (a1, b1) = (a.clone(), b.clone());
+        bench("NAX-wall", 20, Box::new(move || {
+            ctx.run(m, k, n, &a1, &b1).unwrap();
+        }));
+        let (a2, b2) = (a.clone(), b.clone());
+        bench("BLAS/accel", 20, Box::new(move || {
+            std::hint::black_box(crate::blas::sgemm_rowmajor(m, k, n, &a2, &b2));
+        }));
+        let (a3, b3) = (a.clone(), b.clone());
+        bench("naive", 1, Box::new(move || {
+            std::hint::black_box(crate::blas::naive_sgemm(m, k, n, &a3, &b3));
+        }));
     }
 
     #[test]
@@ -769,8 +1226,17 @@ kernel void mpp_probe(
         // Non-Apple -> naive floor.
         assert_eq!(device_matmul_tier("Intel UHD Graphics 630"), Naive);
         assert_eq!(device_matmul_tier("AMD Radeon Pro 5500M"), Naive);
-        // Effective tier is capped at what we actually emit today.
+        // Effective tier is the best *implemented* tier the device supports.
+        // M5 (capability Nax) -> Nax, the highest implemented tier.
         assert_eq!(effective_matmul_tier("Apple M5"), HIGHEST_IMPLEMENTED);
+        assert_eq!(effective_matmul_tier("Apple M5"), Nax);
+        // Pre-NAX Apple GPUs are capability Simdgroup, but that kernel isn't
+        // implemented yet, so they fall back to Naive (not the unimplemented tier).
+        assert_eq!(effective_matmul_tier("Apple M4"), Naive);
+        assert_eq!(effective_matmul_tier("Apple M1"), Naive);
+        // Non-Apple stays at the naive floor.
+        assert_eq!(effective_matmul_tier("Intel UHD Graphics 630"), Naive);
+        assert!(!tier_implemented(Simdgroup));
     }
 
     #[test]
