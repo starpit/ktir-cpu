@@ -26,6 +26,68 @@ use std::collections::HashMap;
 use crate::dtypes::DType;
 use crate::ir::{IRFunction, IRModule, Operation};
 
+// =========================================================================
+// Matmul acceleration tier — the GPU analogue of the BLAS auto-select.
+//
+// On Apple Silicon a GEMM can run three ways, best-first:
+//   * Nax       — `mpp::tensor_ops::matmul2d` (Metal Performance Primitives),
+//                 which drives the M5+ Neural Accelerators. NOT engaged
+//                 automatically by MPS — it must be written in the shader.
+//   * Simdgroup — `simdgroup_matrix<T,8,8>` + `simdgroup_multiply_accumulate`,
+//                 the matrix instructions on Apple7+ (M1..M4) GPUs.
+//   * Naive     — a plain per-element loop. The portable floor (also non-Apple).
+//
+// We pick the highest tier the device supports (capability), capped by the
+// highest tier whose kernel we actually emit today (`HIGHEST_IMPLEMENTED`), so
+// the backend degrades gracefully as the accelerated kernel slices land —
+// exactly like the BLAS providers degrade to the naive matmul.
+// =========================================================================
+
+/// GPU matmul acceleration tier, ordered worst -> best.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatmulTier {
+    Naive,
+    Simdgroup,
+    Nax,
+}
+
+/// The highest tier whose kernel codegen is implemented today. Rises to
+/// `Simdgroup` then `Nax` as those kernel slices (+ the Metal 4 runtime) land;
+/// until then the tiered selection degrades to the naive floor.
+pub const HIGHEST_IMPLEMENTED: MatmulTier = MatmulTier::Naive;
+
+/// The matmul tier a Metal device *supports*, parsed from its name (mirrors
+/// scratchy's `detect_device` name-parse → `AppleSiliconGen` → `is_nax_capable`):
+///   * Apple `M5`+  -> Nax (Apple9 gen 17+, first with the Neural Accelerator)
+///   * any other Apple GPU (M1..M4, Apple7+) -> Simdgroup
+///   * non-Apple / unknown -> Naive
+pub fn device_matmul_tier(device_name: &str) -> MatmulTier {
+    if let Some(generation) = apple_m_generation(device_name) {
+        return if generation >= 5 { MatmulTier::Nax } else { MatmulTier::Simdgroup };
+    }
+    if device_name.contains("Apple") {
+        // An Apple GPU we couldn't pin to an M-number — assume Apple7+ matrix units.
+        return MatmulTier::Simdgroup;
+    }
+    MatmulTier::Naive
+}
+
+/// The tier actually used for a device: its capability, capped at what we emit.
+pub fn effective_matmul_tier(device_name: &str) -> MatmulTier {
+    device_matmul_tier(device_name).min(HIGHEST_IMPLEMENTED)
+}
+
+/// Parse the `M<n>` generation from an Apple GPU name like `"Apple M5 Pro"`.
+/// Returns `None` for non-Apple-Silicon names. Forward-compatible: an `M6`
+/// reads as 6 (>= 5 -> Nax), unlike scratchy's fixed M1..M5 match.
+fn apple_m_generation(name: &str) -> Option<u32> {
+    let rest = name.split('M').nth(1)?; // text after the first 'M'
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!digits.is_empty() && name.contains("Apple"))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
 /// One kernel-argument buffer: the KTIR pointer-arg name, whether it's written,
 /// and its element dtype. The order of [`MslKernel::buffers`] is the MSL
 /// `[[buffer(i)]]` binding order — the runtime must supply data in this order.
@@ -385,5 +447,39 @@ mod tests {
             let name = module.functions.keys().next().unwrap().clone();
             assert!(emit_msl(&module, &name).is_err());
         }
+    }
+
+    #[test]
+    fn matmul_tier_detection() {
+        use super::MatmulTier::*;
+        // M5+ -> NAX (Neural Accelerator).
+        assert_eq!(device_matmul_tier("Apple M5"), Nax);
+        assert_eq!(device_matmul_tier("Apple M5 Pro"), Nax);
+        assert_eq!(device_matmul_tier("Apple M6 Max"), Nax); // forward-compatible
+        // M1..M4 Apple GPUs -> simdgroup matrix units.
+        assert_eq!(device_matmul_tier("Apple M1"), Simdgroup);
+        assert_eq!(device_matmul_tier("Apple M3 Max"), Simdgroup);
+        assert_eq!(device_matmul_tier("Apple M4"), Simdgroup);
+        // An Apple GPU with no M-number still gets the matrix path.
+        assert_eq!(device_matmul_tier("Apple Paravirtual device"), Simdgroup);
+        // Non-Apple -> naive floor.
+        assert_eq!(device_matmul_tier("Intel UHD Graphics 630"), Naive);
+        assert_eq!(device_matmul_tier("AMD Radeon Pro 5500M"), Naive);
+        // Effective tier is capped at what we actually emit today.
+        assert_eq!(effective_matmul_tier("Apple M5"), HIGHEST_IMPLEMENTED);
+    }
+
+    #[test]
+    fn reports_device_tier_on_real_gpu() {
+        use metal::Device;
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device — skipping live tier check");
+            return;
+        };
+        let name = device.name().to_string();
+        let cap = device_matmul_tier(&name);
+        eprintln!("device {name:?}: capability tier = {cap:?}, using = {:?}", effective_matmul_tier(&name));
+        // This machine is an Apple GPU, so it must be at least the simdgroup tier.
+        assert!(cap >= MatmulTier::Simdgroup, "expected an Apple GPU, got {name:?}");
     }
 }
