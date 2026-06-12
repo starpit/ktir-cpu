@@ -14,12 +14,21 @@
 pub mod arith;
 pub mod func;
 pub mod ktdp;
+pub mod linalg;
+pub mod math;
+pub mod scf;
+pub mod tensor;
 
 use std::collections::HashMap;
 
 use crate::context::CoreContext;
 use crate::env::ExecutionEnv;
 use crate::ir::{Operation, Value};
+
+// The single source of truth for latency categories is `crate::latency`.
+// Re-exported here so dialect modules can write `super::LatencyCategory` (or
+// `crate::dialects::LatencyCategory`) and get the full 7-variant enum.
+pub use crate::latency::LatencyCategory;
 
 /// Handler signature. Mirrors Python's `HandlerFn = (op, context, env) -> Any`:
 /// reads operands via `ctx.get_value`, runs nested regions via the dispatch
@@ -34,14 +43,6 @@ pub struct Dispatch {
     latency: HashMap<&'static str, LatencyCategory>,
 }
 
-/// Subset of `ktir_cpu/latency.py`'s `LatencyCategory` StrEnum needed so far.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LatencyCategory {
-    Zero,
-    ComputeFloat,
-    ComputeInt,
-}
-
 impl Dispatch {
     /// Build the table by letting each dialect register its ops.
     pub fn new() -> Self {
@@ -52,6 +53,10 @@ impl Dispatch {
         arith::register(&mut d);
         func::register(&mut d);
         ktdp::register(&mut d);
+        math::register(&mut d);
+        linalg::register(&mut d);
+        tensor::register(&mut d);
+        scf::register(&mut d);
         d
     }
 

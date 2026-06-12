@@ -11,17 +11,23 @@
 //!     brace-balance + type-terminal + SSA-start flush heuristic, enough to
 //!     group the real multi-line `ktdp.construct_*` ops in `examples/`;
 //!   * structural op parse: result, op_type, operands, result type, plus the
-//!     `arith.constant` value attribute and the infix index-arith shorthand.
+//!     `arith.constant` value attribute and the infix index-arith shorthand;
+//!   * dialect-specific attribute parsing for the `ktdp.construct_*` ops —
+//!     ports `parse_construct_memory_view` / `parse_construct_access_tile`
+//!     from `ktir_cpu/dialects/ktdp_ops.py`, lifting the real affine attrs
+//!     (`coordinate_set`, `base_map`, `access_tile_set`, `access_tile_order`),
+//!     the `sizes:`/`strides:` segments, the `dtype`, and the
+//!     `#ktdp.spyre_memory_space<HBM|LX, core=N>` memory space into the typed
+//!     [`Attr`] enum. The affine text is parsed by the recursive-descent parser
+//!     in [`crate::parser_ast`].
 //!
-//! DEFERRED (later slices): nested regions (scf bodies), and dialect-specific
-//! attribute parsing for the affine attrs (`coordinate_set`, `base_map`,
-//! `memory_space`, `sizes:`/`strides:`). Until then a parsed `ktdp.construct_*`
-//! op carries correct op_type / operands / result_type but not its affine
-//! attributes, so it parses structurally but is not yet executable. The Python
-//! original uses the `regex` crate's equivalent; this slice stays dependency-
-//! free with manual scanning (regex is the production tool to adopt here).
+//! DEFERRED (later slices): nested regions (scf bodies), `dense<...>` constant
+//! payloads, and the indirect / distributed construct ops. The Python original
+//! uses the `regex` crate's equivalent; this slice stays dependency-free with
+//! manual scanning (regex is the production tool to adopt here).
 
 use crate::ir::{Attr, IRFunction, IRModule, Operation, Scalar, Value};
+use crate::parser_ast::{is_full_set, is_identity_map, parse_affine_map, parse_affine_set};
 
 /// Parse a full module's MLIR text into an [`IRModule`]. Mirrors `parse_module`.
 pub fn parse_module(text: &str) -> Result<IRModule, String> {
@@ -312,6 +318,18 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
     let mut attributes = std::collections::HashMap::new();
     if op_type == "arith.constant" {
         attributes.insert("value".to_string(), parse_constant_value(after_op)?);
+    } else if op_type == "ktdp.construct_memory_view" {
+        // The construct ops carry their real attributes across the whole op
+        // text (including the `{ ... }` block and the trailing memref type),
+        // so we parse from `text`, not just `after_op`.
+        parse_construct_memory_view_attrs(text, result_type.as_deref(), &mut attributes)?;
+    } else if op_type == "ktdp.construct_access_tile" {
+        parse_construct_access_tile_attrs(
+            text,
+            result_type.as_deref(),
+            &operands,
+            &mut attributes,
+        )?;
     }
 
     Ok(Some(Operation {
@@ -322,6 +340,295 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         result_type,
         regions: Vec::new(),
     }))
+}
+
+// --- phase 4: ktdp construct-op attribute parsing -----------------------
+//
+// Ports `parse_construct_memory_view` / `parse_construct_access_tile` from
+// `ktir_cpu/dialects/ktdp_ops.py`. The structural pass above already fills in
+// result / operands / result_type; here we lift the affine + shape attributes
+// into the typed `Attr` enum so the construct ops are executable.
+
+/// Populate `ktdp.construct_memory_view` attributes from its op text. Mirrors
+/// the body of `parse_construct_memory_view`:
+///   * `sizes: [...]`   -> `Attr::IntList` (`shape`)
+///   * `strides: [...]` -> `Attr::IntList` (`strides`, default `[1]`)
+///   * `#ktdp.spyre_memory_space<S[, core=N]>` -> `memory_space` (`Attr::Str`)
+///     plus an optional `lx_core_id` (`Attr::Int`)
+///   * memref element type -> `dtype` (`Attr::Str`)
+///   * `coordinate_set = affine_set<...>` -> `Attr::AffineSet`
+///
+/// Sizes/strides that are SSA names (dynamic dims) are not representable in the
+/// integer `Attr::IntList`; they already appear as operands from the structural
+/// pass and are resolved at execution time, so the size attribute is omitted in
+/// that case (rather than guessing a literal). This matches the executor's
+/// "lazily resolve SSA sizes" contract.
+fn parse_construct_memory_view_attrs(
+    text: &str,
+    result_type: Option<&str>,
+    attrs: &mut std::collections::HashMap<String, Attr>,
+) -> Result<(), String> {
+    // sizes: [...] — only stored when every element is a literal int.
+    if let Some(list) = bracket_segment(text, "sizes")
+        && let Some(ints) = parse_int_list(&list) {
+            attrs.insert("shape".to_string(), Attr::IntList(ints));
+        }
+
+    // strides: [...] — default [1] (matching the Python default).
+    let strides = bracket_segment(text, "strides")
+        .and_then(|l| parse_int_list(&l))
+        .unwrap_or_else(|| vec![1]);
+    attrs.insert("strides".to_string(), Attr::IntList(strides));
+
+    // #ktdp.spyre_memory_space<S[, core = N]> — default HBM.
+    let (memory_space, lx_core_id) = parse_memory_space(text);
+    attrs.insert("memory_space".to_string(), Attr::Str(memory_space));
+    if let Some(core) = lx_core_id {
+        attrs.insert("lx_core_id".to_string(), Attr::Int(core));
+    }
+
+    // dtype from the memref<...> result type's trailing element type.
+    let dtype = result_type
+        .and_then(parse_memref_dtype)
+        .ok_or("construct_memory_view: could not parse dtype from memref<> type")?;
+    attrs.insert("dtype".to_string(), Attr::Str(dtype));
+
+    // coordinate_set = affine_set<...>
+    if let Some(raw) = named_attr_value(text, "coordinate_set") {
+        let set = parse_affine_set(&raw)?;
+        attrs.insert("coordinate_set".to_string(), Attr::AffineSet(set));
+    }
+
+    Ok(())
+}
+
+/// Populate `ktdp.construct_access_tile` attributes from its op text. Mirrors
+/// `parse_construct_access_tile`:
+///   * access-tile shape from `!ktdp.access_tile<NxMx...xindex>` (`Attr::IntList`)
+///   * `base_map = affine_map<...>` -> `Attr::AffineMap` (synthesized identity
+///     of rank `max(1, operands-1)` when absent)
+///   * `access_tile_set = affine_set<...>` -> `coordinate_set` (`Attr::AffineSet`),
+///     dropped when it is full over the tile box
+///   * `access_tile_order = affine_map<...>` -> `coordinate_order`
+///     (`Attr::AffineMap`), dropped when it is the identity
+fn parse_construct_access_tile_attrs(
+    text: &str,
+    result_type: Option<&str>,
+    operands: &[String],
+    attrs: &mut std::collections::HashMap<String, Attr>,
+) -> Result<(), String> {
+    // Shape + `index` element-type validation from the access_tile<...> type.
+    let inner = result_type
+        .and_then(access_tile_inner)
+        .ok_or("construct_access_tile: missing !ktdp.access_tile<> result type")?;
+    let (shape, elem) = parse_access_tile_inner(&inner)?;
+    if elem != "index" {
+        return Err(format!(
+            "AccessTileType element type must be 'index', got {elem:?}"
+        ));
+    }
+    let shape_i64: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+    attrs.insert("shape".to_string(), Attr::IntList(shape_i64));
+
+    // base_map — synthesize identity of rank max(1, operands-1) when absent.
+    let base_map = match named_attr_value(text, "base_map") {
+        Some(raw) => parse_affine_map(&raw)?,
+        None => {
+            let n = operands.len().saturating_sub(1).max(1);
+            let dims: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+            let csv = dims.join(", ");
+            parse_affine_map(&format!("affine_map<({csv}) -> ({csv})>"))?
+        }
+    };
+    attrs.insert("base_map".to_string(), Attr::AffineMap(base_map));
+
+    // access_tile_set -> coordinate_set; dropped when full over the tile box.
+    if let Some(raw) = named_attr_value(text, "access_tile_set") {
+        let set = parse_affine_set(&raw)?;
+        if !is_full_set(&set, &shape) {
+            attrs.insert("coordinate_set".to_string(), Attr::AffineSet(set));
+        }
+    }
+
+    // access_tile_order -> coordinate_order; dropped when identity.
+    if let Some(raw) = named_attr_value(text, "access_tile_order") {
+        let map = parse_affine_map(&raw)?;
+        if !is_identity_map(&map) {
+            attrs.insert("coordinate_order".to_string(), Attr::AffineMap(map));
+        }
+    }
+
+    Ok(())
+}
+
+/// Find a `keyword: [ ... ]` segment (e.g. `sizes: [4096]`) and return the
+/// inner list text. Mirrors the `sizes\s*:\s*\[([^\]]+)\]` regex.
+fn bracket_segment(text: &str, keyword: &str) -> Option<String> {
+    let key_pos = text.find(keyword)?;
+    let after = &text[key_pos + keyword.len()..];
+    // Expect `:` then `[`.
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    Some(rest[..close].to_string())
+}
+
+/// Parse a comma-separated list of integer literals. Returns `None` when any
+/// element is not a literal int (i.e. an SSA name / dynamic dim).
+fn parse_int_list(list: &str) -> Option<Vec<i64>> {
+    let mut out = Vec::new();
+    for tok in list.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        out.push(tok.parse::<i64>().ok()?);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse `#ktdp.spyre_memory_space<S[, core = N]>` -> (memory_space, lx_core_id).
+/// Defaults to `("HBM", None)` when absent. Mirrors the
+/// `#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>` regex.
+fn parse_memory_space(text: &str) -> (String, Option<i64>) {
+    let marker = "#ktdp.spyre_memory_space<";
+    let Some(start) = text.find(marker) else {
+        return ("HBM".to_string(), None);
+    };
+    let after = &text[start + marker.len()..];
+    let Some(close) = after.find('>') else {
+        return ("HBM".to_string(), None);
+    };
+    let body = after[..close].trim();
+    // body is `S` or `S, core = N`.
+    let mut parts = body.splitn(2, ',');
+    let space = parts.next().unwrap_or("HBM").trim().to_string();
+    let core = parts.next().and_then(|p| {
+        // `core = N`
+        let eq = p.find('=')?;
+        p[eq + 1..].trim().parse::<i64>().ok()
+    });
+    (space, core)
+}
+
+/// Extract the element dtype (last `x`-segment) from a `memref<...>` type
+/// string, e.g. `memref<4096xf16>` -> `f16`. Mirrors the memref-type split.
+fn parse_memref_dtype(result_type: &str) -> Option<String> {
+    let inner = result_type
+        .trim()
+        .strip_prefix("memref<")?
+        .strip_suffix('>')?;
+    let dtype = inner.rsplit('x').next()?.trim();
+    if dtype.is_empty() {
+        None
+    } else {
+        Some(dtype.to_string())
+    }
+}
+
+/// Inner text of a `!ktdp.access_tile<...>` type, e.g.
+/// `!ktdp.access_tile<128xindex>` -> `128xindex`.
+fn access_tile_inner(result_type: &str) -> Option<String> {
+    let inner = result_type
+        .trim()
+        .strip_prefix("!ktdp.access_tile<")?
+        .strip_suffix('>')?;
+    Some(inner.to_string())
+}
+
+/// Split `NxMx...x<elem>` into its dimension list and element type. The element
+/// type may itself contain `x` (e.g. `index`), so we walk the leading `\d+x`
+/// run rather than a naive `split('x')`. Mirrors the
+/// `^(\d+(?:x\d+)*)x([a-zA-Z_]\w*)$` regex.
+fn parse_access_tile_inner(inner: &str) -> Result<(Vec<usize>, String), String> {
+    let mut dims = Vec::new();
+    let mut rest = inner;
+    loop {
+        // Consume a `\d+` run.
+        let digits_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        if digits_end == 0 {
+            break;
+        }
+        let num: usize = rest[..digits_end]
+            .parse()
+            .map_err(|_| format!("Malformed access_tile dims in {inner:?}"))?;
+        // A dimension is only a dimension if an `x` separator follows it.
+        match rest[digits_end..].strip_prefix('x') {
+            Some(after) => {
+                dims.push(num);
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    if dims.is_empty() || rest.is_empty() {
+        return Err(format!(
+            "Malformed access_tile type {inner:?}: expected '<dims>x<elem>'"
+        ));
+    }
+    Ok((dims, rest.to_string()))
+}
+
+/// Extract a `key = value` attribute value, where `value` is a `keyword<...>`
+/// expression (`affine_set<...>` / `affine_map<...>`). Counts `<`/`>` depth
+/// while skipping `>=` and `->`, so the constraint operators inside the body do
+/// not prematurely close the value. Mirrors `extract_named_attr`'s `keyword<...>`
+/// branch in `parser_utils.py`.
+fn named_attr_value(text: &str, key: &str) -> Option<String> {
+    // Find `key` followed (after optional whitespace) by `=`.
+    let mut search = 0;
+    let (rest, _val_start) = loop {
+        let rel = text[search..].find(key)?;
+        let kpos = search + rel;
+        // Ensure a word boundary before the key (avoid matching inside a name).
+        let prev_ok = kpos == 0
+            || !text.as_bytes()[kpos - 1].is_ascii_alphanumeric()
+                && text.as_bytes()[kpos - 1] != b'_';
+        let after_key = &text[kpos + key.len()..];
+        let trimmed = after_key.trim_start();
+        if prev_ok && trimmed.starts_with('=') {
+            let eq_rel = after_key.find('=').unwrap();
+            let val = after_key[eq_rel + 1..].trim_start();
+            break (val, kpos);
+        }
+        search = kpos + key.len();
+    };
+
+    // Walk a `keyword<...>` value, counting bracket depth, skipping `>=`/`->`.
+    let kw_lt = rest.find('<')?;
+    // The portion before `<` must be a bare keyword token (e.g. `affine_set`).
+    if !rest[..kw_lt].trim().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = kw_lt;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '>' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            i += 2; // `>=` constraint operator
+            continue;
+        }
+        if ch == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            i += 2; // `->` affine-map arrow
+            continue;
+        }
+        if ch == '<' {
+            depth += 1;
+        } else if ch == '>' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(rest[..=i].to_string());
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Infix index arithmetic: `%r = %a [*+-] %b : type`. Mirrors `_parse_index_binary`.
@@ -532,6 +839,173 @@ mod tests {
         match ctx.get_value("%d").unwrap() {
             Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 10.0), // (2+3)*2
             other => panic!("expected F32(10.0), got {other:?}"),
+        }
+    }
+
+    // --- ktdp construct-op attribute parsing --------------------------------
+
+    use crate::affine::{AffineExpr, ConstraintKind};
+
+    /// Fetch the attribute map for the op binding `result`, failing the test if
+    /// it is missing.
+    fn attrs_of<'a>(
+        f: &'a IRFunction,
+        result: &str,
+    ) -> &'a std::collections::HashMap<String, Attr> {
+        &f.operations
+            .iter()
+            .find(|o| o.result.as_deref() == Some(result))
+            .unwrap_or_else(|| panic!("no op binding {result}"))
+            .attributes
+    }
+
+    #[test]
+    fn construct_memory_view_carries_real_attributes() {
+        let module = parse_module(VECTOR_ADD).unwrap();
+        let f = module.get_function("add_kernel").unwrap();
+        let a = attrs_of(f, "%x_view");
+
+        // sizes: [4096] -> shape
+        assert_eq!(a.get("shape"), Some(&Attr::IntList(vec![4096])));
+        // strides: [1]
+        assert_eq!(a.get("strides"), Some(&Attr::IntList(vec![1])));
+        // memref<4096xf16> -> dtype f16
+        assert_eq!(a.get("dtype"), Some(&Attr::Str("f16".to_string())));
+        // #ktdp.spyre_memory_space<HBM>
+        assert_eq!(a.get("memory_space"), Some(&Attr::Str("HBM".to_string())));
+        // No per-core LX tag here.
+        assert_eq!(a.get("lx_core_id"), None);
+
+        // coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 4095 >= 0)>
+        match a.get("coordinate_set") {
+            Some(Attr::AffineSet(set)) => {
+                assert_eq!(set.num_dims, 1);
+                assert_eq!(set.constraints.len(), 2);
+                // 0 <= d0 <= 4095
+                assert!(set.contains(&[0], &[] as &[i64]));
+                assert!(set.contains(&[4095], &[] as &[i64]));
+                assert!(!set.contains(&[4096], &[] as &[i64]));
+            }
+            other => panic!("expected AffineSet coordinate_set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construct_access_tile_carries_real_attributes() {
+        let module = parse_module(VECTOR_ADD).unwrap();
+        let f = module.get_function("add_kernel").unwrap();
+        let a = attrs_of(f, "%x_tile");
+
+        // access_tile<128xindex> -> shape [128]
+        assert_eq!(a.get("shape"), Some(&Attr::IntList(vec![128])));
+
+        // base_map is absent in the source -> synthesized identity over 1 dim
+        // (operands = [%x_view, %offset], so n = max(1, 2-1) = 1).
+        match a.get("base_map") {
+            Some(Attr::AffineMap(m)) => {
+                assert_eq!(m.num_dims, 1);
+                assert_eq!(m.exprs, vec![AffineExpr::Dim(0)]);
+            }
+            other => panic!("expected AffineMap base_map, got {other:?}"),
+        }
+
+        // access_tile_set is 0 <= d0 <= 127, which is FULL over the 128-extent
+        // tile, so it is normalised away (no coordinate_set attribute).
+        assert_eq!(a.get("coordinate_set"), None);
+
+        // access_tile_order = identity map -> normalised away.
+        assert_eq!(a.get("coordinate_order"), None);
+    }
+
+    #[test]
+    fn construct_access_tile_keeps_nontrivial_coordinate_set() {
+        // A genuinely restricting set (only even-indexed first half) must NOT be
+        // dropped, and a permuting order map must be preserved.
+        let src = r#"
+            module {
+              func.func @k(%p: index) attributes {grid = [1]} {
+                %t = ktdp.construct_access_tile %v[%p] {
+                  access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 == 0)>,
+                  access_tile_order = affine_map<(d0, d1) -> (d1, d0)>,
+                  base_map = affine_map<(d0, d1) -> (d0, d1)>
+                } : memref<8x8xf16> -> !ktdp.access_tile<4x4xindex>
+                return
+              }
+            }
+        "#;
+        let module = parse_module(src).unwrap();
+        let f = module.get_function("k").unwrap();
+        let a = attrs_of(f, "%t");
+
+        assert_eq!(a.get("shape"), Some(&Attr::IntList(vec![4, 4])));
+
+        // d1 == 0 excludes most of the 4x4 box, so the set is retained.
+        match a.get("coordinate_set") {
+            Some(Attr::AffineSet(set)) => {
+                assert_eq!(set.num_dims, 2);
+                assert_eq!(set.constraints[2].kind, ConstraintKind::Equal);
+                assert!(set.contains(&[2, 0], &[] as &[i64]));
+                assert!(!set.contains(&[2, 1], &[] as &[i64]));
+            }
+            other => panic!("expected retained AffineSet, got {other:?}"),
+        }
+
+        // The (d0,d1)->(d1,d0) order map is a permutation, not identity: kept.
+        match a.get("coordinate_order") {
+            Some(Attr::AffineMap(m)) => assert_eq!(m.eval(&[1, 2], &[]), vec![2, 1]),
+            other => panic!("expected retained AffineMap order, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construct_memory_view_parses_lx_core_and_strides() {
+        // Per-core LX memory space and a multi-dim strided view.
+        let src = r#"
+            module {
+              func.func @k(%p: index) attributes {grid = [1]} {
+                %v = ktdp.construct_memory_view %p, sizes: [16, 32], strides: [32, 1] {
+                  coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
+                  memory_space = #ktdp.spyre_memory_space<LX, core = 3>
+                } : memref<16x32xf32>
+                return
+              }
+            }
+        "#;
+        let module = parse_module(src).unwrap();
+        let f = module.get_function("k").unwrap();
+        let a = attrs_of(f, "%v");
+
+        assert_eq!(a.get("shape"), Some(&Attr::IntList(vec![16, 32])));
+        assert_eq!(a.get("strides"), Some(&Attr::IntList(vec![32, 1])));
+        assert_eq!(a.get("dtype"), Some(&Attr::Str("f32".to_string())));
+        assert_eq!(a.get("memory_space"), Some(&Attr::Str("LX".to_string())));
+        assert_eq!(a.get("lx_core_id"), Some(&Attr::Int(3)));
+        assert!(matches!(a.get("coordinate_set"), Some(Attr::AffineSet(_))));
+    }
+
+    #[test]
+    fn all_construct_ops_in_vector_add_carry_attributes() {
+        // Regression guard: every construct op in the real example must end up
+        // with the load-bearing attributes populated.
+        let module = parse_module(VECTOR_ADD).unwrap();
+        let f = module.get_function("add_kernel").unwrap();
+        for op in &f.operations {
+            match op.op_type.as_str() {
+                "ktdp.construct_memory_view" => {
+                    let a = &op.attributes;
+                    assert!(a.contains_key("shape"), "view missing shape");
+                    assert!(a.contains_key("strides"), "view missing strides");
+                    assert!(a.contains_key("dtype"), "view missing dtype");
+                    assert!(a.contains_key("memory_space"), "view missing memory_space");
+                    assert!(a.contains_key("coordinate_set"), "view missing coordinate_set");
+                }
+                "ktdp.construct_access_tile" => {
+                    let a = &op.attributes;
+                    assert!(a.contains_key("shape"), "tile missing shape");
+                    assert!(a.contains_key("base_map"), "tile missing base_map");
+                }
+                _ => {}
+            }
         }
     }
 }
