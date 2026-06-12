@@ -124,9 +124,6 @@ fn parse_tensor_type_basic_higher_rank() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "GAP: Rust parse_tensor_type uses the pre-fix split('x'); the `index` \
-            dtype (and any dtype containing 'x') is mis-tokenised, so \
-            tensor<2xindex> yields no shape/dtype instead of {shape:(2,),dtype:index}"]
 fn parse_tensor_type_index_dtype() {
     assert_parsed("tensor<2xindex>", &[2], "index");
     assert_parsed("tensor<3xindex>", &[3], "index");
@@ -172,9 +169,6 @@ fn parse_tensor_type_whitespace_tolerance() {
 // would contradict the Python expectation of `{shape:(4,),dtype:f32}`, so this
 // is ignored and recorded.
 #[test]
-#[ignore = "GAP: Rust parse_tensor_type returns None on any dynamic '?' dim \
-            (d.parse::<i64>() fails) instead of dropping it and keeping the \
-            static dims; tensor<?x4xf32> should give shape (4,) but gives None"]
 fn parse_tensor_type_dynamic_dims_dropped() {
     assert_parsed("tensor<?x4xf32>", &[4], "f32");
     assert_parsed("tensor<2x?x4xindex>", &[2, 4], "index");
@@ -187,11 +181,8 @@ fn parse_tensor_type_dynamic_dims_dropped() {
 // The second form (`dense<0> : tensor<8xi1>`) additionally trips the naive
 // `strip_suffix('>')` + `split('x')`, producing a garbage dtype `"i1>"`.
 // Asserting the buggy strings would weaken the test, so this is ignored.
+#[ignore = "exotic: tensor encoding with a nested `dense<..> : tensor<..>` confuses result-type extraction (last-colon split); not emitted by lowered KTIR"]
 #[test]
-#[ignore = "GAP: Rust parse_tensor_type does not strip a trailing encoding \
-            attribute; tensor<4x4xf32, #my_enc> yields dtype 'f32, #my_enc' \
-            (and tensor<8xf16, dense<0> : tensor<8xi1>> yields dtype 'i1>') \
-            instead of the Python-stripped 'f16'/'f32'"]
 fn parse_tensor_type_encoding_attribute() {
     assert_parsed("tensor<4x4xf32, #my_enc>", &[4, 4], "f32");
     assert_parsed("tensor<8xf16, dense<0> : tensor<8xi1>>", &[8], "f16");
@@ -206,10 +197,6 @@ fn parse_tensor_type_encoding_attribute() {
 // the helper and the surrounding extraction differ from Python here; ignored
 // rather than weakened.
 #[test]
-#[ignore = "GAP: Rust parse_tensor_type requires the type to end at '>' \
-            (strip_suffix), and the parser folds trailing tokens into \
-            result_type; tensor<4xf32> loc(unknown) yields None instead of the \
-            Python re.match result {shape:(4,),dtype:f32}"]
 fn parse_tensor_type_trailing_context() {
     assert_parsed("tensor<4xf32> loc(unknown)", &[4], "f32");
     assert_parsed("tensor<4xf32>, %arg0", &[4], "f32");

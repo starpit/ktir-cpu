@@ -674,21 +674,51 @@ fn parse_memory_space(text: &str) -> (String, Option<i64>) {
 
 /// Extract the element dtype (last `x`-segment) from a `memref<...>` type
 /// string, e.g. `memref<4096xf16>` -> `f16`. Mirrors the memref-type split.
-/// Parse a `tensor<DxDx...xELT>` type into `(shape, dtype)`. Returns `None` for
-/// non-tensor types or types with dynamic `?` dims (those need the SSA-size
-/// resolution path). E.g. `tensor<1x4xf16>` -> `([1, 4], "f16")`.
+/// Parse a `tensor<DxDx...xELT[, encoding]>` type into `(static_shape, dtype)`.
+///
+/// Anchored at `tensor<` (trailing context after `>` is ignored, like Python's
+/// `re.match`). Leading `Nx` / `?x` dimension tokens are consumed one at a time
+/// — so the element type's own letters (notably `index`, which *ends in* `x`)
+/// are never mistaken for a dim separator. Dynamic `?` dims are dropped from the
+/// static shape; the dtype stops at the first `,`/`>`/whitespace (so an encoding
+/// attribute like `tensor<4x4xf32, #enc>` yields `f32`). E.g.
+/// `tensor<1x4xf16>` -> `([1, 4], "f16")`, `tensor<2xindex>` -> `([2], "index")`.
 fn parse_tensor_type(ty: &str) -> Option<(Vec<i64>, String)> {
-    let inner = ty.trim().strip_prefix("tensor<")?.strip_suffix('>')?;
-    let parts: Vec<&str> = inner.split('x').collect();
-    if parts.len() < 2 {
+    // Drop whitespace so `tensor< 2 x f32 >` tokenizes like `tensor<2xf32>`.
+    let compact: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut s = compact.strip_prefix("tensor<")?;
+    let mut shape = Vec::new();
+    loop {
+        // A dimension token is `\d+` or `?`, immediately followed by `x`.
+        if let Some(after) = s.strip_prefix('?') {
+            if let Some(rest) = after.strip_prefix('x') {
+                s = rest; // dynamic dim — drop from static shape
+                continue;
+            }
+            break;
+        }
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && s.as_bytes().get(digits) == Some(&b'x') {
+            shape.push(s[..digits].parse::<i64>().ok()?);
+            s = &s[digits + 1..];
+            continue;
+        }
+        break;
+    }
+    // Requires at least one *static* dim. `tensor<f32>` (rank-0) and
+    // `tensor<?xf16>` (all-dynamic) both yield None, matching the Python helper.
+    if shape.is_empty() {
         return None;
     }
-    let (dtype, dims) = parts.split_last().unwrap();
-    let mut shape = Vec::with_capacity(dims.len());
-    for d in dims {
-        shape.push(d.trim().parse::<i64>().ok()?); // `?` dynamic dims -> None
+    // The element type is the leading run of alphanumerics (stops at `,`/`>`).
+    let dtype_end = s
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(s.len());
+    let dtype = &s[..dtype_end];
+    if dtype.is_empty() {
+        return None;
     }
-    Some((shape, dtype.trim().to_string()))
+    Some((shape, dtype.to_string()))
 }
 
 fn parse_memref_dtype(result_type: &str) -> Option<String> {
