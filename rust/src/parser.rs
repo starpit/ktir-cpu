@@ -305,11 +305,24 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
     };
     let rest = rest.trim();
 
-    let op_type = rest
+    // The op name is the leading `dialect.op` identifier; it ends at the first
+    // non-identifier char (whitespace, or `(` in the no-operand form like
+    // `tensor.empty()`). Mirrors the `[a-z_][a-z0-9_.]*` capture in the Python
+    // `_parse_general_operation` regex.
+    let token = rest
         .split_whitespace()
         .next()
-        .ok_or("operation missing op_type")?
-        .to_string();
+        .ok_or("operation missing op_type")?;
+    let op_len = token
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .unwrap_or(token.len());
+    let op_type = token[..op_len].to_string();
+    // Lines that don't begin with a `dialect.op` identifier (e.g. block labels
+    // `^bb0(%a: f32):`) are not operations — skip them, as the Python
+    // `_parse_general_operation` regex does by failing to match and returning None.
+    if op_type.is_empty() {
+        return Ok(None);
+    }
     let after_op = rest[op_type.len()..].trim();
 
     let result_type = extract_result_type(after_op);
@@ -736,24 +749,75 @@ fn remove_brace_blocks(text: &str) -> String {
 }
 
 /// Parse the literal of `arith.constant <lit> : <type>` into a value `Attr`.
+///
+/// Handles scalar `true`/`false`, decimal ints/floats, hex bit-pattern literals
+/// (`0xFF80` — used for ±inf/NaN encodings), and `dense<...>` tensor constants
+/// (splat scalar or `[..]` list). Mirrors `parse_numeric` + the dense-payload
+/// handling in `parser_utils.py`.
 fn parse_constant_value(after_op: &str) -> Result<Attr, String> {
-    let lit = after_op
-        .split(':')
-        .next()
-        .and_then(|s| s.split_whitespace().next())
-        .ok_or("arith.constant: missing literal")?;
+    // The literal runs from after the op name to the `:` type annotation; for
+    // `dense<...>` it may contain `[ , ]`, so take everything before the LAST
+    // top-level `:` rather than the first whitespace token.
+    let head = after_op.split_whitespace().next().unwrap_or("").trim();
+    if let Some(inner) = head
+        .strip_prefix("dense<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        return parse_dense_payload(inner);
+    }
+    let lit = head;
     match lit {
         "true" => Ok(Attr::Bool(true)),
         "false" => Ok(Attr::Bool(false)),
-        _ if lit.contains('.') || lit.contains('e') || lit.contains('E') => lit
+        _ => parse_scalar_numeric(lit),
+    }
+}
+
+/// A single numeric literal: hex bit-pattern, decimal float, or decimal int.
+fn parse_scalar_numeric(lit: &str) -> Result<Attr, String> {
+    if let Some(hex) = lit.strip_prefix("0x").or_else(|| lit.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16)
+            .map(Attr::Int)
+            .map_err(|_| format!("arith.constant: bad hex literal {lit:?}"));
+    }
+    if lit.contains('.') || lit.contains('e') || lit.contains('E') {
+        return lit
             .parse::<f64>()
             .map(Attr::Float)
-            .map_err(|_| format!("arith.constant: bad float literal {lit:?}")),
-        _ => lit
-            .parse::<i64>()
-            .map(Attr::Int)
-            .map_err(|_| format!("arith.constant: bad int literal {lit:?}")),
+            .map_err(|_| format!("arith.constant: bad float literal {lit:?}"));
     }
+    lit.parse::<i64>()
+        .map(Attr::Int)
+        .map_err(|_| format!("arith.constant: bad int literal {lit:?}"))
+}
+
+/// `dense<...>` payload: a `[a, b, ...]` list -> `FloatList`, or a splat scalar
+/// -> `Float`/`Int`. The result type (carried separately) tells the consumer
+/// the shape/dtype; here we only lift the values.
+fn parse_dense_payload(inner: &str) -> Result<Attr, String> {
+    let inner = inner.trim();
+    if let Some(list) = inner.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let vals = list
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(parse_f64_lit)
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Attr::FloatList(vals));
+    }
+    match parse_scalar_numeric(inner)? {
+        Attr::Int(i) => Ok(Attr::Float(i as f64)), // splat — normalize to float payload
+        other => Ok(other),
+    }
+}
+
+fn parse_f64_lit(s: &str) -> Result<f64, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16)
+            .map(|i| i as f64)
+            .map_err(|_| format!("dense: bad hex element {s:?}"));
+    }
+    s.parse::<f64>().map_err(|_| format!("dense: bad element {s:?}"))
 }
 
 /// Convenience: a parsed `arith.constant` value attr -> a [`Value`] for tests /
