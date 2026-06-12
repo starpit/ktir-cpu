@@ -276,7 +276,7 @@ fn generate(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result
                     shape
                 ));
             }
-            t.data
+            t.data.to_vec()
         }
         other => {
             let s = as_f32(&other, "tensor.generate yield")?;
@@ -330,7 +330,7 @@ fn reshaped(tile: &Tile, target: Vec<usize>, name: &str) -> Result<Tile, String>
             target
         ));
     }
-    Ok(Tile::compute(tile.data.clone(), tile.dtype, target))
+    Ok(Tile::compute(tile.data.to_vec(), tile.dtype, target))
 }
 
 // --- index / shape helpers -----------------------------------------------
@@ -490,7 +490,7 @@ mod tests {
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![2, 3]);
         assert_eq!(t.dtype, DType::F32);
-        assert_eq!(t.data, vec![0.0; 6]);
+        assert_eq!(t.data.to_vec(), vec![0.0; 6]);
     }
 
     #[test]
@@ -501,7 +501,7 @@ mod tests {
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![1]);
         assert_eq!(t.dtype, DType::F16);
-        assert_eq!(t.data, vec![0.0]);
+        assert_eq!(t.data.to_vec(), vec![0.0]);
     }
 
     // --- splat -----------------------------------------------------------
@@ -516,7 +516,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![1, 4]);
-        assert_eq!(t.data, vec![2.5; 4]);
+        assert_eq!(t.data.to_vec(), vec![2.5; 4]);
         assert_eq!(t.dtype, DType::F16);
     }
 
@@ -531,7 +531,7 @@ mod tests {
         let t = tile(&ctx, "%t");
         // integer scalar overrides dtype to i32 (mirrors np.int32 branch)
         assert_eq!(t.dtype, DType::I32);
-        assert_eq!(t.data, vec![7.0, 7.0, 7.0]);
+        assert_eq!(t.data.to_vec(), vec![7.0, 7.0, 7.0]);
     }
 
     #[test]
@@ -546,7 +546,7 @@ mod tests {
             .with_attr("dtype", Attr::Str("f32".into()));
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%t");
-        assert_eq!(t.data, vec![9.0, 9.0]);
+        assert_eq!(t.data.to_vec(), vec![9.0, 9.0]);
     }
 
     #[test]
@@ -557,7 +557,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![1]);
-        assert_eq!(t.data, vec![4.0]);
+        assert_eq!(t.data.to_vec(), vec![4.0]);
     }
 
     // --- extract ---------------------------------------------------------
@@ -639,7 +639,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%out");
         assert_eq!(t.shape, vec![2, 3]);
-        assert_eq!(t.data, data); // same flat buffer, row-major
+        assert_eq!(t.data.to_vec(), data); // same flat buffer, row-major
     }
 
     #[test]
@@ -671,7 +671,7 @@ mod tests {
         let t = tile(&ctx, "%out");
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.dtype, DType::F16); // source dtype preserved
-        assert_eq!(t.data, data);
+        assert_eq!(t.data.to_vec(), data);
     }
 
     #[test]
@@ -684,7 +684,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%out");
         assert_eq!(t.shape, vec![6]);
-        assert_eq!(t.data, data);
+        assert_eq!(t.data.to_vec(), data);
     }
 
     #[test]
@@ -711,7 +711,7 @@ mod tests {
         let t = tile(&ctx, "%shape");
         assert_eq!(t.shape, vec![2]);
         assert_eq!(t.dtype, DType::I32); // index lowers to i32
-        assert_eq!(t.data, vec![16.0, 32.0]);
+        assert_eq!(t.data.to_vec(), vec![16.0, 32.0]);
     }
 
     #[test]
@@ -726,7 +726,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![2, 2]);
-        assert_eq!(t.data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![2, 2]);
         // i+j over (i,j) in 2x2: [[0,1],[1,2]]
-        assert_eq!(t.data, vec![0.0, 1.0, 1.0, 2.0]);
+        assert_eq!(t.data.to_vec(), vec![0.0, 1.0, 1.0, 2.0]);
         assert_eq!(t.dtype, DType::F32);
     }
 
@@ -800,7 +800,7 @@ mod tests {
         gen_op.regions = vec![vec![bb0, c, yld]];
         run(&[gen_op], &mut ctx).unwrap();
         let t = tile(&ctx, "%t");
-        assert_eq!(t.data, vec![7.0, 7.0, 7.0]);
+        assert_eq!(t.data.to_vec(), vec![7.0, 7.0, 7.0]);
     }
 
     #[test]
@@ -817,7 +817,7 @@ mod tests {
         run(&[gen_op], &mut ctx).unwrap();
         assert!(!ctx.has_value("%i")); // popped
         let t = tile(&ctx, "%t");
-        assert_eq!(t.data, vec![0.0, 1.0]); // identity index grid
+        assert_eq!(t.data.to_vec(), vec![0.0, 1.0]); // identity index grid
     }
 
     // --- yield -----------------------------------------------------------

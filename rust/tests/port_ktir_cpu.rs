@@ -336,11 +336,15 @@ fn get_cores_in_group_filters() {
 
 #[test]
 fn tile_copy_is_independent() {
-    // test_tile_operations (copy half): mutating a clone does not affect the original.
+    // test_tile_operations (copy half): mutating a clone does not affect the
+    // original. Tile data is `Rc<[f32]>` (shared + immutable), so a clone shares
+    // the buffer until mutated; `Rc::make_mut` copies-on-write, preserving the
+    // independence the Python deep copy guaranteed.
     let tile1 = Tile::compute(vec![1.0, 2.0, 3.0, 4.0], DType::F16, vec![4]);
     let mut tile1_copy = tile1.clone();
-    tile1_copy.data[0] = 999.0;
+    std::rc::Rc::make_mut(&mut tile1_copy.data)[0] = 999.0;
     assert_eq!(tile1.data[0], 1.0, "copy should be independent");
+    assert_eq!(tile1_copy.data[0], 999.0, "copy reflects the mutation");
 }
 
 #[test]

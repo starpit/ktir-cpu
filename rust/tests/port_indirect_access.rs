@@ -238,7 +238,7 @@ fn small_indirect_gather() {
     // Y[m,k] = X[3-k, k]: [12,9,6,3] in every row.
     let expected: Vec<f32> = (0..4).flat_map(|_| [12.0, 9.0, 6.0, 3.0]).collect();
     assert_eq!(tile.shape, vec![4, 4]);
-    assert_eq!(tile.data, expected);
+    assert_eq!(tile.data.to_vec(), expected);
 }
 
 // ===========================================================================
@@ -430,7 +430,7 @@ fn swap_vso_indirect_load() {
     let expected: Vec<f32> = (0..4)
         .flat_map(|r| (0..4).map(move |c| (c * 4 + r) as f32))
         .collect();
-    assert_eq!(tile.data, expected);
+    assert_eq!(tile.data.to_vec(), expected);
 }
 
 #[test]
@@ -494,7 +494,7 @@ fn indirect_load_with_3cycle_vso() {
     // Sorted-by-(l,m,k) gather, reshaped (2,2,2) row-major.
     let expected = vec![0.0, 2.0, 4.0, 6.0, 1.0, 3.0, 5.0, 7.0];
     assert_eq!(tile.shape, vec![2, 2, 2]);
-    assert_eq!(tile.data, expected);
+    assert_eq!(tile.data.to_vec(), expected);
 }
 
 #[test]

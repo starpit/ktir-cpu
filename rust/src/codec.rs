@@ -405,6 +405,6 @@ mod tile_round_tests {
         }
         // f32 tiles keep exact values.
         let g = Tile::compute(vec![0.1, 0.2], DType::F32, vec![2]);
-        assert_eq!(g.data, vec![0.1, 0.2]);
+        assert_eq!(g.data.to_vec(), vec![0.1, 0.2]);
     }
 }

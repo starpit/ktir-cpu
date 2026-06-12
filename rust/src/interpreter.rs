@@ -574,7 +574,7 @@ mod tests {
         let ops = vec![Operation::new(Some("%z"), "arith.addf", &["%x", "%y"])];
         execute_ops(&ops, &mut ctx, &env).unwrap();
         match ctx.get_value("%z").unwrap() {
-            Value::Tile(t) => assert_eq!(t.data, vec![11.0, 22.0, 33.0]),
+            Value::Tile(t) => assert_eq!(t.data.to_vec(), vec![11.0, 22.0, 33.0]),
             other => panic!("expected tile, got {other:?}"),
         }
         // the result Tile was tracked in LX (3 * f32 = 12 bytes)

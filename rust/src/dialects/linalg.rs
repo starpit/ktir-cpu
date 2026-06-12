@@ -99,7 +99,7 @@ fn elementwise(
             op.op_type, a.shape, b.shape
         ));
     }
-    let data: Vec<f32> = a.data.iter().zip(&b.data).map(|(&x, &y)| f(x, y)).collect();
+    let data: Vec<f32> = a.data.iter().zip(b.data.iter()).map(|(&x, &y)| f(x, y)).collect();
     Ok(Some(Value::Tile(Tile::compute(data, a.dtype, a.shape.clone()))))
 }
 
@@ -197,7 +197,7 @@ fn matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
                     c.shape, result.shape
                 ));
             }
-            for (r, &cv) in result.data.iter_mut().zip(&c.data) {
+            for (r, &cv) in std::rc::Rc::make_mut(&mut result.data).iter_mut().zip(c.data.iter()) {
                 *r += cv;
             }
             result.dtype = c.dtype;
@@ -234,7 +234,7 @@ fn batch_matmul(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> R
 
     if op.operands.len() > 2
         && let Value::Tile(c) = ctx.get_value(&op.operands[2])? {
-            for (r, &cv) in result.data.iter_mut().zip(&c.data) {
+            for (r, &cv) in std::rc::Rc::make_mut(&mut result.data).iter_mut().zip(c.data.iter()) {
                 *r += cv;
             }
             result.dtype = c.dtype;
@@ -361,7 +361,7 @@ fn tree_fold(
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
     // Reduce to scalar (no dim) -> flatten everything onto one axis first.
     let (mut acc, mut shape, axis) = match dim {
-        None => (tile.data.clone(), vec![tile.data.len()], 0usize),
+        None => (tile.data.to_vec(), vec![tile.data.len()], 0usize),
         Some(d) => {
             if d >= tile.shape.len() {
                 return Err(format!(
@@ -369,7 +369,7 @@ fn tree_fold(
                     tile.shape
                 ));
             }
-            (tile.data.clone(), tile.shape.clone(), d)
+            (tile.data.to_vec(), tile.shape.clone(), d)
         }
     };
 
@@ -388,7 +388,7 @@ fn tree_fold(
             env,
         )?;
         let mut combined_data = match combined {
-            Value::Tile(t) => t.data,
+            Value::Tile(t) => t.data.to_vec(),
             Value::Scalar(s) => vec![as_f32(&Value::Scalar(s), "reduce combiner")?],
             other => {
                 return Err(format!(
@@ -519,7 +519,7 @@ fn generic(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<
             if n_ins < bb0_names.len() {
                 ctx.set_value(
                     &bb0_names[n_ins],
-                    Value::Tile(Tile::compute(outs_val.data.clone(), outs_val.dtype, out_shape.clone())),
+                    Value::Tile(Tile::compute(outs_val.data.to_vec(), outs_val.dtype, out_shape.clone())),
                 );
             }
             Ok(())
@@ -830,7 +830,7 @@ mod tests {
         ctx.set_value("%init", tile(vec![0.0; 6], vec![2, 3]));
         run(&[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
-        assert_eq!(t.data, vec![7.0; 6]);
+        assert_eq!(t.data.to_vec(), vec![7.0; 6]);
         assert_eq!(t.shape, vec![2, 3]);
     }
 
@@ -840,7 +840,7 @@ mod tests {
         ctx.set_value("%s", Value::Index(3));
         ctx.set_value("%init", tile(vec![0.0; 2], vec![2]));
         run(&[Operation::new(Some("%r"), "linalg.fill", &["%s", "%init"])], &mut ctx).unwrap();
-        assert_eq!(get_tile(&ctx, "%r").data, vec![3.0, 3.0]);
+        assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![3.0, 3.0]);
     }
 
     // --- transpose --------------------------------------------------------
@@ -856,7 +856,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![3, 2]);
-        assert_eq!(t.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(t.data.to_vec(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 
     #[test]
@@ -867,7 +867,7 @@ mod tests {
         let op = Operation::new(Some("%r"), "linalg.transpose", &["%x", "%y"])
             .with_attr("permutation", Attr::IntList(vec![0, 1]));
         run(&[op], &mut ctx).unwrap();
-        assert_eq!(get_tile(&ctx, "%r").data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(t.shape, vec![1, 3, 2]);
         // in[i,j,k] at i*3+k (j=0). out flat: (0,0,0)->in[0,0,0]=0 (0,0,1)->in[1,0,0]=3
         // (0,1,0)->in[0,0,1]=1 (0,1,1)->in[1,0,1]=4 (0,2,0)->in[0,0,2]=2 (0,2,1)->in[1,0,2]=5
-        assert_eq!(t.data, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+        assert_eq!(t.data.to_vec(), vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
     }
 
     // --- broadcast --------------------------------------------------------
@@ -900,7 +900,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![3, 4]);
-        assert_eq!(t.data, vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]);
+        assert_eq!(t.data.to_vec(), vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]);
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
             .with_attr("dimensions", Attr::IntList(vec![0]));
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
-        assert_eq!(t.data, vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
     }
 
     // --- matmul -----------------------------------------------------------
@@ -927,7 +927,7 @@ mod tests {
         run(&[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b"])], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 2]);
-        assert_eq!(t.data, vec![19.0, 22.0, 43.0, 50.0]);
+        assert_eq!(t.data.to_vec(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
     #[test]
@@ -938,7 +938,7 @@ mod tests {
         ctx.set_value("%c", tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
         run(&[Operation::new(Some("%r"), "linalg.matmul", &["%a", "%b", "%c"])], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
-        assert_eq!(t.data, vec![20.0, 23.0, 44.0, 51.0]);
+        assert_eq!(t.data.to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
     }
 
     #[test]
@@ -951,7 +951,7 @@ mod tests {
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 2]);
         // row0: [58, 64], row1: [139, 154]
-        assert_eq!(t.data, vec![58.0, 64.0, 139.0, 154.0]);
+        assert_eq!(t.data.to_vec(), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
     #[test]
@@ -972,7 +972,7 @@ mod tests {
         run(&[Operation::new(Some("%r"), "linalg.batch_matmul", &["%a", "%b"])], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 2, 2]);
-        assert_eq!(t.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     }
 
     // --- reduce -----------------------------------------------------------
@@ -1022,7 +1022,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2]);
-        assert_eq!(t.data, vec![6.0, 15.0]);
+        assert_eq!(t.data.to_vec(), vec![6.0, 15.0]);
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![3]);
-        assert_eq!(t.data, vec![5.0, 7.0, 9.0]);
+        assert_eq!(t.data.to_vec(), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
@@ -1046,7 +1046,7 @@ mod tests {
         let mut op = Operation::new(Some("%r"), "linalg.reduce", &["%x"]).with_attr("dim", Attr::Int(1));
         op.regions.push(addf_combiner_region());
         run(&[op], &mut ctx).unwrap();
-        assert_eq!(get_tile(&ctx, "%r").data, vec![6.0, 15.0]);
+        assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![6.0, 15.0]);
     }
 
     #[test]
@@ -1122,7 +1122,7 @@ mod tests {
         ]);
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
-        assert_eq!(t.data, vec![11.0, 22.0, 33.0]);
+        assert_eq!(t.data.to_vec(), vec![11.0, 22.0, 33.0]);
     }
 
     #[test]
@@ -1140,7 +1140,7 @@ mod tests {
         ]);
         run(&[op], &mut ctx).unwrap();
         let t = get_tile(&ctx, "%r");
-        assert_eq!(t.data, vec![101.0, 202.0, 303.0]);
+        assert_eq!(t.data.to_vec(), vec![101.0, 202.0, 303.0]);
     }
 
     #[test]
@@ -1162,7 +1162,7 @@ mod tests {
         let t = get_tile(&ctx, "%r");
         assert_eq!(t.shape, vec![2, 3]);
         // Each row is [10,20,30].
-        assert_eq!(t.data, vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
+        assert_eq!(t.data.to_vec(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
     }
 
     #[test]
@@ -1176,7 +1176,7 @@ mod tests {
             .with_attr("bb0_names", Attr::StrList(vec!["%a".into(), "%out".into()]));
         op.regions.push(vec![Operation::new(None, "linalg.yield", &["%a"])]);
         run(&[op], &mut ctx).unwrap();
-        assert_eq!(get_tile(&ctx, "%r").data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(get_tile(&ctx, "%r").data.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -1205,7 +1205,7 @@ mod tests {
         match v {
             Value::Tile(t) => {
                 assert_eq!(t.shape, vec![1, 3]);
-                assert_eq!(t.data, vec![0.0, 1.0, 2.0]);
+                assert_eq!(t.data.to_vec(), vec![0.0, 1.0, 2.0]);
                 assert_eq!(t.dtype, DType::I32);
             }
             other => panic!("expected index tile, got {other:?}"),
@@ -1224,7 +1224,7 @@ mod tests {
         match v {
             Value::Tile(t) => {
                 assert_eq!(t.shape, vec![4, 1]);
-                assert_eq!(t.data, vec![0.0, 1.0, 2.0, 3.0]);
+                assert_eq!(t.data.to_vec(), vec![0.0, 1.0, 2.0, 3.0]);
             }
             other => panic!("got {other:?}"),
         }

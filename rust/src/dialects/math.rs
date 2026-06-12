@@ -155,7 +155,7 @@ fn powf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
             let data: Vec<f32> = b
                 .data
                 .iter()
-                .zip(&e.data)
+                .zip(e.data.iter())
                 .map(|(&x, &y)| round_to(x.powf(y), b.dtype))
                 .collect();
             Ok(Some(Value::Tile(Tile::compute(data, b.dtype, b.shape.clone()))))

@@ -21,11 +21,20 @@
 //! `unique_sticks` bookkeeping below is storage-independent either way.
 
 use crate::dtypes::DType;
+use std::rc::Rc;
 
 /// A tensor of element data — `load` result / compute-op operand.
+///
+/// `data` is an `Rc<[f32]>`: tiles are immutable once built (every op produces a
+/// fresh result via [`Tile::compute`]), so cloning a Tile — which the
+/// interpreter does constantly (binding op results, threading scf iter_args,
+/// passing operands) — is a refcount bump, not a deep copy of the element data.
+/// The two spots that fold into an existing result (`linalg.matmul`/`batch_matmul`
+/// accumulate) own their tile uniquely and reach through `Rc::make_mut`, which is
+/// copy-free at refcount 1.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tile {
-    pub data: Vec<f32>,
+    pub data: Rc<[f32]>,
     pub dtype: DType,
     pub shape: Vec<usize>,
     /// Distinct HBM sticks touched by the load that produced this tile.
@@ -52,7 +61,7 @@ impl Tile {
         );
         crate::codec::round_to_dtype(&mut data, dtype);
         Tile {
-            data,
+            data: data.into(),
             dtype,
             shape,
             unique_sticks: None,

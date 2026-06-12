@@ -432,7 +432,7 @@ pub fn distributed_load(
 
     write_to_lx(ctx, &out, dist_tile_ref.dtype);
     Ok(Tile {
-        data: out,
+        data: out.into(),
         dtype: dist_tile_ref.dtype,
         shape: out_shape,
         unique_sticks: if any_hbm { Some(total_unique_sticks) } else { None },
@@ -817,7 +817,7 @@ pub fn load_data(
             ((end + sb - 1) / sb - tile_ref.base_ptr / sb) as usize
         });
         return Ok(Tile {
-            data,
+            data: data.into(),
             dtype,
             shape: tile_ref.shape.clone(),
             unique_sticks,
@@ -843,7 +843,7 @@ pub fn load_data(
     let out_shape = result_shape.unwrap_or_else(|| tile_ref.shape.clone());
     write_to_lx(ctx, &gathered, dtype);
     Ok(Tile {
-        data: gathered,
+        data: gathered.into(),
         dtype,
         shape: out_shape,
         unique_sticks,
@@ -1184,7 +1184,7 @@ mod tests {
         let m = hbm_memref(stick, vec![4], vec![1], DType::F32);
         let tr = m.to_tile_ref();
         let tile = load_data(&mut ctx, &tr, None, None).unwrap();
-        assert_eq!(tile.data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(tile.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(tile.shape, vec![4]);
         // 16 bytes from a stick boundary -> exactly 1 stick.
         assert_eq!(tile.unique_sticks, Some(1));
@@ -1208,7 +1208,7 @@ mod tests {
             coordinate_set: None,
         };
         let tile = load_data(&mut ctx, &m.to_tile_ref(), None, None).unwrap();
-        assert_eq!(tile.data, vec![1.0, 2.0, 4.0]);
+        assert_eq!(tile.data.to_vec(), vec![1.0, 2.0, 4.0]);
         assert_eq!(tile.unique_sticks, None); // LX: no sticks
     }
 
@@ -1228,7 +1228,7 @@ mod tests {
         // Gather the diagonal: (0,0),(1,1),(2,2),(3,3) -> 0,5,10,15.
         let coords = vec![vec![0, 0], vec![1, 1], vec![2, 2], vec![3, 3]];
         let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![4])).unwrap();
-        assert_eq!(tile.data, vec![0.0, 5.0, 10.0, 15.0]);
+        assert_eq!(tile.data.to_vec(), vec![0.0, 5.0, 10.0, 15.0]);
     }
 
     // ---- store round trips ----
@@ -1245,7 +1245,7 @@ mod tests {
         assert_eq!(sticks, 1);
 
         let back = load_data(&mut ctx, &tr, None, None).unwrap();
-        assert_eq!(back.data, vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(back.data.to_vec(), vec![10.0, 20.0, 30.0, 40.0]);
     }
 
     #[test]
@@ -1264,7 +1264,7 @@ mod tests {
         let sticks = store_data(&mut ctx, &tile, &tr, None).unwrap();
         assert_eq!(sticks, 0);
         let back = load_data(&mut ctx, &tr, None, None).unwrap();
-        assert_eq!(back.data, vec![1.0, 2.0, 3.0]);
+        assert_eq!(back.data.to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1398,7 +1398,7 @@ mod tests {
         ];
         run(&ops, &mut ctx).unwrap();
         match ctx.get_value("%t").unwrap() {
-            Value::Tile(t) => assert_eq!(t.data, vec![5.0, 6.0, 7.0, 8.0]),
+            Value::Tile(t) => assert_eq!(t.data.to_vec(), vec![5.0, 6.0, 7.0, 8.0]),
             other => panic!("expected Tile, got {other:?}"),
         }
     }
@@ -1562,7 +1562,7 @@ mod tests {
         let dtr = distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
         let tile = distributed_load(&mut ctx, &dtr, Some(vec![8])).unwrap();
         // Concatenation of both partitions in global-coord order.
-        assert_eq!(tile.data, vec![0.0, 1.0, 2.0, 3.0, 40.0, 50.0, 60.0, 70.0]);
+        assert_eq!(tile.data.to_vec(), vec![0.0, 1.0, 2.0, 3.0, 40.0, 50.0, 60.0, 70.0]);
         assert_eq!(tile.shape, vec![8]);
         // Both partitions are HBM -> unique_sticks aggregated (1 each).
         assert_eq!(tile.unique_sticks, Some(2));
@@ -1586,7 +1586,7 @@ mod tests {
         // Re-resolve (survivor TileRefs are consumed) and read back.
         let dtr2 = distributed_tile_access(&dist, &[8], &AffineMap::identity(1), &[0], None).unwrap();
         let back = distributed_load(&mut ctx, &dtr2, Some(vec![8])).unwrap();
-        assert_eq!(back.data, vec![9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0]);
+        assert_eq!(back.data.to_vec(), vec![9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0]);
     }
 
     // ---- distributed end-to-end through the ktdp.load dispatch handler ----
@@ -1608,7 +1608,7 @@ mod tests {
         let op = Operation::new(Some("%t"), "ktdp.load", &["%a"]);
         run(&[op], &mut ctx).unwrap();
         match ctx.get_value("%t").unwrap() {
-            Value::Tile(t) => assert_eq!(t.data, vec![0.0, 1.0, 2.0, 3.0, 40.0, 50.0, 60.0, 70.0]),
+            Value::Tile(t) => assert_eq!(t.data.to_vec(), vec![0.0, 1.0, 2.0, 3.0, 40.0, 50.0, 60.0, 70.0]),
             other => panic!("expected Tile, got {other:?}"),
         }
     }
@@ -1667,7 +1667,7 @@ mod tests {
         };
 
         let tile = indirect_load(&mut ctx, &iat, None).unwrap();
-        assert_eq!(tile.data, vec![13.0, 10.0, 15.0, 11.0]);
+        assert_eq!(tile.data.to_vec(), vec![13.0, 10.0, 15.0, 11.0]);
         assert_eq!(tile.shape, vec![4]);
         // LX index view -> no index sticks.
         assert_eq!(tile.index_unique_sticks, Some(0));
@@ -1755,7 +1755,7 @@ mod tests {
 
         // Direct full load of X confirms the scatter.
         let back = load_data(&mut ctx, &x_view.to_tile_ref(), None, None).unwrap();
-        assert_eq!(back.data, vec![300.0, 0.0, 100.0, 0.0, 0.0, 200.0, 0.0, 400.0]);
+        assert_eq!(back.data.to_vec(), vec![300.0, 0.0, 100.0, 0.0, 0.0, 200.0, 0.0, 400.0]);
     }
 
     #[test]

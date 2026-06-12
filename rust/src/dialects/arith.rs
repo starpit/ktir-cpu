@@ -607,7 +607,7 @@ fn convertf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resul
     match v {
         Value::Tile(t) => {
             if t.dtype == DType::F16 {
-                Ok(Some(Value::Tile(Tile::compute(t.data, DType::F32, t.shape))))
+                Ok(Some(Value::Tile(Tile::compute(t.data.to_vec(), DType::F32, t.shape))))
             } else {
                 let data: Vec<f32> = t.data.iter().map(|&x| widen_f16(narrow_f16(x))).collect();
                 Ok(Some(Value::Tile(Tile::compute(data, DType::F16, t.shape))))
@@ -662,7 +662,7 @@ fn binary_float(
             if x.shape != y.shape {
                 return Err(format!("{name}: shape mismatch {:?} vs {:?}", x.shape, y.shape));
             }
-            let data: Vec<f32> = x.data.iter().zip(&y.data).map(|(&p, &q)| f(p, q)).collect();
+            let data: Vec<f32> = x.data.iter().zip(y.data.iter()).map(|(&p, &q)| f(p, q)).collect();
             let dtype = result_float_dtype(x.dtype, y.dtype);
             Ok(Some(Value::Tile(Tile::compute(data, dtype, x.shape.clone()))))
         }
@@ -719,7 +719,7 @@ fn binary_int(
             let data: Vec<f32> = x
                 .data
                 .iter()
-                .zip(&y.data)
+                .zip(y.data.iter())
                 .map(|(&p, &q)| f(round_i64(p), round_i64(q)) as f32)
                 .collect();
             Ok(Some(Value::Tile(Tile::compute(data, x.dtype, x.shape.clone()))))
@@ -780,7 +780,7 @@ fn elementwise_data(v: &Value, n: usize, name: &str) -> Result<Vec<f32>, String>
                     t.data.len()
                 ));
             }
-            Ok(t.data.clone())
+            Ok(t.data.to_vec())
         }
         Value::Scalar(_) | Value::Index(_) => Ok(vec![scalar_f32_any(v, name)?; n]),
         other => Err(format!("{name}: bad operand {other:?}")),
@@ -799,7 +799,7 @@ fn cast_to_float(
 ) -> Result<Option<Value>, String> {
     let v = unary_operand(op, ctx, name)?;
     match v {
-        Value::Tile(t) => Ok(Some(Value::Tile(Tile::compute(t.data, dtype, t.shape)))),
+        Value::Tile(t) => Ok(Some(Value::Tile(Tile::compute(t.data.to_vec(), dtype, t.shape)))),
         Value::Scalar(s) => {
             let x = s.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
             Ok(Some(Value::Scalar(Scalar::F32(x))))
@@ -1079,7 +1079,7 @@ mod tests {
             ("%b", tile(vec![10.0, 20.0, 30.0], DType::F32, vec![3])),
         ];
         let r = run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed);
-        assert_eq!(expect_tile(&r).data, vec![11.0, 22.0, 33.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![11.0, 22.0, 33.0]);
     }
 
     #[test]
@@ -1089,11 +1089,11 @@ mod tests {
             ("%b", sf(10.0)),
         ];
         let r = run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed);
-        assert_eq!(expect_tile(&r).data, vec![11.0, 12.0, 13.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![11.0, 12.0, 13.0]);
         // scalar-on-left broadcasts too
         let seed2 = [("%a", sf(10.0)), ("%b", tile(vec![1.0, 2.0], DType::F32, vec![2]))];
         let r2 = run_op(&f32s("%r", "arith.subf", &["%a", "%b"]), &seed2);
-        assert_eq!(expect_tile(&r2).data, vec![9.0, 8.0]);
+        assert_eq!(expect_tile(&r2).data.to_vec(), vec![9.0, 8.0]);
     }
 
     // --- float unary -------------------------------------------------------
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.absf", &["%a"]), &seed)), 3.5);
         let tseed = [("%a", tile(vec![-1.0, 2.0, -3.0], DType::F32, vec![3]))];
         let r = run_op(&f32s("%r", "arith.absf", &["%a"]), &tseed);
-        assert_eq!(expect_tile(&r).data, vec![1.0, 2.0, 3.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
     // --- min/max -----------------------------------------------------------
@@ -1175,7 +1175,7 @@ mod tests {
         let r = run_op(&cmpf_op("olt", &["%a", "%b"]), &seed);
         let t = expect_tile(&r);
         assert_eq!(t.dtype, DType::Bool);
-        assert_eq!(t.data, vec![1.0, 0.0, 0.0]);
+        assert_eq!(t.data.to_vec(), vec![1.0, 0.0, 0.0]);
     }
 
     // --- integer binary ----------------------------------------------------
@@ -1235,11 +1235,11 @@ mod tests {
             ("%b", tile(vec![4.0, 5.0, 6.0], DType::I32, vec![3])),
         ];
         let r = run_op(&f32s("%r", "arith.addi", &["%a", "%b"]), &seed);
-        assert_eq!(expect_tile(&r).data, vec![5.0, 7.0, 9.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![5.0, 7.0, 9.0]);
         // scalar broadcast
         let seed2 = [("%a", tile(vec![1.0, 2.0, 3.0], DType::I32, vec![3])), ("%b", si(10))];
         let r2 = run_op(&f32s("%r", "arith.muli", &["%a", "%b"]), &seed2);
-        assert_eq!(expect_tile(&r2).data, vec![10.0, 20.0, 30.0]);
+        assert_eq!(expect_tile(&r2).data.to_vec(), vec![10.0, 20.0, 30.0]);
     }
 
     // --- bitwise / shift ---------------------------------------------------
@@ -1289,7 +1289,7 @@ mod tests {
         let r = run_op(&cmpi_op("sge", &["%a", "%b"]), &seed);
         let t = expect_tile(&r);
         assert_eq!(t.dtype, DType::Bool);
-        assert_eq!(t.data, vec![0.0, 1.0, 1.0]);
+        assert_eq!(t.data.to_vec(), vec![0.0, 1.0, 1.0]);
     }
 
     // --- select ------------------------------------------------------------
@@ -1312,7 +1312,7 @@ mod tests {
             ("%f", tile(vec![-1.0, -2.0, -3.0], DType::F32, vec![3])),
         ];
         let r = run_op(&op, &seed);
-        assert_eq!(expect_tile(&r).data, vec![10.0, -2.0, 30.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![10.0, -2.0, 30.0]);
     }
 
     #[test]
@@ -1324,7 +1324,7 @@ mod tests {
             ("%f", sf(9.0)),
         ];
         let r = run_op(&op, &seed);
-        assert_eq!(expect_tile(&r).data, vec![7.0, 9.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![7.0, 9.0]);
     }
 
     // --- constant ----------------------------------------------------------
@@ -1356,7 +1356,7 @@ mod tests {
         };
         let r = run_op(&op, &[]);
         let t = expect_tile(&r);
-        assert_eq!(t.data, vec![3.0, 3.0, 3.0, 3.0]);
+        assert_eq!(t.data.to_vec(), vec![3.0, 3.0, 3.0, 3.0]);
         assert_eq!(t.dtype, DType::F16);
         assert_eq!(t.shape, vec![4]);
     }
@@ -1378,7 +1378,7 @@ mod tests {
             regions: vec![],
         };
         let t = run_op(&op, &[]);
-        assert_eq!(expect_tile(&t).data, vec![16.0, 32.0]);
+        assert_eq!(expect_tile(&t).data.to_vec(), vec![16.0, 32.0]);
     }
 
     // --- casts -------------------------------------------------------------
@@ -1411,7 +1411,7 @@ mod tests {
         assert_eq!(expect_tile(&r).dtype, DType::I64);
         let r2 = run_op(&f32s("%r", "arith.trunci", &["%a"]), &seed);
         assert_eq!(expect_tile(&r2).dtype, DType::I32);
-        assert_eq!(expect_tile(&r2).data, vec![1.0, 2.0, 3.0]);
+        assert_eq!(expect_tile(&r2).data.to_vec(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1427,7 +1427,7 @@ mod tests {
         let seed = [("%a", tile(vec![5.0, 7.0], DType::I32, vec![2]))];
         let r = run_op(&op, &seed);
         assert_eq!(expect_tile(&r).dtype, DType::F32);
-        assert_eq!(expect_tile(&r).data, vec![5.0, 7.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![5.0, 7.0]);
         // scalar path
         let sseed = [("%a", si(9))];
         assert_eq!(expect_f32(&run_op(&op, &sseed)), 9.0);
@@ -1439,7 +1439,7 @@ mod tests {
         assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.fptosi", &["%a"]), &seed)), -2);
         let tseed = [("%a", tile(vec![1.9, -1.9, 2.5], DType::F32, vec![3]))];
         let r = run_op(&f32s("%r", "arith.fptosi", &["%a"]), &tseed);
-        assert_eq!(expect_tile(&r).data, vec![1.0, -1.0, 2.0]);
+        assert_eq!(expect_tile(&r).data.to_vec(), vec![1.0, -1.0, 2.0]);
         assert_eq!(expect_tile(&r).dtype, DType::I32);
     }
 

@@ -156,7 +156,7 @@ fn data_close(a: &[f32], b: &[f32], tol: f32) {
 #[test]
 fn addf_tiles() {
     let r = run_op(&op("arith.addf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0])), ("%b", f16_tile(&[3.0, 4.0]))]);
-    assert_eq!(as_tile(&r).data, vec![4.0, 6.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 6.0]);
 }
 
 #[test]
@@ -168,31 +168,31 @@ fn addf_scalars() {
 #[test]
 fn addf_scalar_tile() {
     let r = run_op(&op("arith.addf", &["%a", "%b"]), &[("%a", sf(1.0)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![2.0, 3.0, 4.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![2.0, 3.0, 4.0]);
 }
 
 #[test]
 fn addf_tile_scalar() {
     let r = run_op(&op("arith.addf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", sf(1.0))]);
-    assert_eq!(as_tile(&r).data, vec![2.0, 3.0, 4.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![2.0, 3.0, 4.0]);
 }
 
 #[test]
 fn subf_scalar_tile() {
     let r = run_op(&op("arith.subf", &["%a", "%b"]), &[("%a", sf(10.0)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![9.0, 8.0, 7.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![9.0, 8.0, 7.0]);
 }
 
 #[test]
 fn mulf_tile_scalar() {
     let r = run_op(&op("arith.mulf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", sf(2.0))]);
-    assert_eq!(as_tile(&r).data, vec![2.0, 4.0, 6.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![2.0, 4.0, 6.0]);
 }
 
 #[test]
 fn mulf_scalar_tile() {
     let r = run_op(&op("arith.mulf", &["%a", "%b"]), &[("%a", sf(3.0)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![3.0, 6.0, 9.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![3.0, 6.0, 9.0]);
 }
 
 #[test]
@@ -210,31 +210,31 @@ fn divf_scalar_tile() {
 #[test]
 fn maxf() {
     let r = run_op(&op("arith.maxf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[4.0, 2.0, 6.0]))]);
-    assert_eq!(as_tile(&r).data, vec![4.0, 5.0, 6.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 5.0, 6.0]);
 }
 
 #[test]
 fn maxnumf() {
     let r = run_op(&op("arith.maxnumf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0])), ("%b", f16_tile(&[4.0, 2.0]))]);
-    assert_eq!(as_tile(&r).data, vec![4.0, 5.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 5.0]);
 }
 
 #[test]
 fn maximumf_tiles() {
     let r = run_op(&op("arith.maximumf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[4.0, 2.0, 6.0]))]);
-    assert_eq!(as_tile(&r).data, vec![4.0, 5.0, 6.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 5.0, 6.0]);
 }
 
 #[test]
 fn minimumf() {
     let r = run_op(&op("arith.minimumf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[4.0, 2.0, 6.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 2.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0]);
 }
 
 #[test]
 fn minnumf() {
     let r = run_op(&op("arith.minnumf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0])), ("%b", f16_tile(&[4.0, 2.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 2.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0]);
 }
 
 #[test]
@@ -254,7 +254,7 @@ fn extf_promotes_to_f32() {
     let r = run_op(&op("arith.extf", &["%a"]), &[("%a", f16_tile(&[1.0, 2.0]))]);
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::F32);
-    assert_eq!(t.data, vec![1.0, 2.0]);
+    assert_eq!(t.data.to_vec(), vec![1.0, 2.0]);
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn truncf_passthrough_values() {
     // Python returns the same Tile object; in Rust we check the values round-trip
     // through f16 unchanged (1.0, 2.0 are exactly representable).
     let r = run_op(&op("arith.truncf", &["%a"]), &[("%a", f16_tile(&[1.0, 2.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 2.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0]);
 }
 
 // ===========================================================================
@@ -272,7 +272,7 @@ fn truncf_passthrough_values() {
 #[test]
 fn addi_tile_broadcast() {
     let r = run_op(&op("arith.addi", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", idx(5))]);
-    assert_eq!(as_tile(&r).data, vec![6.0, 7.0, 8.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![6.0, 7.0, 8.0]);
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn addi_broadcast_tile() {
 #[test]
 fn muli_tile_broadcast() {
     let r = run_op(&op("arith.muli", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", idx(3))]);
-    assert_eq!(as_tile(&r).data, vec![3.0, 6.0, 9.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![3.0, 6.0, 9.0]);
 }
 
 #[test]
@@ -366,7 +366,7 @@ fn minsi_tiles() {
         &op("arith.minsi", &["%a", "%b"]),
         &[("%a", tile_with(&[1.0, 5.0, 3.0], DType::I32, &[3])), ("%b", tile_with(&[4.0, 2.0, 6.0], DType::I32, &[3]))],
     );
-    assert_eq!(as_tile(&r).data, vec![1.0, 2.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn maxsi_tiles() {
         &op("arith.maxsi", &["%a", "%b"]),
         &[("%a", tile_with(&[1.0, 5.0, 3.0], DType::I32, &[3])), ("%b", tile_with(&[4.0, 2.0, 6.0], DType::I32, &[3]))],
     );
-    assert_eq!(as_tile(&r).data, vec![4.0, 5.0, 6.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 5.0, 6.0]);
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn andi_tile() {
         &op("arith.andi", &["%a", "%b"]),
         &[("%a", tile_with(&[0b1010 as f32, 0b1100 as f32, 0b1111 as f32], DType::I32, &[3])), ("%b", idx(0b1010))],
     );
-    assert_eq!(as_tile(&r).data, vec![0b1010 as f32, 0b1000 as f32, 0b1010 as f32]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![0b1010 as f32, 0b1000 as f32, 0b1010 as f32]);
 }
 
 // ===========================================================================
@@ -454,7 +454,7 @@ fn negf_scalar() {
 #[test]
 fn negf_tile() {
     let r = run_op(&op("arith.negf", &["%a"]), &[("%a", f16_tile(&[1.0, -2.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![-1.0, 2.0, -3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![-1.0, 2.0, -3.0]);
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn absf_scalar() {
 #[test]
 fn absf_tile() {
     let r = run_op(&op("arith.absf", &["%a"]), &[("%a", f16_tile(&[-1.0, 2.0, -3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 2.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -478,13 +478,13 @@ fn remf_scalars() {
 #[test]
 fn minf_tiles() {
     let r = run_op(&op("arith.minf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 4.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 4.0, 3.0]);
 }
 
 #[test]
 fn minimumf_tiles() {
     let r = run_op(&op("arith.minimumf", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 4.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 4.0, 3.0]);
 }
 
 fn cmpf_op(pred: &str, ops: &[&str]) -> Operation {
@@ -506,7 +506,7 @@ fn cmpf_ogt_scalar() {
 #[test]
 fn cmpf_oeq_tile() {
     let r = run_op(&cmpf_op("oeq", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", f16_tile(&[1.0, 0.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 0.0, 1.0]); // bool stored as 0/1
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 0.0, 1.0]); // bool stored as 0/1
 }
 
 // ===========================================================================
@@ -555,7 +555,7 @@ fn fptosi_tile() {
     let r = run_op(&op("arith.fptosi", &["%a"]), &[("%a", f16_tile(&[1.7, 2.3, -3.9]))]);
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::I32);
-    assert_eq!(t.data, vec![1.0, 2.0, -3.0]);
+    assert_eq!(t.data.to_vec(), vec![1.0, 2.0, -3.0]);
 }
 
 // ===========================================================================
@@ -594,7 +594,7 @@ fn constant_dense_list() {
     let r = run_op(&o, &[]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2]);
-    assert_eq!(t.data, vec![16.0, 32.0]);
+    assert_eq!(t.data.to_vec(), vec![16.0, 32.0]);
 }
 
 #[test]
@@ -649,7 +649,7 @@ fn sitofp_respects_result_type_f32() {
     let r = run_op(&o, &[("%a", tile_with(&[1.0, -2.0], DType::I32, &[2]))]);
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::F32);
-    assert_eq!(t.data, vec![1.0, -2.0]);
+    assert_eq!(t.data.to_vec(), vec![1.0, -2.0]);
 }
 
 // ===========================================================================
@@ -669,7 +669,7 @@ fn cmpi_scalar() {
 #[test]
 fn cmpi_tile() {
     let r = run_op(&cmpi_op("slt", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 0.0, 0.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 0.0, 0.0]);
 }
 
 #[test]
@@ -681,7 +681,7 @@ fn cmpi_ult() {
 #[test]
 fn cmpi_uge_tile() {
     let r = run_op(&cmpi_op("uge", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![0.0, 1.0, 1.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![0.0, 1.0, 1.0]);
 }
 
 #[test]
@@ -700,7 +700,7 @@ fn select_tile() {
             ("%f", f16_tile(&[4.0, 5.0, 6.0])),
         ],
     );
-    assert_eq!(as_tile(&r).data, vec![1.0, 5.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 5.0, 3.0]);
 }
 
 // ===========================================================================
@@ -710,27 +710,27 @@ fn select_tile() {
 #[test]
 fn cmpf_olt_tile() {
     let r = run_op(&cmpf_op("olt", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 0.0, 0.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 0.0, 0.0]);
 }
 
 #[test]
 fn cmpf_oge_tile() {
     let r = run_op(&cmpf_op("oge", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![0.0, 1.0, 1.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![0.0, 1.0, 1.0]);
 }
 
 #[test]
 fn cmpf_olt_nan() {
     // Ordered predicates are false when either operand is NaN.
     let r = run_op(&cmpf_op("olt", &["%a", "%b"]), &[("%a", f16_tile(&[f32::NAN, 1.0])), ("%b", f16_tile(&[2.0, f32::NAN]))]);
-    assert_eq!(as_tile(&r).data, vec![0.0, 0.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![0.0, 0.0]);
 }
 
 #[test]
 fn cmpf_ueq_nan() {
     // Unordered predicates return true when either operand is NaN.
     let r = run_op(&cmpf_op("ueq", &["%a", "%b"]), &[("%a", f16_tile(&[f32::NAN, 3.0])), ("%b", f16_tile(&[2.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 1.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 1.0]);
 }
 
 #[test]
@@ -738,9 +738,9 @@ fn cmpf_ord_uno() {
     let a = f16_tile(&[f32::NAN, 3.0]);
     let b = f16_tile(&[2.0, 4.0]);
     let r_ord = run_op(&cmpf_op("ord", &["%a", "%b"]), &[("%a", a.clone()), ("%b", b.clone())]);
-    assert_eq!(as_tile(&r_ord).data, vec![0.0, 1.0]);
+    assert_eq!(as_tile(&r_ord).data.to_vec(), vec![0.0, 1.0]);
     let r_uno = run_op(&cmpf_op("uno", &["%a", "%b"]), &[("%a", a), ("%b", b)]);
-    assert_eq!(as_tile(&r_uno).data, vec![1.0, 0.0]);
+    assert_eq!(as_tile(&r_uno).data.to_vec(), vec![1.0, 0.0]);
 }
 
 // ===========================================================================
@@ -858,7 +858,7 @@ fn math_cos_scalar() {
 #[test]
 fn math_absf_tile() {
     let r = run_op(&op("math.absf", &["%x"]), &[("%x", f16_tile(&[-2.0, 0.0, 3.0]))]);
-    assert_eq!(as_tile(&r).data, vec![2.0, 0.0, 3.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![2.0, 0.0, 3.0]);
 }
 
 #[test]
@@ -870,7 +870,7 @@ fn math_absf_scalar() {
 #[test]
 fn math_ceil_tile() {
     let r = run_op(&op("math.ceil", &["%x"]), &[("%x", f16_tile(&[1.2, 2.7, -0.5]))]);
-    assert_eq!(as_tile(&r).data, vec![2.0, 3.0, 0.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![2.0, 3.0, 0.0]);
 }
 
 #[test]
@@ -882,7 +882,7 @@ fn math_ceil_scalar() {
 #[test]
 fn math_floor_tile() {
     let r = run_op(&op("math.floor", &["%x"]), &[("%x", f16_tile(&[1.2, 2.7, -0.5]))]);
-    assert_eq!(as_tile(&r).data, vec![1.0, 2.0, -1.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, -1.0]);
 }
 
 #[test]
@@ -900,7 +900,7 @@ fn math_powf_tile() {
 #[test]
 fn math_fma_tile() {
     let r = run_op(&op("math.fma", &["%a", "%b", "%c"]), &[("%a", f16_tile(&[2.0, 3.0])), ("%b", f16_tile(&[4.0, 5.0])), ("%c", f16_tile(&[1.0, 1.0]))]);
-    assert_eq!(as_tile(&r).data, vec![9.0, 16.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![9.0, 16.0]);
 }
 
 #[test]
@@ -918,7 +918,7 @@ fn math_erf_scalar() {
 #[test]
 fn math_absi_tile() {
     let r = run_op(&op("math.absi", &["%x"]), &[("%x", tile_with(&[-3.0, 0.0, 5.0], DType::I32, &[3]))]);
-    assert_eq!(as_tile(&r).data, vec![3.0, 0.0, 5.0]);
+    assert_eq!(as_tile(&r).data.to_vec(), vec![3.0, 0.0, 5.0]);
 }
 
 #[test]
@@ -1102,7 +1102,7 @@ fn linalg_index() {
     let r = execute_op(&o, &mut ctx, &env).unwrap().unwrap();
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4, 1]);
-    assert_eq!(t.data, vec![0.0, 1.0, 2.0, 3.0]);
+    assert_eq!(t.data.to_vec(), vec![0.0, 1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -1161,7 +1161,7 @@ fn tensor_collapse_shape() {
     let r = run_op(&o, &[("%t", tile_with(&[1.0, 2.0, 3.0, 4.0], DType::F16, &[2, 2]))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4]);
-    assert_eq!(t.data, vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
 }
 
 #[test]
@@ -1171,7 +1171,7 @@ fn tensor_reshape() {
     let r = run_op(&o, &[("%t", tile_with(&data, DType::F16, &[8])), ("%s", tile_with(&[2.0, 4.0], DType::I32, &[2]))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2, 4]);
-    assert_eq!(t.data, data);
+    assert_eq!(t.data.to_vec(), data);
 }
 
 #[test]
@@ -1181,7 +1181,7 @@ fn tensor_reshape_non_square_target() {
     let r = run_op(&o, &[("%t", tile_with(&data, DType::F16, &[12])), ("%s", tile_with(&[3.0, 4.0], DType::I32, &[2]))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![3, 4]);
-    assert_eq!(t.data, data); // row-major preserved
+    assert_eq!(t.data.to_vec(), data); // row-major preserved
 }
 
 #[test]
@@ -1200,7 +1200,7 @@ fn tensor_reshape_to_3d() {
     let r = run_op(&o, &[("%t", tile_with(&data, DType::F16, &[24])), ("%s", tile_with(&[2.0, 3.0, 4.0], DType::I32, &[3]))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2, 3, 4]);
-    assert_eq!(t.data, data);
+    assert_eq!(t.data.to_vec(), data);
 }
 
 #[test]
@@ -1209,7 +1209,7 @@ fn tensor_from_elements() {
     let r = run_op(&o, &[("%a", idx(16)), ("%b", idx(32))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![2]);
-    assert_eq!(t.data, vec![16.0, 32.0]);
+    assert_eq!(t.data.to_vec(), vec![16.0, 32.0]);
 }
 
 #[test]
@@ -1218,7 +1218,7 @@ fn tensor_from_elements_n1() {
     let r = run_op(&o, &[("%a", idx(128))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![1]);
-    assert_eq!(t.data, vec![128.0]);
+    assert_eq!(t.data.to_vec(), vec![128.0]);
 }
 
 // ===========================================================================
@@ -1238,7 +1238,7 @@ fn generate_1d() {
     let r = run_op_execute(&o, &[("%c2", idx(2))]);
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4]);
-    assert_eq!(t.data, vec![0.0, 2.0, 4.0, 6.0]);
+    assert_eq!(t.data.to_vec(), vec![0.0, 2.0, 4.0, 6.0]);
 }
 
 #[test]
@@ -1255,7 +1255,7 @@ fn generate_2d() {
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![3, 3]);
     // i >= j lower-triangular (incl diagonal): [[1,0,0],[1,1,0],[1,1,1]]
-    assert_eq!(t.data, vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
+    assert_eq!(t.data.to_vec(), vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
 }
 
 // ===========================================================================
@@ -1430,7 +1430,7 @@ fn load_store_roundtrip() {
     // Load and verify.
     execute_ops(&[view.clone(), access("%acc"), Operation::new(Some("%t"), "ktdp.load", &["%acc"])], &mut ctx, &env).unwrap();
     match ctx.get_value("%t").unwrap() {
-        Value::Tile(t) => assert_eq!(t.data, data),
+        Value::Tile(t) => assert_eq!(t.data.to_vec(), data),
         other => panic!("expected Tile, got {other:?}"),
     }
 

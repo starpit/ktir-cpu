@@ -93,7 +93,7 @@ fn row_major(shape: &[usize]) -> Vec<i64> {
 fn read_back(ctx: &mut ktir_cpu::context::CoreContext, stick: i64, shape: &[usize]) -> Vec<f32> {
     let m = hbm_memref(stick, shape, &row_major(shape), DType::F16);
     let tr = m.to_tile_ref();
-    load_data(ctx, &tr, None, None).expect("read back").data
+    load_data(ctx, &tr, None, None).expect("read back").data.to_vec()
 }
 
 /// Drive a real `ktdp.construct_access_tile` op over an HBM `MemRef` parent and
@@ -198,7 +198,7 @@ fn load_after_tile_access() {
     let parent = hbm_memref(stick, &[4, 4], &[4, 1], DType::F16);
     let tr = tile_access(parent, &[1, 0], &[2, 2], "affine_map<(d0, d1) -> (d0, d1)>");
     let tile = load_data(&mut ctx, &tr, None, None).unwrap();
-    assert_eq!(tile.data, vec![4.0, 5.0, 8.0, 9.0]);
+    assert_eq!(tile.data.to_vec(), vec![4.0, 5.0, 8.0, 9.0]);
     assert_eq!(tile.shape, vec![2, 2]);
 }
 
@@ -212,7 +212,7 @@ fn strided_load_no_coords() {
     let stick = alloc_f16(&mut ctx, &arange(16), &[4, 4]);
     let tr = tile_ref(stick, &[2, 2], &[4, 1]);
     let tile = load_data(&mut ctx, &tr, None, None).unwrap();
-    assert_eq!(tile.data, vec![0.0, 1.0, 4.0, 5.0]);
+    assert_eq!(tile.data.to_vec(), vec![0.0, 1.0, 4.0, 5.0]);
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn non_rectangular_load_store() {
 
     let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![10])).unwrap();
     let expected_vals: Vec<f32> = coords.iter().map(|c| data[(c[0] * 4 + c[1]) as usize]).collect();
-    assert_eq!(tile.data, expected_vals);
+    assert_eq!(tile.data.to_vec(), expected_vals);
 
     let doubled: Vec<f32> = tile.data.iter().map(|v| v * 2.0).collect();
     let doubled_tile = Tile::compute(doubled, DType::F16, vec![10]);
@@ -294,9 +294,9 @@ fn access_tile_order_inverted() {
     let tile = load_data(&mut ctx, &tr, Some(&remapped), Some(vec![9])).unwrap();
 
     let expected: Vec<f32> = remapped.iter().map(|c| data[(c[0] * 3 + c[1]) as usize]).collect();
-    assert_eq!(tile.data, expected);
+    assert_eq!(tile.data.to_vec(), expected);
     // Column-major traversal: 0,3,6,1,4,7,2,5,8.
-    assert_eq!(tile.data, vec![0.0, 3.0, 6.0, 1.0, 4.0, 7.0, 2.0, 5.0, 8.0]);
+    assert_eq!(tile.data.to_vec(), vec![0.0, 3.0, 6.0, 1.0, 4.0, 7.0, 2.0, 5.0, 8.0]);
 }
 
 // ===========================================================================
@@ -323,7 +323,7 @@ fn tile_access_3d_load() {
     let parent = hbm_memref(stick, &[2, 3, 4], &[12, 4, 1], DType::F16);
     let tr = tile_access(parent, &[0, 1, 0], &[1, 2, 4], "affine_map<(d0, d1, d2) -> (d0, d1, d2)>");
     let tile = load_data(&mut ctx, &tr, None, None).unwrap();
-    assert_eq!(tile.data, vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(tile.data.to_vec(), vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
     assert_eq!(tile.shape, vec![1, 2, 4]);
 }
 
@@ -335,7 +335,7 @@ fn non_contiguous_stride_larger_than_extent() {
     let stick = alloc_f16(&mut ctx, &arange(16), &[4, 4]);
     let tr = tile_ref(stick, &[2, 2], &[8, 1]);
     let tile = load_data(&mut ctx, &tr, None, None).unwrap();
-    assert_eq!(tile.data, vec![0.0, 1.0, 8.0, 9.0]);
+    assert_eq!(tile.data.to_vec(), vec![0.0, 1.0, 8.0, 9.0]);
 }
 
 #[test]

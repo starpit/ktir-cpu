@@ -108,7 +108,7 @@ fn tile_add(a: &Tile, b: &Tile) -> Result<Tile, String> {
     if a.shape != b.shape {
         return Err(format!("ktdp.reduce: tile shape mismatch {:?} vs {:?}", a.shape, b.shape));
     }
-    let data = a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect();
+    let data = a.data.iter().zip(b.data.iter()).map(|(x, y)| x + y).collect();
     Ok(Tile::compute(data, a.dtype, a.shape.clone()))
 }
 
@@ -435,7 +435,7 @@ mod tests {
         let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
         for (c, r) in results.iter().enumerate() {
             match r {
-                Some(Value::Tile(t)) => assert_eq!(t.data, vec![10.0], "core {c}"),
+                Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![10.0], "core {c}"),
                 other => panic!("core {c}: expected Tile([10]), got {other:?}"),
             }
         }
@@ -460,7 +460,7 @@ mod tests {
         let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
         for (c, r) in results.iter().enumerate() {
             match r {
-                Some(Value::Tile(t)) => assert_eq!(t.data, vec![6.0, 60.0], "core {c}"),
+                Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![6.0, 60.0], "core {c}"),
                 other => panic!("core {c}: {other:?}"),
             }
         }
@@ -497,7 +497,7 @@ mod tests {
         let ops = vec![Operation::new(Some("%r"), "ktdp.reduce", &["%t", "%g"])];
         let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
         // each core keeps its own value (no reduction)
-        match &results[0] { Some(Value::Tile(t)) => assert_eq!(t.data, vec![1.0]), o => panic!("{o:?}") }
-        match &results[1] { Some(Value::Tile(t)) => assert_eq!(t.data, vec![2.0]), o => panic!("{o:?}") }
+        match &results[0] { Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![1.0]), o => panic!("{o:?}") }
+        match &results[1] { Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![2.0]), o => panic!("{o:?}") }
     }
 }
