@@ -38,12 +38,19 @@ pub struct Tile {
 
 impl Tile {
     /// Construct a compute-produced tile (no stick bookkeeping).
-    pub fn compute(data: Vec<f32>, dtype: DType, shape: Vec<usize>) -> Self {
+    ///
+    /// The data is rounded to `dtype`'s representable set — exactly what a NumPy
+    /// `np.float16`/`np.int32`/... array does on assignment. Because every op
+    /// handler builds its result through this constructor, this gives per-op
+    /// rounding for free: an f16 compute *chain* rounds after each step the way
+    /// NumPy does, rather than accumulating in f32 and rounding only at store.
+    pub fn compute(mut data: Vec<f32>, dtype: DType, shape: Vec<usize>) -> Self {
         debug_assert_eq!(
             data.len(),
             shape.iter().product::<usize>(),
             "tile data length must equal product of shape"
         );
+        crate::codec::round_to_dtype(&mut data, dtype);
         Tile {
             data,
             dtype,

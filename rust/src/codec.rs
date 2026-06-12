@@ -66,6 +66,36 @@ pub fn f32_to_f16_bits(f: f32) -> u16 {
     sign | ((exp as u16) << 10) | half_mant
 }
 
+/// Round each value in place to `dtype`'s representable set — NumPy assignment
+/// semantics for a typed array. `f16` rounds to nearest-even half precision;
+/// integer dtypes truncate toward zero; `bool` maps nonzero -> 1. `f32` is a
+/// no-op. Used by `Tile::compute` so op results round per-op like NumPy.
+pub fn round_to_dtype(data: &mut [f32], dtype: DType) {
+    match dtype {
+        DType::F32 => {}
+        DType::F16 => {
+            for x in data.iter_mut() {
+                *x = f16_bits_to_f32(f32_to_f16_bits(*x));
+            }
+        }
+        DType::I32 => {
+            for x in data.iter_mut() {
+                *x = (*x as i32) as f32;
+            }
+        }
+        DType::I64 => {
+            for x in data.iter_mut() {
+                *x = (*x as i64) as f32;
+            }
+        }
+        DType::Bool => {
+            for x in data.iter_mut() {
+                *x = if *x != 0.0 { 1.0 } else { 0.0 };
+            }
+        }
+    }
+}
+
 /// Encode a flat f32 tile into raw bytes for memory, per `dtype`.
 pub fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * dtype.bytes_per_elem());
@@ -136,5 +166,44 @@ mod tests {
     #[test]
     fn decode_zero_pads_short_input() {
         assert_eq!(decode(&[], 3, DType::F32), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn round_to_dtype_matches_numpy_assignment() {
+        // f16 rounds to nearest-even half precision (0.1 is not f16-exact).
+        let mut f = vec![0.1f32];
+        round_to_dtype(&mut f, DType::F16);
+        assert_eq!(f[0], f16_bits_to_f32(f32_to_f16_bits(0.1)));
+        assert_ne!(f[0], 0.1, "0.1 must round under f16");
+        // integer dtypes truncate toward zero; bool maps nonzero -> 1.
+        let mut i = vec![2.9f32, -2.9];
+        round_to_dtype(&mut i, DType::I32);
+        assert_eq!(i, vec![2.0, -2.0]);
+        let mut b = vec![0.0f32, 5.0];
+        round_to_dtype(&mut b, DType::Bool);
+        assert_eq!(b, vec![0.0, 1.0]);
+        // f32 is exact (no-op) — 0.15625 = 5/32 is f32-exact.
+        let mut g = vec![0.15625f32];
+        round_to_dtype(&mut g, DType::F32);
+        assert_eq!(g[0], 0.15625);
+    }
+}
+
+#[cfg(test)]
+mod tile_round_tests {
+    use crate::dtypes::DType;
+    use crate::tile::Tile;
+
+    #[test]
+    fn tile_compute_rounds_f16_per_op() {
+        // A chain of f16 ops rounds each step (NumPy float16 semantics): building
+        // an f16 tile stores the f16-rounded value, not the exact f32 input.
+        let t = Tile::compute(vec![0.1, 0.2, 0.3], DType::F16, vec![3]);
+        for (&got, &raw) in t.data.iter().zip(&[0.1f32, 0.2, 0.3]) {
+            assert_eq!(got, crate::codec::f16_bits_to_f32(crate::codec::f32_to_f16_bits(raw)));
+        }
+        // f32 tiles keep exact values.
+        let g = Tile::compute(vec![0.1, 0.2], DType::F32, vec![2]);
+        assert_eq!(g.data, vec![0.1, 0.2]);
     }
 }
