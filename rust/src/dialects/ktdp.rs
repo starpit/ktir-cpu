@@ -20,7 +20,8 @@ use crate::context::CoreContext;
 use crate::dtypes::DType;
 use crate::env::ExecutionEnv;
 use crate::ir::{Attr, Operation, Scalar, Value};
-use crate::memref::{AccessTile, MemRef, MemorySpace, ParentRef, TileRef};
+use crate::memref::{AccessTile, DistributedMemRef, MemRef, MemorySpace, ParentRef, TileRef};
+use crate::ops_memory::distributed_tile_access;
 
 pub fn register(d: &mut Dispatch) {
     d.register("ktdp.construct_memory_view", LatencyCategory::Zero, construct_memory_view);
@@ -77,15 +78,15 @@ fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &Execution
     if op.operands.is_empty() {
         return Err("construct_access_tile: missing parent operand".into());
     }
+    // Parent is a single-allocation MemRef or a distributed view; clone the
+    // relevant one so we can drop the borrow before reading the index operands.
+    enum Parent {
+        Single(MemRef),
+        Dist(DistributedMemRef),
+    }
     let parent = match ctx.get_value(&op.operands[0])? {
-        Value::MemRef(m) => m.clone(),
-        Value::DistMemRef(_) => {
-            return Err(
-                "construct_access_tile: distributed parent not yet ported (needs \
-                 distributed_tile_access)"
-                    .into(),
-            )
-        }
+        Value::MemRef(m) => Parent::Single(m.clone()),
+        Value::DistMemRef(d) => Parent::Dist(d.clone()),
         other => return Err(format!("construct_access_tile: parent is {other:?}, expected MemRef")),
     };
 
@@ -110,10 +111,26 @@ fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &Execution
         _ => None,
     };
 
-    let tile_ref = tile_access(&parent, &indices, access_shape.clone(), &base_map);
+    // Single allocation -> direct tile_access; distributed view -> resolve
+    // partition routing now via distributed_tile_access (mirrors ktdp__construct_access_tile).
+    let parent_ref = match parent {
+        Parent::Single(m) => {
+            ParentRef::Tile(tile_access(&m, &indices, access_shape.clone(), &base_map))
+        }
+        Parent::Dist(d) => {
+            let dist = distributed_tile_access(
+                &d,
+                &access_shape,
+                &base_map,
+                &indices,
+                coordinate_set.as_ref(),
+            )?;
+            ParentRef::Dist(dist)
+        }
+    };
 
     Ok(Some(Value::AccessTile(AccessTile {
-        parent_ref: ParentRef::Tile(tile_ref),
+        parent_ref,
         shape: access_shape,
         base_map,
         coordinate_set,
