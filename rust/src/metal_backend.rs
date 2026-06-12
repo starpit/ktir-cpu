@@ -98,7 +98,7 @@ pub fn effective_matmul_tier(device_name: &str) -> MatmulTier {
 }
 
 /// Which matmul implementation to dispatch for a given problem on a given
-/// device. NAX is the M5 GPU tensor engine (bf16); Accelerate is Apple's AMX
+/// device. NAX is the M5 GPU tensor engine (f16); Accelerate is Apple's AMX
 /// matrix coprocessor (f32). See [`choose_matmul_backend`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatmulBackend {
@@ -107,7 +107,7 @@ pub enum MatmulBackend {
     Accelerate,
     /// The `simdgroup_float8x8` matrix GEMM — the GPU path on M1–M4 (pre-NAX).
     Simdgroup,
-    /// The NAX `matmul2d` tensor-engine GEMM (bf16) — the GPU path on M5+.
+    /// The NAX `matmul2d` tensor-engine GEMM (f16) — the GPU path on M5+.
     Nax,
 }
 
@@ -139,7 +139,7 @@ pub const NAX_MIN_K: usize = 256;
 /// GPU ([`NAX_MIN_BLOCKS`]) and K is deep enough to amortize ([`NAX_MIN_K`]);
 /// otherwise, and on every non-NAX device, we use Accelerate.
 ///
-/// Note the backends differ in precision (NAX bf16 vs Accelerate f32), so this
+/// Note the backends differ in precision (NAX f16 vs Accelerate f32), so this
 /// gate belongs to the experimental Metal/Spyre-faithful execution path, NOT
 /// the f32 parity interpreter (which always uses Accelerate via `blas.rs`).
 /// The threshold assumes GPU-resident operands; a one-shot host call pays
@@ -500,8 +500,8 @@ pub fn compile_metal4(source: &str) -> Result<(), String> {
 // prove the engine produces correct results through our runtime and to measure
 // the speedup, gating whether `HIGHEST_IMPLEMENTED` can rise to `Nax`.
 //
-// Inputs/outputs are host `f32` (row-major); A and B are converted to `bfloat`
-// in threadgroup memory inside the shader, so the host never touches bf16. The
+// Inputs/outputs are host `f32` (row-major); A and B are converted to `half`
+// in threadgroup memory inside the shader, so the host never touches f16. The
 // op runs with `transpose_b`, so B (logical K×N) is consumed as its transpose
 // Bᵀ (N×K) — the fill loop transposes while converting.
 
@@ -528,16 +528,16 @@ using namespace metal;
     device float* c_out      [[buffer(2)]],   // M x N = 16 x 32
     uint lid [[thread_index_in_simdgroup]])
 {
-    threadgroup bfloat a_tg[16 * 16];   // [M, K] row-major
-    threadgroup bfloat b_tg[32 * 16];   // [N, K] = transpose(B), row-major
+    threadgroup half a_tg[16 * 16];   // [M, K] row-major
+    threadgroup half b_tg[32 * 16];   // [N, K] = transpose(B), row-major
     // Cooperative fill across the 32 simdgroup lanes.
     for (uint i = lid; i < 16u * 16u; i += 32u) {
-        a_tg[i] = bfloat(a_in[i]);                  // A[m,k] at m*16+k
+        a_tg[i] = half(a_in[i]);                  // A[m,k] at m*16+k
     }
     for (uint i = lid; i < 32u * 16u; i += 32u) {
         uint n = i / 16u;                           // 0..31
         uint k = i % 16u;                           // 0..15
-        b_tg[n * 16u + k] = bfloat(b_in[k * 32u + n]);   // Bt[n,k] = B[k,n]
+        b_tg[n * 16u + k] = half(b_in[k * 32u + n]);   // Bt[n,k] = B[k,n]
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -551,8 +551,8 @@ using namespace metal;
     // input cooperative tensors via the validated BaseNAXFrag lane layout, run,
     // and store the destination with the SAME layout — internally consistent,
     // unlike the metal::tensor `run` overload whose output layout differs.
-    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
-    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
     auto ct_c = gemm_op.template
         get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
 
@@ -823,8 +823,8 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
 
     // Double-buffered staging: while one panel feeds the matmuls, the next is
     // prefetched into the other half, so device-load latency overlaps compute.
-    threadgroup bfloat a_tg[2 * TG_M * BK];   // [2][TG_M, K-step]
-    threadgroup bfloat b_tg[2 * TG_N * BK];   // [2][TG_N, K-step] = transpose(B)
+    threadgroup half a_tg[2 * TG_M * BK];   // [2][TG_M, K-step]
+    threadgroup half b_tg[2 * TG_N * BK];   // [2][TG_N, K-step] = transpose(B)
 
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         16, 32, 16,
@@ -832,10 +832,10 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
 
-    auto a0 = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
-    auto a1 = gemm_op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
-    auto b0 = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
-    auto b1 = gemm_op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    auto a0 = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto a1 = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto b0 = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto b1 = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
     auto c00 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
     auto c01 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
     auto c10 = gemm_op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
@@ -858,17 +858,17 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
     // buffer half `buf`. Zero-pads ragged M/N/K. (Macro so it inlines cleanly.)
 #define STAGE_PANEL(buf, kc)                                                    \
     do {                                                                       \
-        threadgroup bfloat* ap = a_tg + (buf) * (TG_M * BK);                   \
-        threadgroup bfloat* bp = b_tg + (buf) * (TG_N * BK);                   \
+        threadgroup half* ap = a_tg + (buf) * (TG_M * BK);                   \
+        threadgroup half* bp = b_tg + (buf) * (TG_N * BK);                   \
         for (uint i = tid; i < TG_M * BK; i += TG_THREADS) {                   \
             uint r = i / BK, c = i % BK;                                       \
             uint gm = tm0 + r, gk = (kc) + c;                                  \
-            ap[i] = (gm < M && gk < K) ? bfloat(a_in[gm * K + gk]) : bfloat(0);\
+            ap[i] = (gm < M && gk < K) ? half(a_in[gm * K + gk]) : half(0);\
         }                                                                      \
         for (uint i = tid; i < TG_N * BK; i += TG_THREADS) {                   \
             uint n = i / BK, c = i % BK;                                       \
             uint gn = tn0 + n, gk = (kc) + c;                                  \
-            bp[i] = (gn < N && gk < K) ? bfloat(b_in[gk * N + gn]) : bfloat(0);\
+            bp[i] = (gn < N && gk < K) ? half(b_in[gk * N + gn]) : half(0);\
         }                                                                      \
     } while (0)
 
@@ -883,8 +883,8 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
             STAGE_PANEL(cur ^ 1u, (ki + 1u) * BK);
         }
         // Load this simdgroup's fragments from the current buffer and accumulate.
-        threadgroup bfloat* ap = a_tg + cur * (TG_M * BK);
-        threadgroup bfloat* bp = b_tg + cur * (TG_N * BK);
+        threadgroup half* ap = a_tg + cur * (TG_M * BK);
+        threadgroup half* bp = b_tg + cur * (TG_N * BK);
         for (short e = 0; e < 8; ++e) {
             short r = fm + (e >> 2) * 8;
             short c = fn + (e % 4);
@@ -1177,8 +1177,8 @@ impl NaxGemm {
     }
 
     /// `C(m×n) = A(m×k) · B(k×n)`, all row-major. A/B/C are f32 on the host;
-    /// the kernel computes in bf16 (the NAX engine's input precision), so the
-    /// result agrees with an f32 oracle only to bf16 tolerance.
+    /// the kernel computes in f16 (the NAX engine's input precision), so the
+    /// result agrees with an f32 oracle only to f16 tolerance.
     pub fn run(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
         self.run_epi(m, k, n, a, b, None, Epilogue::NONE)
     }
@@ -1674,7 +1674,7 @@ thread_local! {
 /// dispatched to the highest-performance available backend.
 ///
 /// On an M5, large GEMMs (per [`choose_matmul_backend`]) run on the NAX tensor
-/// engine (bf16, ~4 TFLOP/s, ~2× Accelerate); small ones and everything on
+/// engine (f16, ~4 TFLOP/s, ~2× Accelerate); small ones and everything on
 /// non-NAX devices run on Accelerate/`sgemm_rowmajor` (f32). The NAX context is
 /// compiled once and cached per thread; if NAX is chosen but unavailable or
 /// errors, it falls back to Accelerate. So this is always correct and never
@@ -1759,7 +1759,7 @@ kernel void mpp_probe(
     }
 
     /// The NAX tensor engine produces a correct GEMM through our runtime.
-    /// Small-integer inputs (exact in bf16) let us assert *exact* equality with
+    /// Small-integer inputs (exact in f16) let us assert *exact* equality with
     /// the naive oracle. Two identity probes pin the fragment layout: with
     /// A = I, `B[k,n] = n` must yield `C[m,n] = n` (column mapping) and
     /// `B[k,n] = k` must yield `C[m,n] = m` (row mapping) — together these catch
@@ -1767,7 +1767,7 @@ kernel void mpp_probe(
     #[test]
     fn nax_matmul_tile_matches_oracle() {
         // A[m,k] = (m + k) % 3, B[k,n] = (k + 2*n) % 4  — products ≤ 6, sums
-        // over K=16 ≤ 96: all exact in bf16 and f32, and distinct per (m,n).
+        // over K=16 ≤ 96: all exact in f16 and f32, and distinct per (m,n).
         let a: Vec<f32> =
             (0..NAX_TILE_M * NAX_TILE_K).map(|i| ((i / 16 + i % 16) % 3) as f32).collect();
         let b: Vec<f32> = (0..NAX_TILE_K * NAX_TILE_N)
@@ -1811,7 +1811,7 @@ kernel void mpp_probe(
 
     /// The general tiled NAX GEMM is correct across shapes — including ragged
     /// M/N/K that exercise the zero-pad edge guards and multi-tile K
-    /// accumulation. Small-integer inputs are exact in bf16, so we assert exact
+    /// accumulation. Small-integer inputs are exact in f16, so we assert exact
     /// equality with the naive oracle.
     #[test]
     fn nax_matmul_general_matches_oracle() {
@@ -1834,8 +1834,8 @@ kernel void mpp_probe(
             (100, 7, 3),    // tall M
         ];
         for (m, k, n) in shapes {
-            // Small ints exact in bf16: a in 0..3, b in 0..4. Sum over K stays
-            // well under bf16's 256 exact-integer limit for these K.
+            // Small ints exact in f16: a in 0..3, b in 0..4. Sum over K stays
+            // well under f16's 256 exact-integer limit for these K.
             let a: Vec<f32> = (0..m * k).map(|i| (i % 3) as f32).collect();
             let b: Vec<f32> = (0..k * n).map(|i| (i % 4) as f32).collect();
             let got = ctx.run(m, k, n, &a, &b).unwrap();
@@ -1857,8 +1857,8 @@ kernel void mpp_probe(
         };
         // x (m×k0) · W1 (k0×k1) · W2 (k1×k2) · W3 (k2×k3), with a bias+relu epilogue.
         let (m, k0, k1, k2, k3) = (128usize, 128, 128, 128, 128);
-        // Positive inputs: chained bf16 matmuls don't cancel, so the f32 oracle
-        // stays within bf16 tolerance (signed inputs would cancel near zero and
+        // Positive inputs: chained f16 matmuls don't cancel, so the f32 oracle
+        // stays within f16 tolerance (signed inputs would cancel near zero and
         // blow up the *relative* error without any bug).
         let mk = |rows: usize, cols: usize, s: usize| -> Vec<f32> {
             (0..rows * cols).map(|i| ((i + s) % 7) as f32 * 0.03 + 0.01).collect()
@@ -1874,7 +1874,7 @@ kernel void mpp_probe(
         ];
         let got = ctx.run_chain(m, &x, &steps).unwrap();
 
-        // Oracle: same chain on the CPU (bf16 tolerance, since NAX is bf16).
+        // Oracle: same chain on the CPU (f16 tolerance, since NAX is f16).
         let c1 = crate::blas::naive_sgemm(m, k0, k1, &x, &w1);
         let c2 = crate::blas::naive_sgemm(m, k1, k2, &c1, &w2);
         let c3 = crate::blas::naive_sgemm(m, k2, k3, &c2, &w3);
@@ -1925,7 +1925,7 @@ kernel void mpp_probe(
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect();
 
         let got = ctx.run_combined(count, m, k, n, &a, &b).unwrap();
-        // Correctness: each core's rows match its own matmul (bf16 tolerance).
+        // Correctness: each core's rows match its own matmul (f16 tolerance).
         let mut max_rel = 0.0f32;
         for s in 0..count {
             let want = crate::blas::naive_sgemm(m, k, n, &a[s * m * k..(s + 1) * m * k], &b);
@@ -2099,15 +2099,15 @@ kernel void mpp_probe(
                 let want = f(mm[i], e[i]);
                 max_rel = max_rel.max((got[i] - want).abs() / want.abs().max(1.0));
             }
-            assert!(max_rel < 0.05, "fused {epi:?}: max rel err {max_rel} > bf16 tol");
+            assert!(max_rel < 0.05, "fused {epi:?}: max rel err {max_rel} > f16 tol");
         }
         eprintln!("fused matmul→elementwise epilogue matches oracle across {} ops ✓", cases.len());
     }
 
-    /// Random (non-bf16-exact) data: the NAX GEMM agrees with the f32 oracle to
-    /// bf16 tolerance. Documents the precision the engine actually delivers.
+    /// Random (non-f16-exact) data: the NAX GEMM agrees with the f32 oracle to
+    /// f16 tolerance. Documents the precision the engine actually delivers.
     #[test]
-    fn nax_matmul_general_bf16_tolerance() {
+    fn nax_matmul_general_f16_tolerance() {
         let ctx = match NaxGemm::new() {
             Ok(c) => c,
             Err(e) if e.contains("no Metal device") => return,
@@ -2125,9 +2125,9 @@ kernel void mpp_probe(
             let denom = w.abs().max(1.0);
             max_rel = max_rel.max((g - w).abs() / denom);
         }
-        // bf16 has 8 mantissa bits; K=48 accumulation in f32 keeps error modest.
-        assert!(max_rel < 0.05, "max relative error {max_rel} exceeds bf16 tolerance");
-        eprintln!("NAX GEMM vs f32 oracle: max relative error {max_rel:.4} (bf16) ✓");
+        // f16 has 8 mantissa bits; K=48 accumulation in f32 keeps error modest.
+        assert!(max_rel < 0.05, "max relative error {max_rel} exceeds f16 tolerance");
+        eprintln!("NAX GEMM vs f32 oracle: max relative error {max_rel:.4} (f16) ✓");
     }
 
     /// Real benchmark: NAX vs naive vs the linked BLAS (Accelerate on macOS) on

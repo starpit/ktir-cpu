@@ -328,6 +328,135 @@ fn marshal_inputs(
     (input_ptrs, tensor_meta)
 }
 
+/// Opt-in GPU/Spyre-faithful (**f16**) execution of a pure-SPMD grid: step all
+/// cores in lockstep and COMBINE their shared-weight `linalg.matmul`s into one
+/// zero-copy NAX dispatch (the grid's many small matmuls become one tall one —
+/// 1.2–2.6× over a serial AMX loop). Restricted to no-comm, straight-line
+/// (region-free) functions on an M5; returns `Err` otherwise so the caller can
+/// fall back to [`execute_function`].
+///
+/// The NAX kernel runs in **f16** — Spyre's matmul precision, and exactly what
+/// the interpreter rounds every tile to (`f32` accumulate → f16). So results
+/// match the f32/`execute_function` path to f16 tolerance (only the GEMM
+/// accumulation order differs). Kept opt-in for now while the lockstep executor
+/// is young; it is precision-faithful, not a lossy mode.
+#[cfg(metal)]
+pub fn execute_function_gpu(
+    module: &IRModule,
+    func_name: &str,
+    args: &[(&str, Arg)],
+) -> Result<HashMap<String, Output>, String> {
+    use crate::metal_backend::NaxGemm;
+
+    let func = module.get_function(func_name)?;
+    let (gx, gy, gz) = func.grid;
+    let num_cores = gx * gy * gz;
+    let ops = &func.operations;
+
+    // Applicable only to a multi-core, comm-free, straight-line SPMD body.
+    if num_cores <= 1
+        || ops
+            .iter()
+            .any(|o| crate::comm_sched::is_comm_op(&o.op_type) || !o.regions.is_empty())
+    {
+        return Err("execute_function_gpu: not a pure-SPMD straight-line grid".into());
+    }
+    let gemm = NaxGemm::new()?; // Err on non-M5 / no device -> caller falls back
+
+    let mem = SpyreMemoryHierarchy::new(num_cores);
+    let grid = GridExecutor::new(func.grid);
+    let dispatch = Dispatch::new();
+    let env = ExecutionEnv::new(&dispatch, &grid);
+    let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
+
+    let mut ctxs: Vec<CoreContext> = (0..num_cores)
+        .map(|c| {
+            let mut ctx = CoreContext::new(
+                c,
+                grid.linear_to_grid(c),
+                Rc::clone(&mem.hbm),
+                mem.get_lx(c),
+                mem.lx_scratchpads.clone(),
+            );
+            for (name, val) in &input_ptrs {
+                ctx.set_value(name, val.clone());
+            }
+            ctx
+        })
+        .collect();
+
+    for op in ops {
+        // Combine a shared-weight 2-operand matmul across all cores into one
+        // dispatch; fall through to per-core execution if it doesn't apply.
+        if op.op_type == "linalg.matmul"
+            && op.operands.len() == 2
+            && try_combine_matmul(op, &mut ctxs, &gemm)?
+        {
+            continue;
+        }
+        for ctx in &mut ctxs {
+            execute_op(op, ctx, &env)?;
+        }
+    }
+    read_back(&mem, tensor_meta)
+}
+
+/// Combine `op` (a 2-operand `linalg.matmul`) across all cores when every core's
+/// weight operand B is identical: stack the per-core A panels into one tall
+/// GEMM, run it zero-copy on NAX, and scatter the row-blocks back. Returns
+/// `Ok(true)` if combined, `Ok(false)` to fall back to per-core execution.
+#[cfg(metal)]
+fn try_combine_matmul(
+    op: &Operation,
+    ctxs: &mut [CoreContext],
+    gemm: &crate::metal_backend::NaxGemm,
+) -> Result<bool, String> {
+    use crate::metal_backend::Epilogue;
+    use crate::tile::Tile;
+
+    let result = match op.result.as_deref() {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    // Read core 0's operands to fix the shapes and the shared weights.
+    let (a0, b0) = (as_tile(&ctxs[0], &op.operands[0])?, as_tile(&ctxs[0], &op.operands[1])?);
+    if a0.shape.len() != 2 || b0.shape.len() != 2 || a0.shape[1] != b0.shape[0] {
+        return Ok(false);
+    }
+    let (m, k, n) = (a0.shape[0], a0.shape[1], b0.shape[1]);
+    let dtype = a0.dtype;
+    let shared_b = b0.data.clone();
+    let a_shape = a0.shape.clone();
+    let b_shape = b0.shape.clone();
+
+    // Gather A panels; bail (fall back) unless every core shares B exactly.
+    let mut a_stack = Vec::with_capacity(ctxs.len() * m * k);
+    for ctx in ctxs.iter() {
+        let a = as_tile(ctx, &op.operands[0])?;
+        let b = as_tile(ctx, &op.operands[1])?;
+        if a.shape != a_shape || b.shape != b_shape || b.data != shared_b {
+            return Ok(false);
+        }
+        a_stack.extend_from_slice(&a.data);
+    }
+
+    // One zero-copy NAX dispatch for the whole grid's matmul.
+    let ua = gemm.unified_from(&a_stack)?;
+    let ub = gemm.unified_from(&shared_b)?;
+    let mut uc = gemm.unified(ctxs.len() * m * n)?;
+    gemm.matmul_unified(ctxs.len() * m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+
+    // Scatter each core's row-block back as its matmul result.
+    let c = uc.as_slice();
+    for (i, ctx) in ctxs.iter_mut().enumerate() {
+        let block = c[i * m * n..(i + 1) * m * n].to_vec();
+        let tile = Tile::compute(block, dtype, vec![m, n]);
+        ctx.track_lx(result, tile.size_bytes() as i64)?;
+        ctx.set_value(result, Value::Tile(tile));
+    }
+    Ok(true)
+}
+
 /// Read every tensor arg back out of HBM into an `Output`.
 fn read_back(
     mem: &SpyreMemoryHierarchy,
