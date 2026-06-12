@@ -988,7 +988,10 @@ fn split_assignment(text: &str) -> Option<(&str, &str)> {
 }
 
 /// All `%name` operands before the type, with `{...}` blocks removed and the
-/// result name excluded. Mirrors `_extract_operands`.
+/// result name excluded. Mirrors `_extract_operands` (= `find_ssa_names` minus
+/// the result). Operands are POSITIONAL, so repeats are kept — `%y = mulf %x,
+/// %x` must yield `[%x, %x]` (squaring in RMSNorm/LayerNorm variance), not a
+/// deduped `[%x]`.
 fn extract_operands(text: &str, result: Option<&str>) -> Vec<String> {
     let cleaned = remove_brace_blocks(text);
     let mut out = Vec::new();
@@ -1003,7 +1006,7 @@ fn extract_operands(text: &str, result: Option<&str>) -> Vec<String> {
                 j += 1;
             }
             let name = &cleaned[i..j];
-            if Some(name) != result && name.len() > 1 && !out.iter().any(|o| o == name) {
+            if Some(name) != result && name.len() > 1 {
                 out.push(name.to_string());
             }
             i = j;
@@ -1353,6 +1356,15 @@ mod tests {
     const VECTOR_ADD: &str = include_str!(
         "../../examples/triton-ktir/vector_add_ktir.mlir"
     );
+
+    // RUST-ONLY (not in the Python suite): regression for the operand-dedup bug.
+    // MLIR operands are positional, so a repeated operand (`%y = mulf %x, %x`,
+    // the squaring step in RMSNorm/LayerNorm variance) must be kept, not deduped.
+    #[test]
+    fn extract_operands_keeps_positional_repeats() {
+        let ops = extract_operands("%x, %x : tensor<1x1024xf16>", Some("%y"));
+        assert_eq!(ops, vec!["%x".to_string(), "%x".to_string()]);
+    }
 
     #[test]
     fn parses_real_vector_add_structurally() {

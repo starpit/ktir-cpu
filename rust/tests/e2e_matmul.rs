@@ -2,6 +2,9 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
 //
+//! RUST-ONLY (not a port of a Python test): the Python matmul tests assert on
+//! the latency report; this is the first check of the matmul *output* value.
+//!
 //! End-to-end matmul: drive a real multi-core KTIR matmul kernel through the
 //! full interpreter pipeline (parse → HBM marshal → grid → scf.for K-loop →
 //! ktdp.load / linalg.matmul / arith.addf accumulate / ktdp.store → readback)
