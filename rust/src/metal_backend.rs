@@ -310,60 +310,79 @@ pub fn run_kernel(
     inputs: &[Vec<f32>],
     out_len: usize,
 ) -> Result<Vec<f32>, String> {
-    use metal::{Device, MTLResourceOptions, MTLSize};
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+        MTLResourceOptions, MTLSize,
+    };
     use std::ffi::c_void;
+    use std::ptr::NonNull;
 
-    let device = Device::system_default().ok_or("no Metal device available")?;
+    let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    let src = NSString::from_str(&kernel.source);
     let library = device
-        .new_library_with_source(&kernel.source, &metal::CompileOptions::new())
-        .map_err(|e| format!("metal: MSL compile failed: {e}"))?;
+        .newLibraryWithSource_options_error(&src, Some(&opts))
+        .map_err(|e| format!("metal: MSL compile failed: {e:?}"))?;
     let function = library
-        .get_function(&kernel.name, None)
-        .map_err(|e| format!("metal: kernel {:?} not found: {e}", kernel.name))?;
+        .newFunctionWithName(&NSString::from_str(&kernel.name))
+        .ok_or_else(|| format!("metal: kernel {:?} not found", kernel.name))?;
     let pipeline = device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(|e| format!("metal: pipeline build failed: {e}"))?;
-    let queue = device.new_command_queue();
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
+    let queue = device.newCommandQueue().ok_or("metal: newCommandQueue returned nil")?;
 
-    let opts = MTLResourceOptions::StorageModeShared;
+    let res = MTLResourceOptions::StorageModeShared;
     let mut gpu_buffers = Vec::with_capacity(kernel.buffers.len());
     let mut input_iter = inputs.iter();
     let mut out_dtype = DType::F16;
     for b in &kernel.buffers {
-        if b.is_output {
+        let buf = if b.is_output {
             out_dtype = b.dtype;
-            let len = (out_len * b.dtype.bytes_per_elem()) as u64;
-            gpu_buffers.push(device.new_buffer(len.max(1), opts));
+            let len = (out_len * b.dtype.bytes_per_elem()).max(1);
+            device
+                .newBufferWithLength_options(len, res)
+                .ok_or("metal: output buffer alloc failed")?
         } else {
             let data = input_iter.next().ok_or("metal: too few inputs for kernel buffers")?;
             let bytes = crate::codec::encode(data, b.dtype);
-            gpu_buffers.push(device.new_buffer_with_data(
-                bytes.as_ptr() as *const c_void,
-                bytes.len().max(1) as u64,
-                opts,
-            ));
-        }
+            // SAFETY: `bytes` lives until the copy completes inside this call.
+            unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                        bytes.len().max(1),
+                        res,
+                    )
+                    .ok_or("metal: input buffer alloc failed")?
+            }
+        };
+        gpu_buffers.push(buf);
     }
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+    let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
+    enc.setComputePipelineState(&pipeline);
     for (i, buf) in gpu_buffers.iter().enumerate() {
-        enc.set_buffer(i as u64, Some(buf), 0);
+        unsafe { enc.setBuffer_offset_atIndex(Some(buf), 0, i) };
     }
-    let tg = pipeline.max_total_threads_per_threadgroup().min(out_len as u64).max(1);
-    enc.dispatch_threads(
-        MTLSize { width: out_len as u64, height: 1, depth: 1 },
+    let tg = pipeline.maxTotalThreadsPerThreadgroup().min(out_len).max(1);
+    enc.dispatchThreads_threadsPerThreadgroup(
+        MTLSize { width: out_len, height: 1, depth: 1 },
         MTLSize { width: tg, height: 1, depth: 1 },
     );
-    enc.end_encoding();
+    enc.endEncoding();
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
 
     // Read the output buffer (last) back and decode to f32.
     let out = gpu_buffers.last().unwrap();
     let nbytes = out_len * out_dtype.bytes_per_elem();
-    let raw = unsafe { std::slice::from_raw_parts(out.contents() as *const u8, nbytes) }.to_vec();
+    let raw = unsafe {
+        std::slice::from_raw_parts(out.contents().as_ptr() as *const u8, nbytes)
+    }
+    .to_vec();
     Ok(crate::codec::decode(&raw, out_len, out_dtype))
 }
 
@@ -471,8 +490,8 @@ mod tests {
 
     #[test]
     fn reports_device_tier_on_real_gpu() {
-        use metal::Device;
-        let Some(device) = Device::system_default() else {
+        use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+        let Some(device) = MTLCreateSystemDefaultDevice() else {
             eprintln!("no Metal device — skipping live tier check");
             return;
         };
