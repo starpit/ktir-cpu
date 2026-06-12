@@ -23,11 +23,36 @@
 
 use std::collections::HashMap;
 
+use crate::dtypes::DType;
 use crate::ir::{IRFunction, IRModule, Operation};
+
+/// One kernel-argument buffer: the KTIR pointer-arg name, whether it's written,
+/// and its element dtype. The order of [`MslKernel::buffers`] is the MSL
+/// `[[buffer(i)]]` binding order — the runtime must supply data in this order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BufferBinding {
+    pub name: String,
+    pub is_output: bool,
+    pub dtype: DType,
+}
+
+/// A lowered Metal kernel: the MSL source, the kernel name, and its buffer
+/// bindings in `[[buffer(i)]]` order.
+#[derive(Clone, Debug)]
+pub struct MslKernel {
+    pub source: String,
+    pub name: String,
+    pub buffers: Vec<BufferBinding>,
+}
 
 /// Lower `func_name` to an MSL kernel string. Errors if the function isn't the
 /// supported element-wise shape (with a message pointing at what tripped it).
 pub fn emit_msl(module: &IRModule, func_name: &str) -> Result<String, String> {
+    Ok(emit_kernel(module, func_name)?.source)
+}
+
+/// Lower `func_name` to a full [`MslKernel`] (source + buffer bindings).
+pub fn emit_kernel(module: &IRModule, func_name: &str) -> Result<MslKernel, String> {
     let f = module.get_function(func_name)?;
     let defs = def_map(f);
 
@@ -49,19 +74,21 @@ pub fn emit_msl(module: &IRModule, func_name: &str) -> Result<String, String> {
         .get(strip(&store.operands[0]))
         .ok_or("metal: stored value has no defining op")?;
     let expr = lower_compute(compute, &defs)?;
-    let elem_ty = buffer_dtype(&out_buf, f, &defs);
+    let dtype = buffer_dtype(&out_buf, f);
 
     // Inputs in first-seen order; the output buffer last. (De-dup: a buffer may
     // be both read and written, though vector_add's aren't.)
-    let mut buffers: Vec<(String, bool)> = Vec::new(); // (name, is_output)
+    let mut buffers: Vec<BufferBinding> = Vec::new();
     for b in collect_input_buffers(compute, &defs) {
-        if !buffers.iter().any(|(n, _)| *n == b) {
-            buffers.push((b, false));
+        if !buffers.iter().any(|x| x.name == b) {
+            let bdt = buffer_dtype(&b, f);
+            buffers.push(BufferBinding { name: b, is_output: false, dtype: bdt });
         }
     }
-    buffers.push((out_buf, true));
+    buffers.push(BufferBinding { name: out_buf, is_output: true, dtype });
 
-    Ok(render_kernel(func_name, &buffers, &elem_ty, &expr))
+    let source = render_kernel(func_name, &buffers, &expr);
+    Ok(MslKernel { source, name: func_name.to_string(), buffers })
 }
 
 // --- dataflow ------------------------------------------------------------
@@ -112,30 +139,30 @@ fn collect_input_buffers(compute: &Operation, defs: &HashMap<String, &Operation>
         .collect()
 }
 
-/// Element type of a buffer, read from the `construct_memory_view` dtype that
-/// produced it. Defaults to `half` (f16) — the common KTIR tile dtype.
-fn buffer_dtype(buf: &str, f: &IRFunction, _defs: &HashMap<String, &Operation>) -> String {
-    // Find a construct_memory_view whose pointer operand is this buffer.
+/// Element dtype of a buffer, read from the `construct_memory_view` that
+/// produced it. Defaults to `f16` — the common KTIR tile dtype.
+fn buffer_dtype(buf: &str, f: &IRFunction) -> DType {
     for op in &f.operations {
         if op.op_type == "ktdp.construct_memory_view"
             && op.operands.first().map(|p| strip(p)) == Some(buf)
             && let Some(crate::ir::Attr::Str(dt)) = op.attributes.get("dtype")
+            && let Ok(parsed) = DType::parse(dt)
         {
-            return msl_type(dt);
+            return parsed;
         }
     }
-    "half".to_string()
+    DType::F16
 }
 
-fn msl_type(ktir_dtype: &str) -> String {
-    match ktir_dtype {
-        "f16" | "fp16" | "float16" => "half",
-        "f32" | "float32" => "float",
-        "i32" | "si32" | "index" => "int",
-        "i64" | "si64" => "long",
-        _ => "half",
+/// The MSL scalar type for a KTIR dtype.
+fn msl_type(dt: DType) -> &'static str {
+    match dt {
+        DType::F16 => "half",
+        DType::F32 => "float",
+        DType::I32 => "int",
+        DType::I64 => "long",
+        DType::Bool => "bool",
     }
-    .to_string()
 }
 
 // --- compute lowering ----------------------------------------------------
@@ -186,22 +213,96 @@ fn lower_compute(op: &Operation, defs: &HashMap<String, &Operation>) -> Result<S
 
 // --- rendering -----------------------------------------------------------
 
-fn render_kernel(name: &str, buffers: &[(String, bool)], elem_ty: &str, expr: &str) -> String {
+fn render_kernel(name: &str, buffers: &[BufferBinding], expr: &str) -> String {
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
     s.push_str(&format!("kernel void {name}(\n"));
-    for (i, (buf, is_out)) in buffers.iter().enumerate() {
-        let qual = if *is_out { "device" } else { "device const" };
+    for (i, b) in buffers.iter().enumerate() {
+        let qual = if b.is_output { "device" } else { "device const" };
         s.push_str(&format!(
-            "    {qual} {elem_ty}* {buf} [[buffer({i})]],\n"
+            "    {qual} {}* {} [[buffer({i})]],\n",
+            msl_type(b.dtype),
+            b.name
         ));
     }
     s.push_str("    uint gid [[thread_position_in_grid]]\n) {\n");
     // The output buffer is the last entry.
-    let out = &buffers.last().unwrap().0;
+    let out = &buffers.last().unwrap().name;
     s.push_str(&format!("    {out}[gid] = {expr};\n"));
     s.push_str("}\n");
     s
+}
+
+// =========================================================================
+// Runtime dispatch (slice 2) — compile the MSL and run it on a Metal device.
+// =========================================================================
+
+/// Compile `kernel`'s MSL, upload `inputs` (in `kernel.buffers` non-output
+/// order, as f32 — encoded to each buffer's dtype), dispatch one thread per
+/// output element, and read `out_len` elements back as f32.
+///
+/// Returns `Err("no Metal device …")` when no GPU is available (e.g. headless
+/// CI), so callers can skip gracefully.
+pub fn run_kernel(
+    kernel: &MslKernel,
+    inputs: &[Vec<f32>],
+    out_len: usize,
+) -> Result<Vec<f32>, String> {
+    use metal::{Device, MTLResourceOptions, MTLSize};
+    use std::ffi::c_void;
+
+    let device = Device::system_default().ok_or("no Metal device available")?;
+    let library = device
+        .new_library_with_source(&kernel.source, &metal::CompileOptions::new())
+        .map_err(|e| format!("metal: MSL compile failed: {e}"))?;
+    let function = library
+        .get_function(&kernel.name, None)
+        .map_err(|e| format!("metal: kernel {:?} not found: {e}", kernel.name))?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|e| format!("metal: pipeline build failed: {e}"))?;
+    let queue = device.new_command_queue();
+
+    let opts = MTLResourceOptions::StorageModeShared;
+    let mut gpu_buffers = Vec::with_capacity(kernel.buffers.len());
+    let mut input_iter = inputs.iter();
+    let mut out_dtype = DType::F16;
+    for b in &kernel.buffers {
+        if b.is_output {
+            out_dtype = b.dtype;
+            let len = (out_len * b.dtype.bytes_per_elem()) as u64;
+            gpu_buffers.push(device.new_buffer(len.max(1), opts));
+        } else {
+            let data = input_iter.next().ok_or("metal: too few inputs for kernel buffers")?;
+            let bytes = crate::codec::encode(data, b.dtype);
+            gpu_buffers.push(device.new_buffer_with_data(
+                bytes.as_ptr() as *const c_void,
+                bytes.len().max(1) as u64,
+                opts,
+            ));
+        }
+    }
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    for (i, buf) in gpu_buffers.iter().enumerate() {
+        enc.set_buffer(i as u64, Some(buf), 0);
+    }
+    let tg = pipeline.max_total_threads_per_threadgroup().min(out_len as u64).max(1);
+    enc.dispatch_threads(
+        MTLSize { width: out_len as u64, height: 1, depth: 1 },
+        MTLSize { width: tg, height: 1, depth: 1 },
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    // Read the output buffer (last) back and decode to f32.
+    let out = gpu_buffers.last().unwrap();
+    let nbytes = out_len * out_dtype.bytes_per_elem();
+    let raw = unsafe { std::slice::from_raw_parts(out.contents() as *const u8, nbytes) }.to_vec();
+    Ok(crate::codec::decode(&raw, out_len, out_dtype))
 }
 
 #[cfg(test)]
@@ -228,6 +329,52 @@ mod tests {
             msl.contains("output_ptr[gid] = x_ptr[gid] + y_ptr[gid];"),
             "unexpected body:\n{msl}"
         );
+    }
+
+    #[test]
+    fn gpu_matches_oracle_vector_add() {
+        use crate::dtypes::DType;
+        use crate::interpreter::{execute_function, Arg};
+        use crate::ir::Scalar;
+
+        let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+        let module = parse_module(src).unwrap();
+        let kernel = emit_kernel(&module, "add_kernel").unwrap();
+
+        let n = 4096usize;
+        let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+
+        let gpu = match run_kernel(&kernel, &[x.clone(), y.clone()], n) {
+            Ok(g) => g,
+            // No GPU in this environment (e.g. headless CI) — skip, don't fail.
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("skipping GPU validation: {e}");
+                return;
+            }
+            Err(e) => panic!("GPU run failed: {e}"),
+        };
+
+        // Oracle: the same kernel through the CPU interpreter.
+        let args = [
+            ("x_ptr", Arg::Tensor { data: x, shape: vec![n], dtype: DType::F16 }),
+            ("y_ptr", Arg::Tensor { data: y, shape: vec![n], dtype: DType::F16 }),
+            ("output_ptr", Arg::Tensor { data: vec![0.0; n], shape: vec![n], dtype: DType::F16 }),
+            ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
+        ];
+        let oracle = execute_function(&module, "add_kernel", &args).unwrap();
+        let oracle = &oracle.get("output_ptr").unwrap().data;
+
+        assert_eq!(gpu.len(), n);
+        for i in 0..n {
+            assert!(
+                (gpu[i] - oracle[i]).abs() < 1e-2,
+                "GPU vs oracle mismatch at {i}: gpu={}, oracle={}",
+                gpu[i],
+                oracle[i]
+            );
+        }
+        eprintln!("GPU output matches the interpreter oracle over {n} elements ✓");
     }
 
     #[test]

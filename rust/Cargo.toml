@@ -12,10 +12,10 @@ description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
 [features]
 default = []
 
-# Experimental KTIR -> Metal Shading Language backend (codegen only for now;
-# GPU dispatch is a later slice). Pure string emission — no deps, no GPU needed
-# to build/test the codegen. macOS-oriented.
-metal = []
+# Experimental KTIR -> Metal Shading Language backend. The codegen is pure
+# string emission (no GPU needed); the runtime dispatch pulls the `metal` crate
+# (macOS-only) to compile the MSL and run it on a MTLDevice.
+metal = ["dep:metal"]
 
 # BLAS matmul for NON-macOS platforms — pick one. (macOS uses Apple Accelerate
 # automatically, with no feature flag; see the target deps below.) Linux has no
@@ -33,6 +33,7 @@ blis            = ["dep:cblas-sys", "dep:blas-src", "blas-src/blis"]
 # Optional on non-macOS (pulled in by a provider feature); see the macOS target
 # section for the always-on Accelerate wiring.
 cblas-sys = { version = "0.1", optional = true }
+metal = { version = "0.29", optional = true }
 blas-src = { version = "0.10", optional = true, default-features = false }
 openblas-src = { version = "0.10", optional = true, default-features = false }
 
