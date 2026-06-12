@@ -22,6 +22,7 @@ pub mod ir;
 pub mod latency;
 pub mod memory;
 pub mod memref;
+pub mod ops_memory;
 pub mod parser;
 pub mod parser_ast;
 pub mod tile;

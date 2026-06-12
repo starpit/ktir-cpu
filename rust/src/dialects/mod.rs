@@ -14,6 +14,7 @@
 pub mod arith;
 pub mod func;
 pub mod ktdp;
+pub mod ktdp_extra;
 pub mod linalg;
 pub mod math;
 pub mod scf;
@@ -53,10 +54,12 @@ impl Dispatch {
         arith::register(&mut d);
         func::register(&mut d);
         ktdp::register(&mut d);
+        ktdp_extra::register(&mut d);
         math::register(&mut d);
         linalg::register(&mut d);
         tensor::register(&mut d);
         scf::register(&mut d);
+        crate::ops_memory::register(&mut d);
         d
     }
 
