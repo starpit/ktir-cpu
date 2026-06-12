@@ -47,6 +47,20 @@ impl GridExecutor {
         let (nx, ny, _nz) = self.grid_shape;
         z * (nx * ny) + y * nx + x
     }
+
+    /// Core ids matching `(x, y, z)`, where `-1` in any axis means "all in that
+    /// dimension" (wildcard). Mirrors `get_cores_in_group`.
+    pub fn cores_in_group(&self, group: (i64, i64, i64)) -> Vec<usize> {
+        let (tx, ty, tz) = group;
+        (0..self.num_cores)
+            .filter(|&core_id| {
+                let (x, y, z) = self.linear_to_grid(core_id);
+                (tx == -1 || x as i64 == tx)
+                    && (ty == -1 || y as i64 == ty)
+                    && (tz == -1 || z as i64 == tz)
+            })
+            .collect()
+    }
 }
 
 /// Resources passed to every handler. Mirrors `ExecutionEnv`. Borrows the

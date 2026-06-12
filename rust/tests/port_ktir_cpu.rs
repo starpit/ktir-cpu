@@ -317,12 +317,17 @@ fn grid_linear_coord_roundtrip_all_cores() {
 }
 
 #[test]
-#[ignore = "GAP: get_cores_in_group(group) wildcard/dimension filtering has no \
-            public Rust analogue — the Rust GridExecutor exposes only coordinate \
-            transforms; group selection lives in the interpreter driver"]
 fn get_cores_in_group_filters() {
-    // test_grid_executor (group half), test_get_cores_in_group_yz_filters,
-    // test_get_cores_in_group_all_wildcards, test_get_cores_in_group_xy_wildcards.
+    use ktir_cpu::env::GridExecutor;
+    let g = GridExecutor::new((4, 2, 1)); // 8 cores: x in 0..4, y in 0..2
+    // all wildcards -> every core.
+    assert_eq!(g.cores_in_group((-1, -1, -1)), (0..8).collect::<Vec<_>>());
+    // y=1, z=0 -> the 4 cores in the second row (linear ids 4..8).
+    assert_eq!(g.cores_in_group((-1, 1, 0)), vec![4, 5, 6, 7]);
+    // x=2 across all y -> ids where x==2: (2,0)=2 and (2,1)=6.
+    assert_eq!(g.cores_in_group((2, -1, -1)), vec![2, 6]);
+    // a fully-specified coordinate -> exactly one core.
+    assert_eq!(g.cores_in_group((3, 1, 0)), vec![7]);
 }
 
 // ===========================================================================

@@ -168,13 +168,14 @@ fn grid_8x4_shape() {
 }
 
 #[test]
-#[ignore = "GAP: GridExecutor has no per-core list (.cores) nor wildcard \
-            get_cores_in_group(group) selection ((-1,0,0)/(2,-1,0)); the Rust \
-            GridExecutor exposes only num_cores + linear_to_grid/grid_to_linear. \
-            Core-group selection is unimplemented in the Rust crate."]
 fn grid_core_group_selection() {
-    // Python: grid.get_cores_in_group((-1, 0, 0)) -> all cores in row 0;
-    //         grid_8x4.get_cores_in_group((2, -1, 0)) -> 4 cores in column 2.
+    use ktir_cpu::env::GridExecutor;
+    // 4x2 grid: row 0 (y=0) -> ids 0..4.
+    let g = GridExecutor::new((4, 2, 1));
+    assert_eq!(g.cores_in_group((-1, 0, 0)), vec![0, 1, 2, 3]);
+    // 8x4 grid: column 2 (x=2) across y -> one id per row at x=2.
+    let g2 = GridExecutor::new((8, 4, 1));
+    assert_eq!(g2.cores_in_group((2, -1, 0)), vec![2, 10, 18, 26]);
 }
 
 // ===========================================================================
