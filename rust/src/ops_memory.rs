@@ -1045,61 +1045,19 @@ fn ndindex(shape: &[usize], f: &mut impl FnMut(&[i64])) {
 
 /// Decode `n` elements of `dtype` from the front of `raw` into f32 values.
 /// Missing/short bytes decode as zero (matches the simulator's zero-padding).
+///
+/// Delegates to the single `codec` implementation (which carries the SIMD/
+/// table-backed f16 fast path) — only the operand order differs locally.
+#[inline]
 fn decode(raw: &[u8], dtype: DType, n: usize) -> Vec<f32> {
-    let bpe = dtype.bytes_per_elem();
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = i * bpe;
-        let chunk = raw.get(off..off + bpe);
-        let v = match (dtype, chunk) {
-            (DType::F16, Some(b)) => widen_f16(u16::from_le_bytes([b[0], b[1]])),
-            (DType::F32, Some(b)) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            (DType::I32, Some(b)) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
-            (DType::I64, Some(b)) => {
-                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-            }
-            (DType::Bool, Some(b)) => {
-                if b[0] != 0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            (_, _) => 0.0, // short/missing bytes -> zero
-        };
-        out.push(v);
-    }
-    out
+    crate::codec::decode(raw, n, dtype)
 }
 
 /// Encode f32 element values into `dtype`'s native little-endian byte layout.
+/// Delegates to the single `codec` implementation.
+#[inline]
 fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() * dtype.bytes_per_elem());
-    for &x in data {
-        match dtype {
-            DType::F16 => out.extend_from_slice(&narrow_f16(x).to_le_bytes()),
-            DType::F32 => out.extend_from_slice(&x.to_le_bytes()),
-            DType::I32 => out.extend_from_slice(&(x.round() as i32).to_le_bytes()),
-            DType::I64 => out.extend_from_slice(&(x.round() as i64).to_le_bytes()),
-            DType::Bool => out.push(if x != 0.0 { 1 } else { 0 }),
-        }
-    }
-    out
-}
-
-// ===========================================================================
-// f16 <-> f32 (round-to-nearest-even; mirrors arith.rs narrow_f16/widen_f16)
-// ===========================================================================
-
-// These were standalone bit-manipulation duplicates of the codec's f16 round
-// trip (the consolidation the codec module flagged as a follow-up). They now
-// delegate to `codec`, so `decode` gets codec's 64K f16→f32 lookup table — the
-// hot path of every `ktdp.load` — and there is a single f16 implementation.
-fn narrow_f16(x: f32) -> u16 {
-    crate::codec::f32_to_f16_bits(x)
-}
-fn widen_f16(h: u16) -> f32 {
-    crate::codec::f16_bits_to_f32(h)
+    crate::codec::encode(data, dtype)
 }
 
 // ===========================================================================
@@ -1129,8 +1087,8 @@ mod tests {
     #[test]
     fn f16_roundtrips_exact_representables() {
         for &v in &[0.0f32, 1.0, -2.0, 0.5, 1024.0, -0.25, 3.5] {
-            let h = narrow_f16(v);
-            assert_eq!(widen_f16(h), v, "f16 round trip for {v}");
+            let h = crate::codec::f32_to_f16_bits(v);
+            assert_eq!(crate::codec::f16_bits_to_f32(h), v, "f16 round trip for {v}");
         }
     }
 
@@ -1225,7 +1183,7 @@ mod tests {
         let mut ctx = single_core_context();
         let raw: Vec<u8> = [1.0f32, 2.0, 4.0]
             .iter()
-            .flat_map(|x| narrow_f16(*x).to_le_bytes())
+            .flat_map(|x| crate::codec::f32_to_f16_bits(*x).to_le_bytes())
             .collect();
         ctx.lx.borrow_mut().write_bytes(0, &raw);
 

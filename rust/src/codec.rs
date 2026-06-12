@@ -73,9 +73,12 @@ pub fn f32_to_f16_bits(f: f32) -> u16 {
     let rem = mant & 0x1fff;
     if rem > 0x1000 || (rem == 0x1000 && (half_mant & 1) == 1) {
         half_mant += 1;
-        // carry into exponent handled naturally by the +1 spilling into exp bits
     }
-    sign | ((exp as u16) << 10) | half_mant
+    // ADD (not OR) the mantissa so a rounding carry (half_mant -> 0x400) spills
+    // into the exponent: e.g. 32767.994 rounds up to 32768 (exp+1, mant 0), and
+    // a carry that reaches exp 0x1f naturally yields inf. `| half_mant` would
+    // collide with the exponent's low bit when exp is odd. Matches hardware RNE.
+    sign | (((exp as u16) << 10) + half_mant)
 }
 
 /// Round each value in place to `dtype`'s representable set — NumPy assignment
@@ -85,11 +88,7 @@ pub fn f32_to_f16_bits(f: f32) -> u16 {
 pub fn round_to_dtype(data: &mut [f32], dtype: DType) {
     match dtype {
         DType::F32 => {}
-        DType::F16 => {
-            for x in data.iter_mut() {
-                *x = f16_bits_to_f32(f32_to_f16_bits(*x));
-            }
-        }
+        DType::F16 => round_f16_in_place(data),
         DType::I32 => {
             for x in data.iter_mut() {
                 *x = (*x as i32) as f32;
@@ -110,6 +109,12 @@ pub fn round_to_dtype(data: &mut [f32], dtype: DType) {
 
 /// Encode a flat f32 tile into raw bytes for memory, per `dtype`.
 pub fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
+    // f16 is the hot dtype in a real-model run — convert 4 lanes/instruction
+    // with hardware `vcvt_f16_f32` (round-to-nearest-even, matching the scalar
+    // `f32_to_f16_bits`) instead of the per-element bit twiddle.
+    if dtype == DType::F16 {
+        return encode_f16(data);
+    }
     let mut out = Vec::with_capacity(data.len() * dtype.bytes_per_elem());
     for &v in data {
         match dtype {
@@ -126,6 +131,12 @@ pub fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
 /// Decode `n` elements of `dtype` from raw bytes into a flat f32 tile.
 /// Zero-pads if `bytes` is short (matches the memory sim's zero-fill).
 pub fn decode(bytes: &[u8], n: usize, dtype: DType) -> Vec<f32> {
+    // f16 fast path: the bytes are fully present (the common case — only the
+    // zero-pad-short fallback below needs per-element bounds checks). f16→f32 is
+    // exact, so hardware `vcvt_f32_f16` over 4 lanes matches the table exactly.
+    if dtype == DType::F16 && bytes.len() >= n * 2 {
+        return decode_f16(bytes, n);
+    }
     let bpe = dtype.bytes_per_elem();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -146,6 +157,116 @@ pub fn decode(bytes: &[u8], n: usize, dtype: DType) -> Vec<f32> {
     out
 }
 
+// ===========================================================================
+// f16 batch conversion — SIMD on aarch64 (hardware FP16), scalar elsewhere.
+//
+// f16 dominates real-model self-time (every ktdp.load decodes, every store and
+// round_to_dtype encodes). Apple Silicon has native half<->single conversion:
+// `vcvt_f32_f16` / `vcvt_f16_f32` do 4 lanes per instruction with no memory
+// traffic, versus the 256 KB f16->f32 lookup table thrashing L1. The hardware
+// converters use round-to-nearest-even — bit-identical to the scalar helpers
+// for finite values (verified exhaustively in the tests below).
+// ===========================================================================
+
+/// f16 bytes (little-endian, fully present) -> f32 tile. Exact (no rounding).
+fn decode_f16(bytes: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    decode_f16_into(bytes, &mut out);
+    out
+}
+
+/// f32 tile -> f16 bytes (little-endian), round-to-nearest-even.
+fn encode_f16(data: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; data.len() * 2];
+    encode_f16_into(data, &mut out);
+    out
+}
+
+/// Quantize each f32 to its nearest f16 value, in place (f32->f16->f32).
+fn round_f16_in_place(data: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let (p, n) = (data.as_mut_ptr(), data.len());
+        let mut i = 0;
+        while i + 4 <= n {
+            let f = vld1q_f32(p.add(i));
+            vst1q_f32(p.add(i), vcvt_f32_f16(vcvt_f16_f32(f)));
+            i += 4;
+        }
+        while i < n {
+            *p.add(i) = f16_bits_to_f32(f32_to_f16_bits(*p.add(i)));
+            i += 1;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for x in data.iter_mut() {
+        *x = f16_bits_to_f32(f32_to_f16_bits(*x));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_f16_into(bytes: &[u8], out: &mut [f32]) {
+    use core::arch::aarch64::*;
+    let n = out.len();
+    debug_assert!(bytes.len() >= n * 2);
+    unsafe {
+        let (src, dst) = (bytes.as_ptr(), out.as_mut_ptr());
+        let mut i = 0;
+        while i + 4 <= n {
+            // Unaligned 4×u16 load -> reinterpret as f16 -> widen to 4×f32.
+            let h = vld1_u16(src.add(i * 2).cast::<u16>());
+            vst1q_f32(dst.add(i), vcvt_f32_f16(vreinterpret_f16_u16(h)));
+            i += 4;
+        }
+        while i < n {
+            let (lo, hi) = (*src.add(i * 2), *src.add(i * 2 + 1));
+            *dst.add(i) = f16_bits_to_f32(u16::from_le_bytes([lo, hi]));
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn decode_f16_into(bytes: &[u8], out: &mut [f32]) {
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = f16_bits_to_f32(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn encode_f16_into(data: &[f32], out: &mut [u8]) {
+    use core::arch::aarch64::*;
+    let n = data.len();
+    debug_assert!(out.len() >= n * 2);
+    unsafe {
+        let (src, dst) = (data.as_ptr(), out.as_mut_ptr());
+        let mut i = 0;
+        while i + 4 <= n {
+            // 4×f32 -> narrow to 4×f16 (RNE) -> reinterpret u16 -> unaligned store.
+            let f = vld1q_f32(src.add(i));
+            let h = vreinterpret_u16_f16(vcvt_f16_f32(f));
+            vst1_u16(dst.add(i * 2).cast::<u16>(), h);
+            i += 4;
+        }
+        while i < n {
+            let b = f32_to_f16_bits(*src.add(i)).to_le_bytes();
+            *dst.add(i * 2) = b[0];
+            *dst.add(i * 2 + 1) = b[1];
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn encode_f16_into(data: &[f32], out: &mut [u8]) {
+    for (i, &v) in data.iter().enumerate() {
+        let b = f32_to_f16_bits(v).to_le_bytes();
+        out[i * 2] = b[0];
+        out[i * 2 + 1] = b[1];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +277,74 @@ mod tests {
             let back = f16_bits_to_f32(f32_to_f16_bits(v));
             assert_eq!(back, v, "f16 round-trip for {v}");
         }
+    }
+
+    // The SIMD f16 batch path must be bit-identical to the scalar helpers for
+    // every finite f16 value — otherwise it would silently shift golden output.
+    // f16 has only 65536 patterns, so we can check all of them exhaustively.
+    #[test]
+    fn simd_f16_decode_matches_scalar_for_all_patterns() {
+        let bytes: Vec<u8> = (0..=u16::MAX).flat_map(|h| h.to_le_bytes()).collect();
+        let n = 1 << 16;
+        let simd = decode(&bytes, n, DType::F16); // hits decode_f16 fast path
+        for h in 0..=u16::MAX {
+            let want = f16_bits_to_f32(h);
+            let got = simd[h as usize];
+            if want.is_nan() {
+                assert!(got.is_nan(), "pattern {h:#06x}: want NaN, got {got}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "decode pattern {h:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn simd_f16_encode_matches_scalar_for_all_representable() {
+        // Widen every f16 value to f32, then re-encode: the SIMD narrow must
+        // produce the original bit pattern (round-trip is exact for these),
+        // matching the scalar `f32_to_f16_bits`.
+        let vals: Vec<f32> = (0..=u16::MAX).map(f16_bits_to_f32).collect();
+        let simd = encode(&vals, DType::F16); // hits encode_f16 fast path
+        for (i, &v) in vals.iter().enumerate() {
+            if v.is_nan() {
+                // NaN payloads are don't-care; just require an f16 NaN out.
+                let got = u16::from_le_bytes([simd[i * 2], simd[i * 2 + 1]]);
+                assert_eq!(got & 0x7c00, 0x7c00, "encode NaN slot {i}");
+                assert_ne!(got & 0x03ff, 0, "encode NaN must keep mantissa");
+                continue;
+            }
+            let got = u16::from_le_bytes([simd[i * 2], simd[i * 2 + 1]]);
+            assert_eq!(got, f32_to_f16_bits(v), "encode value {v} (slot {i})");
+        }
+    }
+
+    #[test]
+    fn simd_f16_encode_matches_scalar_for_unrepresentable() {
+        // Values needing real rounding (not f16-exact): SIMD RNE must equal the
+        // scalar RNE bit-for-bit. Sweep a dense range across magnitudes.
+        let mut vals = Vec::new();
+        let mut x = -70000.0f32;
+        while x < 70000.0 {
+            vals.push(x);
+            x += 0.013;
+        }
+        let simd = encode(&vals, DType::F16);
+        for (i, &v) in vals.iter().enumerate() {
+            let got = u16::from_le_bytes([simd[i * 2], simd[i * 2 + 1]]);
+            assert_eq!(got, f32_to_f16_bits(v), "encode rounding for {v} (slot {i})");
+        }
+    }
+
+    #[test]
+    fn simd_round_f16_matches_scalar() {
+        // Odd length to exercise the scalar tail after the 4-lane body.
+        let mut a: Vec<f32> = (0..103).map(|i| (i as f32) * 0.37 - 12.5).collect();
+        let mut b = a.clone();
+        round_to_dtype(&mut a, DType::F16); // SIMD round_f16_in_place
+        for x in b.iter_mut() {
+            *x = f16_bits_to_f32(f32_to_f16_bits(*x));
+        }
+        assert_eq!(a, b);
     }
 
     #[test]
