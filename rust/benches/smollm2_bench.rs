@@ -71,8 +71,11 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
-    eprintln!("profiling {} nodes x {iters} passes...", nodes.len());
-    for _ in 0..iters {
+
+    // One full-model pass: every node, with per-node dispatch + arg marshaling +
+    // inter-node tensor threading — i.e. the interpreter itself, end to end.
+    // Mirrors bench_e2e_py_vs_rust.py.
+    let one_pass = || {
         let mut buf = sources.clone();
         for node in nodes {
             let func = node["fn"].as_str().unwrap();
@@ -108,6 +111,27 @@ fn main() {
                 buf.insert(tid, out[&nm].data.clone());
             }
         }
+    };
+
+    // Profiling mode: when SMOLLM2_PROFILE is set, just run the passes (for a
+    // sampling profiler). Otherwise report ms/pass (one warm-up excluded),
+    // matching bench_e2e_py_vs_rust.py so the two are directly comparable.
+    if std::env::var_os("SMOLLM2_PROFILE").is_some() {
+        eprintln!("profiling {} nodes x {iters} passes...", nodes.len());
+        for _ in 0..iters {
+            one_pass();
+        }
+        eprintln!("done");
+    } else {
+        one_pass(); // warm-up
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            one_pass();
+        }
+        let ms = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
+        println!(
+            "smollm2-135m e2e (Rust): {ms:.1} ms/pass  ({} nodes, {iters} passes)",
+            nodes.len()
+        );
     }
-    eprintln!("done");
 }
