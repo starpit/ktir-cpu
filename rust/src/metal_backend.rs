@@ -650,6 +650,60 @@ fn bytemuck_cast(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
+/// Reinterpret a `&[u32]` as bytes (for small uniform buffers like dims/codes).
+fn bytemuck_u32(data: &[u32]) -> &[u8] {
+    // SAFETY: u32 is plain-old-data; same bytes, same lifetime.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
+/// A fused matmul epilogue: `out = act(c BINOP e)`, where `e` is a per-element
+/// operand (bias/residual/scale). The codes match the MSL `nax_epilogue` switch.
+/// Lets the emulator fold a `matmul` and a following elementwise op (add, mul,
+/// relu, tanh, …) into one GPU kernel — no readback, no second launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Epilogue {
+    /// Binary op with `e`: 0 none, 1 add, 2 mul, 3 sub, 4 max, 5 min.
+    pub binop: u32,
+    /// Activation: 0 none, 1 relu, 2 tanh, 3 exp, 4 sigmoid.
+    pub act: u32,
+}
+
+impl Epilogue {
+    /// No epilogue — a plain matmul.
+    pub const NONE: Epilogue = Epilogue { binop: 0, act: 0 };
+    pub const ADD: Epilogue = Epilogue { binop: 1, act: 0 };
+    pub const MUL: Epilogue = Epilogue { binop: 2, act: 0 };
+    pub const SUB: Epilogue = Epilogue { binop: 3, act: 0 };
+    pub const MAX: Epilogue = Epilogue { binop: 4, act: 0 };
+    pub const MIN: Epilogue = Epilogue { binop: 5, act: 0 };
+    pub const RELU: Epilogue = Epilogue { binop: 0, act: 1 };
+    pub const TANH: Epilogue = Epilogue { binop: 0, act: 2 };
+    pub const EXP: Epilogue = Epilogue { binop: 0, act: 3 };
+    pub const SIGMOID: Epilogue = Epilogue { binop: 0, act: 4 };
+
+    /// Map a binary elementwise KTIR op name to its epilogue (with `e` the other
+    /// operand), or `None` if it isn't a fusable binary op.
+    pub fn from_binary_op(op_type: &str) -> Option<Epilogue> {
+        Some(match op_type {
+            "linalg.add" | "arith.addf" => Epilogue::ADD,
+            "linalg.mul" | "arith.mulf" => Epilogue::MUL,
+            "linalg.sub" | "arith.subf" => Epilogue::SUB,
+            "linalg.max" | "arith.maximumf" | "arith.maxf" => Epilogue::MAX,
+            "linalg.min" | "arith.minimumf" | "arith.minf" => Epilogue::MIN,
+            _ => return None,
+        })
+    }
+
+    /// Map a unary activation KTIR op name to its epilogue, or `None`.
+    pub fn from_unary_op(op_type: &str) -> Option<Epilogue> {
+        Some(match op_type {
+            "math.tanh" => Epilogue::TANH,
+            "math.exp" => Epilogue::EXP,
+            _ => return None,
+        })
+    }
+}
+
 // =========================================================================
 // General tiled NAX GEMM — arbitrary M, N, K
 // =========================================================================
@@ -691,11 +745,36 @@ constant constexpr uint TG_M   = SG_M * SGS_M;   // threadgroup block rows  = 12
 constant constexpr uint TG_N   = SG_N * SGS_N;   // threadgroup block cols  = 256
 constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
 
+// Fused elementwise epilogue applied in the GEMM store: out = act(c BINOP e).
+// binop: 0 none, 1 add, 2 mul, 3 sub, 4 max, 5 min.  act: 0 none, 1 relu,
+// 2 tanh, 3 exp, 4 sigmoid. This is the matmul->elementwise fusion — the
+// activation/bias runs in the same kernel as the matmul, with no readback.
+inline float nax_epilogue(float v, float ev, uint binop, uint act) {
+    switch (binop) {
+        case 1: v = v + ev; break;
+        case 2: v = v * ev; break;
+        case 3: v = v - ev; break;
+        case 4: v = max(v, ev); break;
+        case 5: v = min(v, ev); break;
+        default: break;
+    }
+    switch (act) {
+        case 1: v = max(v, 0.0f); break;
+        case 2: v = tanh(v); break;
+        case 3: v = exp(v); break;
+        case 4: v = 1.0f / (1.0f + exp(-v)); break;
+        default: break;
+    }
+    return v;
+}
+
 [[kernel]] void nax_matmul(
     device const float* a_in [[buffer(0)]],   // M x K row-major
     device const float* b_in [[buffer(1)]],   // K x N row-major
     device float* c_out      [[buffer(2)]],   // M x N row-major
     constant uint3& dims     [[buffer(3)]],   // (M, N, K)
+    device const float* e_in [[buffer(4)]],   // M x N epilogue operand (or dummy)
+    constant uint2& epi      [[buffer(5)]],   // (binop, act) codes
     uint2 tg  [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_simdgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]])
@@ -791,7 +870,16 @@ constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
     }
 #undef STAGE_PANEL
 
-    // Store this simdgroup's 2x2 tile block (rows m0+{0,16}, cols n0+{0,16,32,48}).
+    // Store this simdgroup's 2x2 tile block (rows m0+{0,16}, cols n0+{0,16,32,48}),
+    // applying the fused elementwise epilogue out = act(c BINOP e) per element.
+    const uint binop = epi.x, act = epi.y;
+#define EPI_STORE(rr, cc, cval)                                                \
+    do {                                                                       \
+        if ((rr) < M && (cc) < N) {                                            \
+            float ev = (binop != 0u) ? e_in[(rr) * N + (cc)] : 0.0f;           \
+            c_out[(rr) * N + (cc)] = nax_epilogue((cval), ev, binop, act);     \
+        }                                                                      \
+    } while (0)
     for (short e = 0; e < 8; ++e) {
         short r = fm + (e >> 2) * 8;
         short c = fn + (e % 4);
@@ -799,19 +887,16 @@ constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
         uint r1 = r0 + 16u;
         uint c0a = n0 + (uint)c;          uint c0b = c0a + 16u;   // tj=0 -> cols 0..31
         uint c1a = n0 + 32u + (uint)c;    uint c1b = c1a + 16u;   // tj=1 -> cols 32..63
-        if (r0 < M) {
-            if (c0a < N) c_out[r0 * N + c0a] = c00[e];
-            if (c0b < N) c_out[r0 * N + c0b] = c00[8 + e];
-            if (c1a < N) c_out[r0 * N + c1a] = c01[e];
-            if (c1b < N) c_out[r0 * N + c1b] = c01[8 + e];
-        }
-        if (r1 < M) {
-            if (c0a < N) c_out[r1 * N + c0a] = c10[e];
-            if (c0b < N) c_out[r1 * N + c0b] = c10[8 + e];
-            if (c1a < N) c_out[r1 * N + c1a] = c11[e];
-            if (c1b < N) c_out[r1 * N + c1b] = c11[8 + e];
-        }
+        EPI_STORE(r0, c0a, c00[e]);
+        EPI_STORE(r0, c0b, c00[8 + e]);
+        EPI_STORE(r0, c1a, c01[e]);
+        EPI_STORE(r0, c1b, c01[8 + e]);
+        EPI_STORE(r1, c0a, c10[e]);
+        EPI_STORE(r1, c0b, c10[8 + e]);
+        EPI_STORE(r1, c1a, c11[e]);
+        EPI_STORE(r1, c1b, c11[8 + e]);
     }
+#undef EPI_STORE
 }
 ";
 
@@ -856,6 +941,37 @@ impl NaxGemm {
     /// the kernel computes in bf16 (the NAX engine's input precision), so the
     /// result agrees with an f32 oracle only to bf16 tolerance.
     pub fn run(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
+        self.run_epi(m, k, n, a, b, None, Epilogue::NONE)
+    }
+
+    /// Fused matmul + elementwise epilogue in one kernel: `D = act(A·B BINOP E)`
+    /// where `E` is the row-major m×n elementwise operand. No host readback of
+    /// the matmul result and no second kernel launch — the activation/bias runs
+    /// in the GEMM store. See [`Epilogue`].
+    pub fn run_fused(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        e: &[f32],
+        epi: Epilogue,
+    ) -> Result<Vec<f32>, String> {
+        assert_eq!(e.len(), m * n, "epilogue operand E must be m×n");
+        self.run_epi(m, k, n, a, b, Some(e), epi)
+    }
+
+    fn run_epi(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        e: Option<&[f32]>,
+        epi: Epilogue,
+    ) -> Result<Vec<f32>, String> {
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
             MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
@@ -883,21 +999,28 @@ impl NaxGemm {
         };
         let a_buf = mk_in(a)?;
         let b_buf = mk_in(b)?;
+        let dummy = [0.0f32];
+        let e_buf = mk_in(e.unwrap_or(&dummy))?;
         let c_buf = self
             .device
             .newBufferWithLength_options((out_len * 4).max(1), res)
             .ok_or("metal: output buffer alloc failed")?;
         let dims = [m as u32, n as u32, k as u32];
-        // SAFETY: copies 12 bytes that live for the duration of this call.
-        let dims_buf = unsafe {
-            self.device
-                .newBufferWithBytes_length_options(
-                    NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                    std::mem::size_of_val(&dims),
-                    res,
-                )
-                .ok_or("metal: dims buffer alloc failed")?
+        let codes = [epi.binop, epi.act];
+        // SAFETY: small POD arrays that live for the duration of this call.
+        let small_buf = |bytes: &[u8]| -> Result<_, String> {
+            unsafe {
+                self.device
+                    .newBufferWithBytes_length_options(
+                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                        bytes.len(),
+                        res,
+                    )
+                    .ok_or_else(|| "metal: small buffer alloc failed".to_string())
+            }
         };
+        let dims_buf = small_buf(bytemuck_u32(&dims))?;
+        let codes_buf = small_buf(bytemuck_u32(&codes))?;
 
         let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
         let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
@@ -907,8 +1030,10 @@ impl NaxGemm {
             enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
             enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
+            enc.setBuffer_offset_atIndex(Some(&codes_buf), 0, 5);
         }
-        // One threadgroup (4 simdgroups, 128 threads) per 64×128 output block.
+        // One threadgroup (16 simdgroups, 512 threads) per 128×256 output block.
         let m_blocks = m.div_ceil(128);
         let n_blocks = n.div_ceil(256);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -961,17 +1086,22 @@ impl NaxGemm {
         };
         let a_buf = mk_in(a)?;
         let b_buf = mk_in(b)?;
+        let e_buf = mk_in(&[0.0f32])?;
         let c_buf = self.device.newBufferWithLength_options((m * n * 4).max(1), res).ok_or("alloc")?;
-        let dims = [m as u32, n as u32, k as u32];
-        let dims_buf = unsafe {
-            self.device
-                .newBufferWithBytes_length_options(
-                    NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
-                    std::mem::size_of_val(&dims),
-                    res,
-                )
-                .ok_or("alloc")?
+        let small = |v: &[u32]| -> Result<_, String> {
+            let bytes = bytemuck_u32(v);
+            unsafe {
+                self.device
+                    .newBufferWithBytes_length_options(
+                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
+                        bytes.len(),
+                        res,
+                    )
+                    .ok_or_else(|| "alloc".to_string())
+            }
         };
+        let dims_buf = small(&[m as u32, n as u32, k as u32])?;
+        let codes_buf = small(&[0u32, 0u32])?;
         let m_blocks = m.div_ceil(128);
         let n_blocks = n.div_ceil(256);
 
@@ -984,6 +1114,8 @@ impl NaxGemm {
                 enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
                 enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
                 enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(&codes_buf), 0, 5);
             }
             enc.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
@@ -1170,6 +1302,42 @@ kernel void mpp_probe(
             assert_eq!(got, want, "NAX GEMM mismatch at shape ({m},{k},{n})");
         }
         eprintln!("general NAX GEMM matches the oracle across {} shapes ✓", shapes.len());
+    }
+
+    /// Fused matmul→elementwise epilogue (`D = act(A·B BINOP E)`) computed in one
+    /// kernel matches doing the matmul then the elementwise op separately.
+    #[test]
+    fn nax_matmul_fused_epilogue_matches_oracle() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => return,
+            Err(e) => panic!("{e}"),
+        };
+        let (m, k, n) = (130usize, 40usize, 200usize); // ragged, multi-block
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) * 0.5).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+        let e: Vec<f32> = (0..m * n).map(|i| (i % 11) as f32 * 0.1 - 0.5).collect();
+        let mm = crate::blas::naive_sgemm(m, k, n, &a, &b);
+
+        let cases: &[(Epilogue, fn(f32, f32) -> f32)] = &[
+            (Epilogue::ADD, |c, ev| c + ev),
+            (Epilogue::MUL, |c, ev| c * ev),
+            (Epilogue::SUB, |c, ev| c - ev),
+            (Epilogue::MAX, |c, ev| c.max(ev)),
+            (Epilogue::RELU, |c, _| c.max(0.0)),
+            (Epilogue { binop: 1, act: 1 }, |c, ev| (c + ev).max(0.0)), // add + relu
+            (Epilogue { binop: 1, act: 2 }, |c, ev| (c + ev).tanh()),   // add + tanh
+        ];
+        for &(epi, f) in cases {
+            let got = ctx.run_fused(m, k, n, &a, &b, &e, epi).unwrap();
+            let mut max_rel = 0.0f32;
+            for i in 0..m * n {
+                let want = f(mm[i], e[i]);
+                max_rel = max_rel.max((got[i] - want).abs() / want.abs().max(1.0));
+            }
+            assert!(max_rel < 0.05, "fused {epi:?}: max rel err {max_rel} > bf16 tol");
+        }
+        eprintln!("fused matmul→elementwise epilogue matches oracle across {} ops ✓", cases.len());
     }
 
     /// Random (non-bf16-exact) data: the NAX GEMM agrees with the f32 oracle to
