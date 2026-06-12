@@ -14,4 +14,5 @@ pub mod interpreter;
 pub mod ir;
 pub mod memory;
 pub mod memref;
+pub mod parser;
 pub mod tile;

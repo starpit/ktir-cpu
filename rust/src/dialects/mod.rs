@@ -12,6 +12,7 @@
 //! registration is visible rather than hidden in attribute macros.
 
 pub mod arith;
+pub mod func;
 pub mod ktdp;
 
 use std::collections::HashMap;
@@ -46,6 +47,7 @@ impl Dispatch {
             latency: HashMap::new(),
         };
         arith::register(&mut d);
+        func::register(&mut d);
         ktdp::register(&mut d);
         d
     }

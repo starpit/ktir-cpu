@@ -18,7 +18,14 @@ be diffed against each other as the port grows.
 | `dialects` | `dialects/registry.py` | explicit-table `Dispatch` |
 | `dialects::arith` | `dialects/arith_ops.py` | `constant`, `addf`, `mulf`, `addi` |
 | `dialects::ktdp` | `dialects/ktdp_ops.py` | `construct_memory_view`, `construct_access_tile` (single-allocation path) |
+| `dialects::func` | (terminator) | `return` / `func.return` |
+| `parser` | `parser.py` | module/func/grid/args extraction, multi-line op tokenizer, structural op parse, `arith.constant` + infix index-arith |
 | `interpreter` | `interpreter.py` + `grid.py` scope | `Scope` + straight-line `execute_ops` |
+
+The parser handles the **real** `examples/triton-ktir/vector_add_ktir.mlir`
+structurally (correct func/grid/args and one `Operation` per multi-line
+`ktdp.construct_*`), and parses+executes straight-line arith functions
+end-to-end. See the test module in `parser.rs`.
 
 `Value` is the keystone — the tagged union replacing Python's `Any` across every
 SSA binding and handler return. `MemorySpace` as an enum makes the Python
@@ -27,8 +34,11 @@ violate.
 
 ## Not yet ported (next slices)
 
-- `parser/` — the regex MLIR tokenizer (`parser.py` + `parser_ast.py`), so real
-  `examples/*.mlir` can feed the interpreter instead of hand-built `Operation`s.
+- Parser depth: nested regions (scf bodies), and dialect-specific **attribute**
+  parsing for the affine attrs (`coordinate_set`, `base_map`, `memory_space`,
+  `sizes:`/`strides:`). Until then a parsed `ktdp.construct_*` op has correct
+  op_type/operands/result_type but not its affine attributes, so it parses
+  structurally but is not yet executable end-to-end.
 - The distributed memory path: `construct_distributed_memory_view`,
   `distributed_tile_access`, and `ktdp.load`/`store` (need a real
   `HBMSimulator` in `memory.rs`).
@@ -52,4 +62,4 @@ cargo test
 cargo clippy --all-targets
 ```
 
-19 tests, clippy-clean.
+22 tests, clippy-clean.
