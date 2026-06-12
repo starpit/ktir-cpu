@@ -31,6 +31,8 @@
 //! * `m.source` round-trip — the Rust `AffineMap`/`AffineSet` carry no `source`
 //!   field (no Rust analogue; Python-only).
 
+use std::rc::Rc;
+
 use ktir_cpu::affine::{eval_bound, sym_add, sym_max, sym_min, sym_neg};
 use ktir_cpu::affine::{AffineExpr, Bound, ConstraintKind};
 use ktir_cpu::parser_ast::{parse_affine_map, parse_affine_set, parse_expr};
@@ -46,10 +48,10 @@ fn cst(c: i64) -> AffineExpr {
     AffineExpr::Const(c)
 }
 fn add(a: AffineExpr, b: AffineExpr) -> AffineExpr {
-    AffineExpr::Add(Box::new(a), Box::new(b))
+    AffineExpr::Add(Rc::new(a), Rc::new(b))
 }
 fn mul(a: AffineExpr, b: AffineExpr) -> AffineExpr {
-    AffineExpr::Mul(Box::new(a), Box::new(b))
+    AffineExpr::Mul(Rc::new(a), Rc::new(b))
 }
 // The Rust parser normalises unary minus to `-1 * x` and binary subtraction to
 // `a + (-1 * b)` rather than building `Neg` / `Sub` nodes (the Python tuple AST
@@ -738,7 +740,7 @@ fn zero_dim_affine_map_multi_output() {
 // ===========================================================================
 
 fn bsym(i: usize) -> Bound {
-    Bound::Symbolic(Box::new(sym(i)))
+    Bound::Symbolic(Rc::new(sym(i)))
 }
 fn bcst(c: i64) -> Bound {
     Bound::Concrete(c)
@@ -761,7 +763,7 @@ fn mvp_simplifications() {
     // double negation collapses: -(-s0) -> s0. The collapse in `sym_neg` fires
     // on an actual `Neg` node (Python's `("neg", s0)`), so build that directly
     // rather than via the `-1 * x` normalising helper.
-    let neg_s0 = Bound::Symbolic(Box::new(AffineExpr::Neg(Box::new(sym(0)))));
+    let neg_s0 = Bound::Symbolic(Rc::new(AffineExpr::Neg(Rc::new(sym(0)))));
     assert_eq!(sym_neg(&neg_s0), s0);
     // max/min idempotent on same SymRef (compare-by-value)
     assert_eq!(sym_max(&s0, &bsym(0)), s0);
@@ -775,15 +777,15 @@ fn int_operand_wrapped_as_const_node() {
     let s0 = bsym(0);
     assert_eq!(
         sym_add(&bcst(5), &s0),
-        Bound::Symbolic(Box::new(add(cst(5), sym(0))))
+        Bound::Symbolic(Rc::new(add(cst(5), sym(0))))
     );
     assert_eq!(
         sym_max(&bcst(0), &s0),
-        Bound::Symbolic(Box::new(AffineExpr::Max(Box::new(cst(0)), Box::new(sym(0)))))
+        Bound::Symbolic(Rc::new(AffineExpr::Max(Rc::new(cst(0)), Rc::new(sym(0)))))
     );
     assert_eq!(
         sym_min(&s0, &bcst(10)),
-        Bound::Symbolic(Box::new(AffineExpr::Min(Box::new(sym(0)), Box::new(cst(10)))))
+        Bound::Symbolic(Rc::new(AffineExpr::Min(Rc::new(sym(0)), Rc::new(cst(10)))))
     );
 }
 

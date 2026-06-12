@@ -24,6 +24,7 @@
 //! `lhs - rhs` / `rhs - lhs`; `lhs == rhs` becomes `expr == 0`
 //! ([`ConstraintKind::Equal`]) over `lhs - rhs`.
 
+use std::rc::Rc;
 use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
 
 // ---------------------------------------------------------------------------
@@ -213,9 +214,9 @@ impl Parser {
             let op = self.consume(None)?;
             let right = self.term()?;
             left = if op == "+" {
-                AffineExpr::Add(Box::new(left), Box::new(right))
+                AffineExpr::Add(Rc::new(left), Rc::new(right))
             } else {
-                AffineExpr::Add(Box::new(left), Box::new(neg(right)))
+                AffineExpr::Add(Rc::new(left), Rc::new(neg(right)))
             };
         }
         Ok(left)
@@ -242,8 +243,8 @@ impl Parser {
                     self.consume(Some("*"))?;
                     let operand = self.atom()?;
                     return Ok(AffineExpr::Mul(
-                        Box::new(AffineExpr::Const(num)),
-                        Box::new(operand),
+                        Rc::new(AffineExpr::Const(num)),
+                        Rc::new(operand),
                     ));
                 }
                 return Ok(AffineExpr::Const(num));
@@ -261,8 +262,8 @@ impl Parser {
                         .parse()
                         .map_err(|_| "bad integer coefficient".to_string())?;
                     Ok(AffineExpr::Mul(
-                        Box::new(AffineExpr::Const(num)),
-                        Box::new(node),
+                        Rc::new(AffineExpr::Const(num)),
+                        Rc::new(node),
                     ))
                 }
                 other => Err(format!(
@@ -395,12 +396,12 @@ impl Parser {
 
 /// `-a` as `Mul(Const(-1), a)`.
 fn neg(a: AffineExpr) -> AffineExpr {
-    AffineExpr::Mul(Box::new(AffineExpr::Const(-1)), Box::new(a))
+    AffineExpr::Mul(Rc::new(AffineExpr::Const(-1)), Rc::new(a))
 }
 
 /// `a - b` as `Add(a, Mul(Const(-1), b))`.
 fn sub(a: AffineExpr, b: AffineExpr) -> AffineExpr {
-    AffineExpr::Add(Box::new(a), Box::new(neg(b)))
+    AffineExpr::Add(Rc::new(a), Rc::new(neg(b)))
 }
 
 /// Linear lookup in a name->index assoc list (lists are tiny — at most a handful

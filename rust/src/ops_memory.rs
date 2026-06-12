@@ -1109,6 +1109,7 @@ fn widen_f16(h: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
     use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
@@ -1467,11 +1468,11 @@ mod tests {
         let mut constraints = Vec::new();
         for i in 0..lo.len() {
             constraints.push(Constraint {
-                expr: AffineExpr::Sub(Box::new(AffineExpr::Dim(i)), Box::new(AffineExpr::Const(lo[i]))),
+                expr: AffineExpr::Sub(Rc::new(AffineExpr::Dim(i)), Rc::new(AffineExpr::Const(lo[i]))),
                 kind: ConstraintKind::GreaterEq,
             });
             constraints.push(Constraint {
-                expr: AffineExpr::Sub(Box::new(AffineExpr::Const(hi[i])), Box::new(AffineExpr::Dim(i))),
+                expr: AffineExpr::Sub(Rc::new(AffineExpr::Const(hi[i])), Rc::new(AffineExpr::Dim(i))),
                 kind: ConstraintKind::GreaterEq,
             });
         }
@@ -1491,7 +1492,7 @@ mod tests {
             num_dims: 2,
             num_syms: 0,
             constraints: vec![Constraint {
-                expr: AffineExpr::Add(Box::new(AffineExpr::Dim(0)), Box::new(AffineExpr::Dim(1))),
+                expr: AffineExpr::Add(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Dim(1))),
                 kind: ConstraintKind::GreaterEq,
             }],
         };
@@ -1803,8 +1804,8 @@ mod tests {
             num_dims: 1,
             num_syms: 0,
             exprs: vec![AffineExpr::Mul(
-                Box::new(AffineExpr::Const(2)),
-                Box::new(AffineExpr::Dim(0)),
+                Rc::new(AffineExpr::Const(2)),
+                Rc::new(AffineExpr::Dim(0)),
             )],
         };
         let iat = IndirectAccessTile {

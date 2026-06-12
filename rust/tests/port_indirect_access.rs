@@ -45,6 +45,7 @@
 //!   and never binds an outer SSA scalar as a variable, so that guard does not
 //!   exist in the crate. Both cases are `#[ignore]`d with that reason.
 
+use std::rc::Rc;
 use std::collections::HashMap;
 
 use ktir_cpu::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
@@ -73,8 +74,8 @@ fn box_set(sizes: &[i64]) -> AffineSet {
         });
         constraints.push(Constraint {
             expr: AffineExpr::Sub(
-                Box::new(AffineExpr::Const(n - 1)),
-                Box::new(AffineExpr::Dim(i)),
+                Rc::new(AffineExpr::Const(n - 1)),
+                Rc::new(AffineExpr::Dim(i)),
             ),
             kind: ConstraintKind::GreaterEq,
         });

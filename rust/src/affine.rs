@@ -24,9 +24,11 @@
 //! `sym_min`) mirror `parser_ast.py` 1:1, including its minimal constant
 //! folding (concrete-on-concrete, additive identity, idempotent `sym`).
 
+use std::rc::Rc;
+
 /// Recursive affine-expression AST: `Dim`, `Sym`, `Const`, and the operators
 /// MLIR affine exprs support plus the `Max`/`Min`/`Neg`/`Sub`/`Ref` shapes the
-/// symbolic-bound layer constructs. Box-recursive — the standard shape.
+/// symbolic-bound layer constructs. `Rc`-recursive so clones are cheap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AffineExpr {
     Dim(usize),
@@ -35,14 +37,18 @@ pub enum AffineExpr {
     /// A named, domain-specific reference atom (`"ref"` in the Python AST).
     /// Never linearizable — its presence forces the constraint slow path.
     Ref(String),
-    Add(Box<AffineExpr>, Box<AffineExpr>),
-    Sub(Box<AffineExpr>, Box<AffineExpr>),
-    Neg(Box<AffineExpr>),
-    Mul(Box<AffineExpr>, Box<AffineExpr>),
-    FloorDiv(Box<AffineExpr>, Box<AffineExpr>),
-    Mod(Box<AffineExpr>, Box<AffineExpr>),
-    Max(Box<AffineExpr>, Box<AffineExpr>),
-    Min(Box<AffineExpr>, Box<AffineExpr>),
+    // Children are `Rc`, not `Box`: the affine tree is immutable after parsing,
+    // so cloning a whole expression (done per access-tile construction, per
+    // K-tile per node in the kernels) is a refcount bump instead of a deep
+    // Box-tree copy — killing the `AffineExpr` clone/drop the flamegraph flagged.
+    Add(Rc<AffineExpr>, Rc<AffineExpr>),
+    Sub(Rc<AffineExpr>, Rc<AffineExpr>),
+    Neg(Rc<AffineExpr>),
+    Mul(Rc<AffineExpr>, Rc<AffineExpr>),
+    FloorDiv(Rc<AffineExpr>, Rc<AffineExpr>),
+    Mod(Rc<AffineExpr>, Rc<AffineExpr>),
+    Max(Rc<AffineExpr>, Rc<AffineExpr>),
+    Min(Rc<AffineExpr>, Rc<AffineExpr>),
 }
 
 impl AffineExpr {
@@ -191,7 +197,7 @@ impl BoxSet {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Bound {
     Concrete(i64),
-    Symbolic(Box<AffineExpr>),
+    Symbolic(Rc<AffineExpr>),
 }
 
 impl Bound {
@@ -213,7 +219,7 @@ impl From<AffineExpr> for Bound {
         // paths keep working — mirrors `("const", k)` never appearing alone.
         match e {
             AffineExpr::Const(c) => Bound::Concrete(c),
-            other => Bound::Symbolic(Box::new(other)),
+            other => Bound::Symbolic(Rc::new(other)),
         }
     }
 }
@@ -236,9 +242,9 @@ pub fn sym_add(a: &Bound, b: &Bound) -> Bound {
         (Bound::Concrete(x), Bound::Concrete(y)) => Bound::Concrete(x + y),
         (Bound::Concrete(0), _) => b.clone(),
         (_, Bound::Concrete(0)) => a.clone(),
-        _ => Bound::Symbolic(Box::new(AffineExpr::Add(
-            Box::new(bound_to_node(a)),
-            Box::new(bound_to_node(b)),
+        _ => Bound::Symbolic(Rc::new(AffineExpr::Add(
+            Rc::new(bound_to_node(a)),
+            Rc::new(bound_to_node(b)),
         ))),
     }
 }
@@ -250,7 +256,7 @@ pub fn sym_neg(a: &Bound) -> Bound {
         Bound::Concrete(c) => Bound::Concrete(-c),
         Bound::Symbolic(node) => match node.as_ref() {
             AffineExpr::Neg(inner) => Bound::from((**inner).clone()),
-            other => Bound::Symbolic(Box::new(AffineExpr::Neg(Box::new(other.clone())))),
+            other => Bound::Symbolic(Rc::new(AffineExpr::Neg(Rc::new(other.clone())))),
         },
     }
 }
@@ -278,14 +284,14 @@ fn sym_minmax(a: &Bound, b: &Bound, is_max: bool) -> Bound {
             && i == j {
                 return a.clone();
             }
-    let an = Box::new(bound_to_node(a));
-    let bn = Box::new(bound_to_node(b));
+    let an = Rc::new(bound_to_node(a));
+    let bn = Rc::new(bound_to_node(b));
     let node = if is_max {
         AffineExpr::Max(an, bn)
     } else {
         AffineExpr::Min(an, bn)
     };
-    Bound::Symbolic(Box::new(node))
+    Bound::Symbolic(Rc::new(node))
 }
 
 /// Lift a [`Bound`] to an [`AffineExpr`] node (wraps concrete ints in `Const`),
@@ -738,14 +744,14 @@ fn build_sym_term(sym_coeffs: &[i64], const_: i64) -> Bound {
         }
         let sym = AffineExpr::Sym(j);
         let term: Bound = if c == -1 {
-            sym_neg(&Bound::Symbolic(Box::new(sym)))
+            sym_neg(&Bound::Symbolic(Rc::new(sym)))
         } else if c != 1 {
-            Bound::Symbolic(Box::new(AffineExpr::Mul(
-                Box::new(AffineExpr::Const(c)),
-                Box::new(sym),
+            Bound::Symbolic(Rc::new(AffineExpr::Mul(
+                Rc::new(AffineExpr::Const(c)),
+                Rc::new(sym),
             )))
         } else {
-            Bound::Symbolic(Box::new(sym))
+            Bound::Symbolic(Rc::new(sym))
         };
         expr = sym_add(&expr, &term);
     }
@@ -908,16 +914,16 @@ mod tests {
         AffineExpr::Const(c)
     }
     fn add(a: AffineExpr, b: AffineExpr) -> AffineExpr {
-        AffineExpr::Add(Box::new(a), Box::new(b))
+        AffineExpr::Add(Rc::new(a), Rc::new(b))
     }
     fn sub(a: AffineExpr, b: AffineExpr) -> AffineExpr {
-        AffineExpr::Sub(Box::new(a), Box::new(b))
+        AffineExpr::Sub(Rc::new(a), Rc::new(b))
     }
     fn neg(a: AffineExpr) -> AffineExpr {
-        AffineExpr::Neg(Box::new(a))
+        AffineExpr::Neg(Rc::new(a))
     }
     fn mul(c: i64, a: AffineExpr) -> AffineExpr {
-        AffineExpr::Mul(Box::new(cst(c)), Box::new(a))
+        AffineExpr::Mul(Rc::new(cst(c)), Rc::new(a))
     }
 
     #[test]
@@ -928,12 +934,12 @@ mod tests {
             num_syms: 1,
             exprs: vec![
                 AffineExpr::Add(
-                    Box::new(AffineExpr::Dim(0)),
-                    Box::new(AffineExpr::Sym(0)),
+                    Rc::new(AffineExpr::Dim(0)),
+                    Rc::new(AffineExpr::Sym(0)),
                 ),
                 AffineExpr::Mul(
-                    Box::new(AffineExpr::Dim(1)),
-                    Box::new(AffineExpr::Const(2)),
+                    Rc::new(AffineExpr::Dim(1)),
+                    Rc::new(AffineExpr::Const(2)),
                 ),
             ],
         };
@@ -944,10 +950,10 @@ mod tests {
     #[test]
     fn euclidean_floordiv_and_mod() {
         let fd = AffineExpr::FloorDiv(
-            Box::new(AffineExpr::Dim(0)),
-            Box::new(AffineExpr::Const(4)),
+            Rc::new(AffineExpr::Dim(0)),
+            Rc::new(AffineExpr::Const(4)),
         );
-        let m = AffineExpr::Mod(Box::new(AffineExpr::Dim(0)), Box::new(AffineExpr::Const(4)));
+        let m = AffineExpr::Mod(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Const(4)));
         // -1 floordiv 4 == -1, -1 mod 4 == 3 (matches MLIR / Python semantics)
         assert_eq!(fd.eval(&[-1], &[]), -1);
         assert_eq!(m.eval(&[-1], &[]), 3);
@@ -960,8 +966,8 @@ mod tests {
         // -d0
         assert_eq!(neg(dim(0)).eval(&[5], &[]), -5);
         // max(d0, d1), min(d0, d1)
-        let mx = AffineExpr::Max(Box::new(dim(0)), Box::new(dim(1)));
-        let mn = AffineExpr::Min(Box::new(dim(0)), Box::new(dim(1)));
+        let mx = AffineExpr::Max(Rc::new(dim(0)), Rc::new(dim(1)));
+        let mn = AffineExpr::Min(Rc::new(dim(0)), Rc::new(dim(1)));
         assert_eq!(mx.eval(&[3, 8], &[]), 8);
         assert_eq!(mn.eval(&[3, 8], &[]), 3);
     }
@@ -992,10 +998,10 @@ mod tests {
                 },
                 Constraint {
                     expr: AffineExpr::Add(
-                        Box::new(AffineExpr::Const(7)),
-                        Box::new(AffineExpr::Mul(
-                            Box::new(AffineExpr::Const(-1)),
-                            Box::new(AffineExpr::Dim(0)),
+                        Rc::new(AffineExpr::Const(7)),
+                        Rc::new(AffineExpr::Mul(
+                            Rc::new(AffineExpr::Const(-1)),
+                            Rc::new(AffineExpr::Dim(0)),
                         )),
                     ),
                     kind: ConstraintKind::GreaterEq,
@@ -1183,8 +1189,8 @@ mod tests {
     #[test]
     fn symbox_symbolic_specialize() {
         // lo = [s0], hi = [s0 + 2]  — a width-2 window starting at s0.
-        let lo = Bound::Symbolic(Box::new(sym(0)));
-        let hi = sym_add(&Bound::Symbolic(Box::new(sym(0))), &Bound::Concrete(2));
+        let lo = Bound::Symbolic(Rc::new(sym(0)));
+        let hi = sym_add(&Bound::Symbolic(Rc::new(sym(0))), &Bound::Concrete(2));
         let b = SymBoxSet::new(vec![lo], vec![hi]);
         assert!(!b.is_concrete());
         // contains uses symbols to resolve bounds.
@@ -1210,11 +1216,11 @@ mod tests {
         );
         // additive identity
         assert_eq!(
-            sym_add(&Bound::Concrete(0), &Bound::Symbolic(Box::new(sym(0)))),
-            Bound::Symbolic(Box::new(sym(0)))
+            sym_add(&Bound::Concrete(0), &Bound::Symbolic(Rc::new(sym(0)))),
+            Bound::Symbolic(Rc::new(sym(0)))
         );
         // double-negation collapse
-        let s = Bound::Symbolic(Box::new(sym(1)));
+        let s = Bound::Symbolic(Rc::new(sym(1)));
         assert_eq!(sym_neg(&sym_neg(&s)), s);
         // concrete min/max fold
         assert_eq!(
@@ -1226,7 +1232,7 @@ mod tests {
             Bound::Concrete(2)
         );
         // idempotent on identical symbol refs
-        let sk = Bound::Symbolic(Box::new(sym(3)));
+        let sk = Bound::Symbolic(Rc::new(sym(3)));
         assert_eq!(sym_max(&sk, &sk), sk);
     }
 

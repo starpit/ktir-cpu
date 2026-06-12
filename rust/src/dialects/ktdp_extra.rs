@@ -332,6 +332,7 @@ fn scalar_i64(v: &Value, ctx: &str) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
     use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
@@ -356,15 +357,15 @@ mod tests {
         for i in 0..lo.len() {
             constraints.push(Constraint {
                 expr: AffineExpr::Sub(
-                    Box::new(AffineExpr::Dim(i)),
-                    Box::new(AffineExpr::Const(lo[i])),
+                    Rc::new(AffineExpr::Dim(i)),
+                    Rc::new(AffineExpr::Const(lo[i])),
                 ),
                 kind: ConstraintKind::GreaterEq,
             });
             constraints.push(Constraint {
                 expr: AffineExpr::Sub(
-                    Box::new(AffineExpr::Const(hi[i])),
-                    Box::new(AffineExpr::Dim(i)),
+                    Rc::new(AffineExpr::Const(hi[i])),
+                    Rc::new(AffineExpr::Dim(i)),
                 ),
                 kind: ConstraintKind::GreaterEq,
             });

@@ -48,6 +48,7 @@
 //!   here drives the slow path with non-axis-aligned (diagonal-masked) partition
 //!   sets so `lower_to_box` returns `None`, and asserts `CoordinateSet::Points`.
 
+use std::rc::Rc;
 use ktir_cpu::affine::{AffineExpr, AffineMap, AffineSet, BoxSet, Constraint, ConstraintKind};
 use ktir_cpu::codec;
 use ktir_cpu::context::CoreContext;
@@ -73,15 +74,15 @@ fn box_affine(lo: &[i64], hi: &[i64]) -> AffineSet {
     for i in 0..lo.len() {
         constraints.push(Constraint {
             expr: AffineExpr::Sub(
-                Box::new(AffineExpr::Dim(i)),
-                Box::new(AffineExpr::Const(lo[i])),
+                Rc::new(AffineExpr::Dim(i)),
+                Rc::new(AffineExpr::Const(lo[i])),
             ),
             kind: ConstraintKind::GreaterEq,
         });
         constraints.push(Constraint {
             expr: AffineExpr::Sub(
-                Box::new(AffineExpr::Const(hi[i])),
-                Box::new(AffineExpr::Dim(i)),
+                Rc::new(AffineExpr::Const(hi[i])),
+                Rc::new(AffineExpr::Dim(i)),
             ),
             kind: ConstraintKind::GreaterEq,
         });
@@ -517,7 +518,7 @@ fn build_partitions(diagonal_mask: bool) -> DistributedMemRef {
             // d0 + d1 >= 0 — always true for non-negative coords, but not
             // axis-aligned, so SymBoxSet::try_from_affine_set / lower_to_box bails.
             set.constraints.push(Constraint {
-                expr: AffineExpr::Add(Box::new(AffineExpr::Dim(0)), Box::new(AffineExpr::Dim(1))),
+                expr: AffineExpr::Add(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Dim(1))),
                 kind: ConstraintKind::GreaterEq,
             });
         }
