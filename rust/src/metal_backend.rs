@@ -631,11 +631,14 @@ const NAX_MATMUL_SRC: &str = "\
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 
-constant constexpr uint BK   = 16;
-constant constexpr uint TG_M = 64;    // threadgroup block rows  (2 simdgroups x 32)
-constant constexpr uint TG_N = 128;   // threadgroup block cols  (2 simdgroups x 64)
-constant constexpr uint SG_M = 32;    // simdgroup sub-block rows
-constant constexpr uint SG_N = 64;    // simdgroup sub-block cols
+constant constexpr uint BK     = 16;
+constant constexpr uint SG_M   = 32;    // simdgroup sub-block rows (2 tiles of 16)
+constant constexpr uint SG_N   = 64;    // simdgroup sub-block cols (2 tiles of 32)
+constant constexpr uint SGS_M  = 4;     // simdgroup rows per threadgroup
+constant constexpr uint SGS_N  = 4;     // simdgroup cols per threadgroup
+constant constexpr uint TG_M   = SG_M * SGS_M;   // threadgroup block rows  = 128
+constant constexpr uint TG_N   = SG_N * SGS_N;   // threadgroup block cols  = 256
+constant constexpr uint TG_THREADS = SGS_M * SGS_N * 32;   // = 512
 
 [[kernel]] void nax_matmul(
     device const float* a_in [[buffer(0)]],   // M x K row-major
@@ -649,11 +652,11 @@ constant constexpr uint SG_N = 64;    // simdgroup sub-block cols
     const uint M = dims.x, N = dims.y, K = dims.z;
     const uint tm0 = tg.y * TG_M;          // threadgroup block base row
     const uint tn0 = tg.x * TG_N;          // threadgroup block base column
-    const uint sm  = sgid / 2u;            // simdgroup's row slot (0,1)
-    const uint sn  = sgid % 2u;            // simdgroup's col slot (0,1)
+    const uint sm  = sgid / SGS_N;         // simdgroup's row slot
+    const uint sn  = sgid % SGS_N;         // simdgroup's col slot
     const uint m0  = tm0 + sm * SG_M;      // this simdgroup's base row
     const uint n0  = tn0 + sn * SG_N;      // this simdgroup's base column
-    const uint tid = sgid * 32u + lid;     // flat thread id in threadgroup (0..127)
+    const uint tid = sgid * 32u + lid;     // flat thread id in threadgroup
 
     threadgroup bfloat a_tg[TG_M * BK];    // [TG_M, K-step] staging
     threadgroup bfloat b_tg[TG_N * BK];    // [TG_N, K-step] = transpose(B) staging
@@ -683,13 +686,13 @@ constant constexpr uint SG_N = 64;    // simdgroup sub-block cols
     }
 
     for (uint k0 = 0; k0 < K; k0 += BK) {
-        // All 128 threads cooperatively stage the threadgroup panels.
-        for (uint i = tid; i < TG_M * BK; i += 128u) {
+        // All threads in the threadgroup cooperatively stage the shared panels.
+        for (uint i = tid; i < TG_M * BK; i += TG_THREADS) {
             uint r = i / BK, c = i % BK;              // r: M (in block), c: K
             uint gm = tm0 + r, gk = k0 + c;
             a_tg[i] = (gm < M && gk < K) ? bfloat(a_in[gm * K + gk]) : bfloat(0);
         }
-        for (uint i = tid; i < TG_N * BK; i += 128u) {
+        for (uint i = tid; i < TG_N * BK; i += TG_THREADS) {
             uint n = i / BK, c = i % BK;              // n: N (in block), c: K
             uint gn = tn0 + n, gk = k0 + c;
             b_tg[i] = (gn < N && gk < K) ? bfloat(b_in[gk * N + gn]) : bfloat(0);
@@ -697,8 +700,8 @@ constant constexpr uint SG_N = 64;    // simdgroup sub-block cols
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // This simdgroup's sub-panel base within the shared staging.
-        uint ar = sm * SG_M;     // row offset into a_tg (0 or 32)
-        uint bn = sn * SG_N;     // col offset into b_tg (0 or 64)
+        uint ar = sm * SG_M;     // row offset into a_tg
+        uint bn = sn * SG_N;     // col offset into b_tg
         for (short e = 0; e < 8; ++e) {
             short r = fm + (e >> 2) * 8;
             short c = fn + (e % 4);
@@ -834,11 +837,11 @@ impl NaxGemm {
             enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
         }
         // One threadgroup (4 simdgroups, 128 threads) per 64×128 output block.
-        let m_blocks = m.div_ceil(64);
-        let n_blocks = n.div_ceil(128);
+        let m_blocks = m.div_ceil(128);
+        let n_blocks = n.div_ceil(256);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
-            MTLSize { width: 128, height: 1, depth: 1 },
+            MTLSize { width: 512, height: 1, depth: 1 },
         );
         enc.endEncoding();
         cb.commit();
@@ -897,8 +900,8 @@ impl NaxGemm {
                 )
                 .ok_or("alloc")?
         };
-        let m_blocks = m.div_ceil(64);
-        let n_blocks = n.div_ceil(128);
+        let m_blocks = m.div_ceil(128);
+        let n_blocks = n.div_ceil(256);
 
         let cb = self.queue.commandBuffer().ok_or("cb")?;
         for _ in 0..iters {
@@ -912,7 +915,7 @@ impl NaxGemm {
             }
             enc.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
-                MTLSize { width: 128, height: 1, depth: 1 },
+                MTLSize { width: 512, height: 1, depth: 1 },
             );
             enc.endEncoding();
         }
@@ -1084,6 +1087,18 @@ kernel void mpp_probe(
     /// Real benchmark: NAX vs naive vs the linked BLAS (Accelerate on macOS) on
     /// a sizeable GEMM. Prints GFLOP/s for each so the speedup is concrete.
     /// `--ignored` because it's a perf measurement, not a correctness gate.
+    ///
+    /// Observed on an M5 (numbers vary with thermals):
+    ///
+    /// - GPU-only kernel throughput climbs with size and plateaus ~4 TFLOP/s at
+    ///   2048³+ (where #threadgroups finally fills the cores); at 1024³ it is
+    ///   occupancy-bound (~32 threadgroups) and small sizes are far worse.
+    /// - At its plateau the kernel is ~2× Apple Accelerate (AMX, ~2 TFLOP/s).
+    /// - Per-call wall-clock is dominated by buffer alloc + host/device copy +
+    ///   readback; `gpu_time_seconds` isolates the kernel from that overhead.
+    ///
+    /// The remaining gap to NAX's true peak is the per-K-step staging+barrier
+    /// tax — a double-buffered kernel (overlap load with compute) is the next win.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
     fn bench_nax_vs_blas() {
@@ -1094,8 +1109,26 @@ kernel void mpp_probe(
                 return;
             }
         };
-        let (m, k, n) = (1024usize, 1024usize, 1024usize);
         let prng = |i: usize| (i.wrapping_mul(2654435761) % 1000) as f32 / 1000.0;
+
+        // GPU-only throughput sweep across sizes: diagnoses whether the kernel
+        // is occupancy-bound (climbs as #threadgroups grows) or compute-bound
+        // (plateaus). #threadgroups = ceil(s/128) * ceil(s/256).
+        eprintln!("-- GPU-only throughput sweep (kernel time only) --");
+        for &s in &[256usize, 512, 1024, 2048, 4096] {
+            let a: Vec<f32> = (0..s * s).map(prng).collect();
+            let b: Vec<f32> = (0..s * s).map(|i| prng(i + 3)).collect();
+            let iters = if s <= 1024 { 50 } else { 10 };
+            let g = ctx.gpu_time_seconds(s, s, s, &a, &b, iters).unwrap() / iters as f64;
+            let tgs = s.div_ceil(128) * s.div_ceil(256);
+            eprintln!(
+                "  {s:>4}^3: {:7.3} ms   {:7.1} GFLOP/s   ({tgs} threadgroups)",
+                g * 1e3,
+                2.0 * (s as f64).powi(3) / g / 1e9
+            );
+        }
+
+        let (m, k, n) = (1024usize, 1024usize, 1024usize);
         let a: Vec<f32> = (0..m * k).map(prng).collect();
         let b: Vec<f32> = (0..k * n).map(|i| prng(i + 3)).collect();
         let flops = 2.0 * m as f64 * k as f64 * n as f64;
