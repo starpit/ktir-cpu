@@ -1091,66 +1091,15 @@ fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
 // f16 <-> f32 (round-to-nearest-even; mirrors arith.rs narrow_f16/widen_f16)
 // ===========================================================================
 
-/// Standard f32 -> f16 conversion (round-to-nearest-even), returning the f16
-/// bit pattern. No `half` dependency.
+// These were standalone bit-manipulation duplicates of the codec's f16 round
+// trip (the consolidation the codec module flagged as a follow-up). They now
+// delegate to `codec`, so `decode` gets codec's 64K f16→f32 lookup table — the
+// hot path of every `ktdp.load` — and there is a single f16 implementation.
 fn narrow_f16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mant = bits & 0x007f_ffff;
-    if x.is_nan() {
-        return sign | 0x7e00;
-    }
-    if exp <= 0 {
-        if exp < -10 {
-            return sign;
-        }
-        let mant_with_implicit = mant | 0x0080_0000;
-        let shift = (14 - exp) as u32;
-        let mut half_mant = mant_with_implicit >> shift;
-        if shift >= 1 && (mant_with_implicit >> (shift - 1)) & 1 == 1 {
-            half_mant += 1;
-        }
-        sign | half_mant as u16
-    } else if exp >= 0x1f {
-        sign | 0x7c00
-    } else {
-        let mut half = sign | ((exp as u16) << 10) | (mant >> 13) as u16;
-        let round_bit = mant & 0x0000_1000;
-        let sticky = mant & 0x0000_0fff;
-        if round_bit != 0 && (sticky != 0 || (half & 1) == 1) {
-            half += 1;
-        }
-        half
-    }
+    crate::codec::f32_to_f16_bits(x)
 }
-
-/// Convert an f16 bit pattern back to f32.
 fn widen_f16(h: u16) -> f32 {
-    let sign = ((h & 0x8000) as u32) << 16;
-    let exp = ((h >> 10) & 0x1f) as u32;
-    let mant = (h & 0x03ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign
-        } else {
-            let mut e = -1i32;
-            let mut m = mant;
-            while m & 0x0400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x03ff;
-            let f32_exp = (e + 127 - 15 + 1) as u32;
-            sign | (f32_exp << 23) | (m << 13)
-        }
-    } else if exp == 0x1f {
-        sign | 0x7f80_0000 | (mant << 13)
-    } else {
-        let f32_exp = exp + 127 - 15;
-        sign | (f32_exp << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
+    crate::codec::f16_bits_to_f32(h)
 }
 
 // ===========================================================================
