@@ -27,6 +27,12 @@ pub struct CoreContext {
     all_lx: Vec<Rc<RefCell<LXScratchpad>>>,
     /// Region-scoped SSA map; index 0 is the function body. Inner scopes shadow.
     scope_stack: Vec<FxHashMap<String, Value>>,
+    /// Recycled scope maps. `pop_scope` clears and returns its map here so the
+    /// next `push_scope` reuses the bucket allocation instead of allocating (and
+    /// re-growing) a fresh map on every region entry — hot in scf.for bodies,
+    /// where each iteration pushes and pops a scope. Depth-bounded (grows only to
+    /// the max concurrent region nesting), so it never accumulates.
+    scope_pool: Vec<FxHashMap<String, Value>>,
     /// SSA name -> LX bytes; single source of truth for `lx.used`.
     lx_bytes: FxHashMap<String, i64>,
     /// Bump-allocator watermarks; `len == scope_stack.len() - 1`.
@@ -52,6 +58,7 @@ impl CoreContext {
             lx,
             all_lx,
             scope_stack: vec![FxHashMap::default()],
+            scope_pool: Vec::new(),
             lx_bytes: FxHashMap::default(),
             lx_next_ptr_stack: Vec::new(),
             outbox: Vec::new(),
@@ -108,19 +115,26 @@ impl CoreContext {
     /// Enter a region: snapshot the LX watermark, push a fresh scope.
     pub fn push_scope(&mut self) {
         self.lx_next_ptr_stack.push(self.lx.borrow().next_ptr);
-        self.scope_stack.push(FxHashMap::default());
+        // Reuse a recycled (already-cleared) map if one is pooled; its bucket
+        // allocation survives, so body inserts don't re-grow from empty.
+        let scope = self.scope_pool.pop().unwrap_or_default();
+        self.scope_stack.push(scope);
     }
 
     /// Exit the current region: untrack its values, rewind LX to the watermark.
     /// Panics if called on the function-body scope. Mirrors `pop_scope`.
     pub fn pop_scope(&mut self) {
         assert!(self.scope_stack.len() > 1, "cannot pop function-body scope");
-        let scope = self.scope_stack.pop().unwrap();
+        let mut scope = self.scope_stack.pop().unwrap();
         for name in scope.keys() {
             self.untrack_lx(name);
         }
         let watermark = self.lx_next_ptr_stack.pop().unwrap();
         self.lx.borrow_mut().next_ptr = watermark;
+        // Recycle the map (clear drops its entries but keeps capacity) so the
+        // next push_scope reuses it instead of allocating a fresh one.
+        scope.clear();
+        self.scope_pool.push(scope);
     }
 
     /// Record an SSA value occupying `size_bytes` in LX. Mirrors `track_lx`;
