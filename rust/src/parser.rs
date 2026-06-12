@@ -38,6 +38,7 @@ use crate::parser_ast::{is_full_set, is_identity_map, parse_affine_map, parse_af
 /// Parse a full module's MLIR text into an [`IRModule`]. Mirrors `parse_module`.
 pub fn parse_module(text: &str) -> Result<IRModule, String> {
     let text = strip_comments(text);
+    let text = expand_attr_aliases(&text);
     let mut module = IRModule::default();
     for (name, args, grid, body) in find_functions(&text)? {
         let operations = parse_operations(&body)?;
@@ -50,6 +51,147 @@ pub fn parse_module(text: &str) -> Result<IRModule, String> {
         });
     }
     Ok(module)
+}
+
+/// Resolve module-level named attribute aliases. MLIR lets a module declare
+/// `#name = <value>` at top scope and then reference `#name` inside op
+/// attributes (e.g. `coordinate_set = #A_HBM_coord_set`). Port of the Python
+/// `KTIRParser` "module-level pre-scan" (`parser.py`): collect every
+/// `#name = keyword<...>` declaration and textually substitute each `#name`
+/// reference with its expansion. The declaration lines themselves are blanked
+/// (line structure preserved) so they are not re-parsed as ops.
+///
+/// Only `keyword<...>` values (`affine_set<...>` / `affine_map<...>` and the
+/// like) are expanded — these are the alias forms the dialect ops use; depth is
+/// tracked across `<`/`>` while skipping the `>=` / `->` operators that appear
+/// inside affine bodies (same walk as `named_attr_value`).
+fn expand_attr_aliases(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut blanked = text.to_string();
+
+    // Find `#name = keyword<...>` declarations. A declaration begins at a `#`
+    // whose token is followed (after whitespace) by `=` then a `keyword<`.
+    let mut i = 0;
+    while let Some(rel) = text[i..].find('#') {
+        let hash = i + rel;
+        // `#name` token: `#` then word chars / dots.
+        let name_end = hash
+            + 1
+            + text[hash + 1..]
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+                .unwrap_or(text.len() - hash - 1);
+        let name = &text[hash..name_end];
+        let after = text[name_end..].trim_start();
+        if name.len() > 1 && after.starts_with('=') {
+            // Candidate declaration. Extract the balanced `keyword<...>` value.
+            let val_region = &text[name_end..];
+            if let Some(value) = keyword_value(val_region) {
+                // Compute the absolute end of the declaration (after the value).
+                let val_off = val_region.find(&value).unwrap();
+                let decl_end = name_end + val_off + value.len();
+                aliases.push((name.to_string(), value.clone()));
+                // Blank the declaration span in `blanked` (preserve newlines).
+                blank_span(&mut blanked, hash, decl_end);
+                i = decl_end;
+                continue;
+            }
+        }
+        i = name_end;
+    }
+    let _ = bytes;
+
+    if aliases.is_empty() {
+        return blanked;
+    }
+    // Substitute references. Longest names first so a prefix alias never
+    // shadows a longer one. Only replace whole `#name` tokens (the char after
+    // the name must not continue the identifier).
+    aliases.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+    for (name, value) in &aliases {
+        blanked = replace_alias_token(&blanked, name, value);
+    }
+    blanked
+}
+
+/// Extract a leading `= keyword<...>` value from `text` (text starts at the
+/// alias name's end). Returns the `keyword<...>` substring, balancing `<`/`>`
+/// while skipping `>=` / `->`.
+fn keyword_value(text: &str) -> Option<String> {
+    let eq = text.find('=')?;
+    let rest = text[eq + 1..].trim_start();
+    let kw_lt = rest.find('<')?;
+    if !rest[..kw_lt]
+        .trim()
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = kw_lt;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        if bytes[i] == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Include the leading keyword by returning from rest start.
+                    return Some(rest[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Overwrite `[start, end)` of `s` with spaces, preserving newlines so line
+/// numbers (and the `strip_comments` line-count invariant) stay intact.
+fn blank_span(s: &mut String, start: usize, end: usize) {
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..start]);
+    for ch in s[start..end].chars() {
+        out.push(if ch == '\n' { '\n' } else { ' ' });
+    }
+    out.push_str(&s[end..]);
+    *s = out;
+}
+
+/// Replace every whole-token occurrence of `#name` in `text` with `value`.
+/// A match is a whole token when the following char does not continue the
+/// identifier (`[\w.]`).
+fn replace_alias_token(text: &str, name: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(rel) = text[i..].find(name) {
+        let pos = i + rel;
+        let after = pos + name.len();
+        let boundary = text[after..]
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_' || c == '.'))
+            .unwrap_or(true);
+        out.push_str(&text[i..pos]);
+        if boundary {
+            out.push_str(value);
+        } else {
+            out.push_str(name);
+        }
+        i = after;
+    }
+    out.push_str(&text[i..]);
+    out
 }
 
 // --- phase 1: structure --------------------------------------------------
@@ -492,7 +634,7 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         // Mirrors the `_result_shape`/`_result_dtype` population in
         // `_parse_general_operation`.
         if let Some(rt) = &result_type
-            && let Some((shape, dt)) = parse_tensor_type(rt)
+            && let Some((shape, dt)) = parse_tensor_type(rt).or_else(|| parse_memref_type(rt))
         {
             attributes.entry("shape".to_string()).or_insert(Attr::IntList(shape));
             attributes.entry("dtype".to_string()).or_insert(Attr::Str(dt));
@@ -822,6 +964,45 @@ pub fn parse_tensor_type(ty: &str) -> Option<(Vec<i64>, String)> {
     }
     // Requires at least one *static* dim. `tensor<f32>` (rank-0) and
     // `tensor<?xf16>` (all-dynamic) both yield None, matching the Python helper.
+    if shape.is_empty() {
+        return None;
+    }
+    // The element type is the leading run of alphanumerics (stops at `,`/`>`).
+    let dtype_end = s
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(s.len());
+    let dtype = &s[..dtype_end];
+    if dtype.is_empty() {
+        return None;
+    }
+    Some((shape, dtype.to_string()))
+}
+
+/// Parse a `memref<DxDx...xELT>` type into `(static_shape, dtype)`, or `None` if
+/// not a memref type. Mirrors `parse_tensor_type` but for the `memref<...>`
+/// prefix; the Python `KTIRParser` derives `shape`/`dtype` from a memref result
+/// type the same way (needed by `ktdp.construct_distributed_memory_view`, whose
+/// shape lives only in its `memref<192x64xf16>` result type).
+pub fn parse_memref_type(ty: &str) -> Option<(Vec<i64>, String)> {
+    let compact: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut s = compact.strip_prefix("memref<")?;
+    let mut shape = Vec::new();
+    loop {
+        if let Some(after) = s.strip_prefix('?') {
+            if let Some(rest) = after.strip_prefix('x') {
+                s = rest; // dynamic dim — drop from static shape
+                continue;
+            }
+            break;
+        }
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && s.as_bytes().get(digits) == Some(&b'x') {
+            shape.push(s[..digits].parse::<i64>().ok()?);
+            s = &s[digits + 1..];
+            continue;
+        }
+        break;
+    }
     if shape.is_empty() {
         return None;
     }

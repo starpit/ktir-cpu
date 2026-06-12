@@ -31,10 +31,16 @@
 //!   `distributed_tile_access` emits an **inclusive** `[lo, hi]` `BoxSet` for
 //!   each survivor's `C_i`, so the structural assertions translate
 //!   `BoxSet(lo, hi)` -> inclusive `lo..=hi-1`.
-//! * `test_distributed_view_copy_rfc` (RFC §C.3 example file) is `xfail` in
-//!   Python (per-core LX routing gap) and depends on an example `.mlir` file
-//!   loaded by path; it has no faithful crate analogue here and is left as an
-//!   `#[ignore]` stub (see `skipped`).
+//! * `test_distributed_view_copy_rfc` (RFC §C.3 example file) PASSES in Python
+//!   (it is not xfail — the per-core LX routing caveat in the .mlir comment does
+//!   not apply to this crate, which threads `lx_core_id` through `MemorySpace`
+//!   and routes distributed reads via `ctx.get_lx(Some(N))`). It is now a real,
+//!   passing port: parse `distributed-view-copy.mlir`, seed each partition
+//!   (HBM rows 0..95; LX core-0 rows 96..127 col-packed; LX core-1 rows 128..191
+//!   row-major), run the distributed gather/scatter, and assert the contiguous
+//!   output equals the f16 reference. Closing it surfaced two real parser gaps,
+//!   now fixed: module-level attribute aliases (`#name = affine_set<...>`) and
+//!   shape/dtype derivation from `memref<...>` result types.
 //! * The slow-path fixture test parses partition sets via `parse_affine_set_raw`
 //!   to *force* the AffineSet enumeration path and asserts the survivor stores a
 //!   `list` (Python type check).  The Rust survivor instead stores a
@@ -722,27 +728,153 @@ fn distributed_store_does_not_trample_outside_c_i_col_packed() {
 }
 
 // ===========================================================================
-// RFC §C.3 reference example — per-core LX routing.
+// RFC §C.3 reference example — per-core LX routing (port of
+// test_distributed_view_copy_rfc).
 //
-// CORRECTION: the Python test PASSES (not xfail — confirmed by running
-// tests/test_distributed_view.py::test_distributed_view_copy_rfc, 16 passed).
+// The Python test PASSES (confirmed: tests/test_distributed_view.py -k rfc).
 // It monkeypatches `_prepare_execution` to seed a 192×64 tensor split across
-// HBM + LX core 0 (col-packed strides) + LX core 1 (row-major) BEFORE running
+// HBM (rows 0..95, row-major), LX core 0 (rows 96..127, col-packed strides
+// [1,64]) and LX core 1 (rows 128..191, row-major) BEFORE running
 // distributed-view-copy.mlir, which copies the distributed A into contiguous
-// HBM B. Porting it needs a pre-execution memory-seed hook: public APIs to write
-// strided data into a specific core's LX and bump its next_ptr (the Python
-// `_write_strided` + `lx.next_ptr = …`), which the Rust crate does not yet
-// expose. So this is a REAL (un-ported) GAP, not a Python xfail — the
-// distributed-view machinery itself is exercised by `distributed_copy_all_cases`
-// at the ops layer, but the full RFC §C.3 kernel-level run is not yet covered.
+// HBM B (rows 0..191, byte/stick 24576).
+//
+// The Rust analogue of the `_prepare_execution` monkeypatch is to seed `mem`
+// directly and then drive execution with `comm_sched::execute_with_communication`
+// (which the crate exposes publicly), rather than going through
+// `execute_function` (which only marshals tensor args into HBM).
+//
+// HBM addressing parity: in BOTH Python and Rust, an HBM `base_ptr` constant
+// from the MLIR is a *stick* index (Python `HBMSimulator.read/write(stick, …)`
+// multiplies by STICK_BYTES internally; Rust `MemRef.byte_address()` =
+// base_ptr * STICK_BYTES). The Rust `HBMSimulator::{read,write}_bytes` take a
+// raw *byte* address, so the seed/read-back here scales the stick constants
+// (0, 24576) by STICK_BYTES. LX `base_ptr` is a byte address in both worlds.
+//
+// Per-core LX routing IS honoured in the Rust crate: the parser captures
+// `lx_core_id` from `#ktdp.spyre_memory_space<LX, core = N>`, the
+// construct_memory_view handler threads it into `MemorySpace::Lx { core_id }`,
+// and the distributed-load read path routes through `ctx.get_lx(Some(N))`,
+// which returns the *global* core-N scratchpad regardless of the executing
+// core. So the .mlir's "simulator does not yet honor core = N" caveat does not
+// apply to this Rust implementation.
 // ===========================================================================
 
 #[test]
-#[ignore = "REAL GAP (not xfail — Python passes): needs a pre-execution per-core \
-            LX strided-seed hook to port test_distributed_view_copy_rfc. The \
-            distributed-view ops are covered by distributed_copy_all_cases; the \
-            kernel-level RFC C.3 run awaits a public LX-seed API."]
 fn distributed_view_copy_rfc() {
-    // See the correction note above: Python passes via an LX-seed monkeypatch;
-    // the Rust execute_function has no memory-seed hook yet.
+    use ktir_cpu::dialects::Dispatch;
+    use ktir_cpu::env::GridExecutor;
+    use ktir_cpu::ir::Value;
+    use ktir_cpu::memory::SpyreMemoryHierarchy;
+
+    // Reference: arange(192*64) reshaped (192, 64). Python builds this as an
+    // np.float16 array, so the values are f16-ROUNDED (integers > 2048 are not
+    // all exactly representable in f16). Round here too — via an F16
+    // encode/decode round-trip — so the seed and the expected tensor agree on
+    // the same f16 values and the final comparison is f16-vs-f16, matching
+    // `np.testing.assert_array_equal(b, full_f16)`.
+    const ROWS: usize = 192;
+    const COLS: usize = 64;
+    let full: Vec<Vec<f32>> = (0..ROWS)
+        .map(|r| {
+            let row: Vec<f32> = (0..COLS).map(|c| (r * COLS + c) as f32).collect();
+            codec::decode(&codec::encode(&row, DType::F16), COLS, DType::F16)
+        })
+        .collect();
+
+    // Parse the RFC example module.
+    let text = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/rfc/distributed-view-copy.mlir"),
+    )
+    .expect("read distributed-view-copy.mlir");
+    let module = ktir_cpu::parser::parse_module(&text).expect("parse module");
+    let func = module.get_function("distributed_view_copy").expect("function");
+
+    // Build the memory hierarchy for the function's grid ([2,1,1] -> 2 cores)
+    // and seed it the way `_prepare_execution` does in Python.
+    let (gx, gy, gz) = func.grid;
+    let num_cores = (gx * gy * gz).max(1);
+    let mem = SpyreMemoryHierarchy::new(num_cores);
+
+    // --- Seed HBM: rows 0..95 row-major at stick 0; zero B at stick 24576. ---
+    {
+        let a_hbm: Vec<f32> = (0..96).flat_map(|r| full[r].iter().copied()).collect();
+        let a_hbm_raw = codec::encode(&a_hbm, DType::F16);
+        let zeros = vec![0u8; ROWS * COLS * 2];
+        let mut hbm = mem.hbm.borrow_mut();
+        // Stick 0 / 24576 -> byte addresses (HBM base_ptr is a stick index).
+        hbm.write_bytes(0, &a_hbm_raw);
+        hbm.write_bytes(24576 * STICK_BYTES, &zeros);
+    }
+
+    // --- Seed LX core 0: rows 96..127 col-packed strides [1, 64] at byte 12288. ---
+    // _write_strided: element (i, j) -> element offset i*1 + j*64; holes zero.
+    {
+        let block = slice_block_192(&full, 96, 32);
+        let raw = encode_strided(&block, [1, 64]);
+        let lx0 = mem.get_lx(0);
+        lx0.borrow_mut().write_bytes(12288, &raw);
+        // span = 31*1 + 63*64 + 1 = 4064 elems = 8128 bytes
+        lx0.borrow_mut().next_ptr = 12288 + 8128;
+    }
+
+    // --- Seed LX core 1: rows 128..191 row-major at byte 16384. ---
+    {
+        let block = slice_block_192(&full, 128, 64);
+        let raw = encode_strided(&block, [64, 1]);
+        let lx1 = mem.get_lx(1);
+        lx1.borrow_mut().write_bytes(16384, &raw);
+        // span = 64*64 = 4096 elems = 8192 bytes
+        lx1.borrow_mut().next_ptr = 16384 + 8192;
+    }
+
+    // The function takes no pointer arguments — every address is an
+    // `arith.constant` in the body — so there are no input pointers to bind.
+    let input_ptrs: Vec<(String, Value)> = Vec::new();
+
+    let grid = GridExecutor::new(func.grid);
+    let dispatch = Dispatch::new();
+    ktir_cpu::comm_sched::execute_with_communication(
+        &grid,
+        &mem,
+        &func.operations,
+        &input_ptrs,
+        &dispatch,
+        None,
+    )
+    .expect("execute distributed_view_copy");
+
+    // Read B back from HBM (stick 24576) and compare to the full reference.
+    let n = ROWS * COLS;
+    let raw = mem.hbm.borrow().read_bytes(24576 * STICK_BYTES, n * 2);
+    let actual = codec::decode(&raw, n, DType::F16);
+    let expected: Vec<f32> = full.iter().flat_map(|r| r.iter().copied()).collect();
+    assert_eq!(actual, expected, "distributed_view_copy: B != reference tensor");
+}
+
+/// Extract `nrows` rows of the 192×64 reference starting at `r0` (all 64 cols).
+fn slice_block_192(full: &[Vec<f32>], r0: usize, nrows: usize) -> Vec<Vec<f32>> {
+    (0..nrows).map(|i| full[r0 + i].clone()).collect()
+}
+
+/// f16-encode a `[nrows][ncols]` block laid out with element `strides`
+/// (`_write_strided`): element (i, j) lands at element offset
+/// `i*strides[0] + j*strides[1]`; holes are left zero.
+fn encode_strided(block: &[Vec<f32>], strides: [i64; 2]) -> Vec<u8> {
+    let nrows = block.len();
+    let ncols = if nrows > 0 { block[0].len() } else { 0 };
+    let mut span = 1usize;
+    for i in 0..nrows {
+        for j in 0..ncols {
+            let off = (i as i64) * strides[0] + (j as i64) * strides[1];
+            span = span.max(off as usize + 1);
+        }
+    }
+    let mut buf = vec![0.0f32; span];
+    for i in 0..nrows {
+        for j in 0..ncols {
+            let off = ((i as i64) * strides[0] + (j as i64) * strides[1]) as usize;
+            buf[off] = block[i][j];
+        }
+    }
+    codec::encode(&buf, DType::F16)
 }
