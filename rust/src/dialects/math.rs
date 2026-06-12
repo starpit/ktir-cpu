@@ -60,51 +60,95 @@ pub fn register(d: &mut Dispatch) {
 // pure `f32 -> f32` kernel to `unary`. The kernels are the exact element-wise
 // functions `MathOps.exp` / `MathOps.exp_scalar` etc. apply via NumPy.
 
-fn exp(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn exp(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.exp", |x| x.exp())
 }
 
-fn sqrt(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn sqrt(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.sqrt", |x| x.sqrt())
 }
 
-fn rsqrt(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn rsqrt(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // 1.0 / sqrt(x), matching `MathOps.rsqrt`.
     unary(op, ctx, "math.rsqrt", |x| 1.0 / x.sqrt())
 }
 
-fn log(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn log(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.log", |x| x.ln())
 }
 
-fn log2(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn log2(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.log2", |x| x.log2())
 }
 
-fn log1p(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn log1p(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // log(1 + x), matching `np.log1p`.
     unary(op, ctx, "math.log1p", |x| x.ln_1p())
 }
 
-fn tanh(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn tanh(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.tanh", |x| x.tanh())
 }
 
-fn sin(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn sin(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.sin", |x| x.sin())
 }
 
-fn cos(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn cos(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.cos", |x| x.cos())
 }
 
-fn absf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn absf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // `MathOps.absf` applies `np.abs` directly to the stored data without the
     // float32 round-trip, so abs is exact regardless of dtype.
     unary(op, ctx, "math.absf", |x| x.abs())
 }
 
-fn absi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn absi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Integer absolute value. Tile data is f32-backed in slice-1, but the values
     // are whole numbers; `MathOps.absi` is also a plain `np.abs`. For genuine
     // integer scalars we keep the integer variant exact.
@@ -117,15 +161,27 @@ fn absi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
     }
 }
 
-fn ceil(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn ceil(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.ceil", |x| x.ceil())
 }
 
-fn floor(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn floor(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary(op, ctx, "math.floor", |x| x.floor())
 }
 
-fn erf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn erf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Abramowitz & Stegun 7.1.26 polynomial — see `MathOps._erf_f32`.
     unary(op, ctx, "math.erf", erf_f32)
 }
@@ -135,7 +191,11 @@ fn erf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Opt
 /// `math.powf %base, %exp` — element-wise `base ** exp`. Both operands must be
 /// the same kind (tile/tile or scalar/scalar), mirroring `MathOps.powf` /
 /// `powf_scalar` which read `base`'s type to decide the dispatch.
-fn powf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn powf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.len() != 2 {
         return Err(format!(
             "math.powf expects 2 operands, got {}",
@@ -158,7 +218,11 @@ fn powf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
                 .zip(e.data.iter())
                 .map(|(&x, &y)| round_to(x.powf(y), b.dtype))
                 .collect();
-            Ok(Some(Value::Tile(Tile::compute(data, b.dtype, b.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                b.dtype,
+                b.shape.clone(),
+            ))))
         }
         (Value::Scalar(b), Value::Scalar(e)) => {
             let x = b.as_f32().ok_or("math.powf: non-float base scalar")?;
@@ -171,9 +235,16 @@ fn powf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
 
 /// `math.fma %a, %b, %c` — fused multiply-add `a * b + c`, element-wise.
 /// Mirrors `MathOps.fma` / `fma_scalar`; dispatch keys on whether `a` is a tile.
-fn fma(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn fma(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.len() != 3 {
-        return Err(format!("math.fma expects 3 operands, got {}", op.operands.len()));
+        return Err(format!(
+            "math.fma expects 3 operands, got {}",
+            op.operands.len()
+        ));
     }
     let a = ctx.get_value(&op.operands[0])?.clone();
     let b = ctx.get_value(&op.operands[1])?.clone();
@@ -189,7 +260,11 @@ fn fma(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Opt
             let data: Vec<f32> = (0..ta.data.len())
                 .map(|i| round_to(ta.data[i] * tb.data[i] + tc.data[i], ta.dtype))
                 .collect();
-            Ok(Some(Value::Tile(Tile::compute(data, ta.dtype, ta.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                ta.dtype,
+                ta.shape.clone(),
+            ))))
         }
         (Value::Scalar(sa), Value::Scalar(sb), Value::Scalar(sc)) => {
             let x = sa.as_f32().ok_or("math.fma: non-float scalar")?;
@@ -203,13 +278,12 @@ fn fma(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Opt
 
 // --- helpers --------------------------------------------------------------
 
-fn one_operand<'s>(
-    op: &Operation,
-    ctx: &'s CoreContext,
-    name: &str,
-) -> Result<&'s Value, String> {
+fn one_operand<'s>(op: &Operation, ctx: &'s CoreContext, name: &str) -> Result<&'s Value, String> {
     if op.operands.len() != 1 {
-        return Err(format!("{name} expects 1 operand, got {}", op.operands.len()));
+        return Err(format!(
+            "{name} expects 1 operand, got {}",
+            op.operands.len()
+        ));
     }
     ctx.get_value(&op.operands[0])
 }
@@ -241,7 +315,9 @@ fn unary(
             // from f16; here scalars are f32-typed, so we keep f32 precision.
             Ok(Some(Value::Scalar(Scalar::F32(f(x)))))
         }
-        other => Err(format!("{name}: expected tile or scalar operand, got {other:?}")),
+        other => Err(format!(
+            "{name}: expected tile or scalar operand, got {other:?}"
+        )),
     }
 }
 
@@ -343,8 +419,7 @@ fn erf_f32(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.3275911 * a);
     let poly = t
         * (0.254_829_6
-            + t * (-0.284_496_72
-                + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
+            + t * (-0.284_496_72 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
     let sign = if x > 0.0 {
         1.0
     } else if x < 0.0 {
@@ -417,15 +492,38 @@ mod tests {
     fn all_ops_register_with_expected_latency() {
         let d = Dispatch::new();
         for name in [
-            "math.exp", "math.sqrt", "math.rsqrt", "math.log", "math.log2",
-            "math.log1p", "math.tanh", "math.sin", "math.cos", "math.erf", "math.powf",
+            "math.exp",
+            "math.sqrt",
+            "math.rsqrt",
+            "math.log",
+            "math.log2",
+            "math.log1p",
+            "math.tanh",
+            "math.sin",
+            "math.cos",
+            "math.erf",
+            "math.powf",
         ] {
             assert!(d.handler(name).is_some(), "{name} missing");
-            assert_eq!(d.latency_category(name), LatencyCategory::ComputeTranscendental, "{name}");
+            assert_eq!(
+                d.latency_category(name),
+                LatencyCategory::ComputeTranscendental,
+                "{name}"
+            );
         }
-        for name in ["math.absf", "math.absi", "math.ceil", "math.floor", "math.fma"] {
+        for name in [
+            "math.absf",
+            "math.absi",
+            "math.ceil",
+            "math.floor",
+            "math.fma",
+        ] {
             assert!(d.handler(name).is_some(), "{name} missing");
-            assert_eq!(d.latency_category(name), LatencyCategory::ComputeFloat, "{name}");
+            assert_eq!(
+                d.latency_category(name),
+                LatencyCategory::ComputeFloat,
+                "{name}"
+            );
         }
     }
 
@@ -481,13 +579,22 @@ mod tests {
     #[test]
     fn log_family() {
         let e = std::f32::consts::E;
-        let r = ok(&Operation::new(Some("%r"), "math.log", &["%x"]), &[("%x", tile(vec![e]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.log", &["%x"]),
+            &[("%x", tile(vec![e]))],
+        );
         close(as_tile(&r).data[0], 1.0);
 
-        let r = ok(&Operation::new(Some("%r"), "math.log2", &["%x"]), &[("%x", tile(vec![8.0]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.log2", &["%x"]),
+            &[("%x", tile(vec![8.0]))],
+        );
         close(as_tile(&r).data[0], 3.0);
 
-        let r = ok(&Operation::new(Some("%r"), "math.log1p", &["%x"]), &[("%x", tile(vec![0.0]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.log1p", &["%x"]),
+            &[("%x", tile(vec![0.0]))],
+        );
         close(as_tile(&r).data[0], 0.0);
     }
 
@@ -496,17 +603,26 @@ mod tests {
     #[test]
     fn trig_and_tanh() {
         let pi = std::f32::consts::PI;
-        let r = ok(&Operation::new(Some("%r"), "math.sin", &["%x"]), &[("%x", tile(vec![0.0, pi / 2.0]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.sin", &["%x"]),
+            &[("%x", tile(vec![0.0, pi / 2.0]))],
+        );
         let t = as_tile(&r);
         close(t.data[0], 0.0);
         close(t.data[1], 1.0);
 
-        let r = ok(&Operation::new(Some("%r"), "math.cos", &["%x"]), &[("%x", tile(vec![0.0, pi]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.cos", &["%x"]),
+            &[("%x", tile(vec![0.0, pi]))],
+        );
         let t = as_tile(&r);
         close(t.data[0], 1.0);
         close(t.data[1], -1.0);
 
-        let r = ok(&Operation::new(Some("%r"), "math.tanh", &["%x"]), &[("%x", tile(vec![0.0]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.tanh", &["%x"]),
+            &[("%x", tile(vec![0.0]))],
+        );
         close(as_tile(&r).data[0], 0.0);
     }
 
@@ -534,12 +650,18 @@ mod tests {
 
     #[test]
     fn floor_and_ceil() {
-        let r = ok(&Operation::new(Some("%r"), "math.floor", &["%x"]), &[("%x", tile(vec![1.7, -1.2]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.floor", &["%x"]),
+            &[("%x", tile(vec![1.7, -1.2]))],
+        );
         let t = as_tile(&r);
         close(t.data[0], 1.0);
         close(t.data[1], -2.0);
 
-        let r = ok(&Operation::new(Some("%r"), "math.ceil", &["%x"]), &[("%x", tile(vec![1.2, -1.7]))]);
+        let r = ok(
+            &Operation::new(Some("%r"), "math.ceil", &["%x"]),
+            &[("%x", tile(vec![1.2, -1.7]))],
+        );
         let t = as_tile(&r);
         close(t.data[0], 2.0);
         close(t.data[1], -1.0);
@@ -573,7 +695,10 @@ mod tests {
         let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
         let r = ok(
             &op,
-            &[("%b", tile(vec![2.0, 3.0, 4.0])), ("%e", tile(vec![2.0, 2.0, 0.5]))],
+            &[
+                ("%b", tile(vec![2.0, 3.0, 4.0])),
+                ("%e", tile(vec![2.0, 2.0, 0.5])),
+            ],
         );
         let t = as_tile(&r);
         close(t.data[0], 4.0);
@@ -655,7 +780,11 @@ mod tests {
         assert_eq!(t.dtype, DType::F16);
         assert_eq!(f16_round(t.data[0]), t.data[0]);
         // Still numerically close to e, within f16 resolution (~1e-2 near 2.7).
-        assert!((t.data[0] - std::f32::consts::E).abs() < 1e-2, "{}", t.data[0]);
+        assert!(
+            (t.data[0] - std::f32::consts::E).abs() < 1e-2,
+            "{}",
+            t.data[0]
+        );
     }
 
     // --- error paths -----------------------------------------------------
@@ -665,7 +794,10 @@ mod tests {
         let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
         let err = run(
             &op,
-            &[("%b", tile(vec![2.0])), ("%e", Value::Scalar(Scalar::F32(2.0)))],
+            &[
+                ("%b", tile(vec![2.0])),
+                ("%e", Value::Scalar(Scalar::F32(2.0))),
+            ],
         );
         assert!(err.is_err());
     }
@@ -680,7 +812,10 @@ mod tests {
     #[test]
     fn powf_shape_mismatch_errors() {
         let op = Operation::new(Some("%r"), "math.powf", &["%b", "%e"]);
-        let err = run(&op, &[("%b", tile(vec![2.0, 3.0])), ("%e", tile(vec![2.0]))]);
+        let err = run(
+            &op,
+            &[("%b", tile(vec![2.0, 3.0])), ("%e", tile(vec![2.0]))],
+        );
         assert!(err.is_err());
     }
 }

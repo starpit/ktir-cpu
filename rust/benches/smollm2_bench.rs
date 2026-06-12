@@ -9,7 +9,7 @@
 //! Skips (exits 0) when the bundle is absent. SMOLLM2_ITERS controls the loop.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::parser::parse_module;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,7 +37,13 @@ fn main() {
     let mut sources: HashMap<u64, Vec<f32>> = HashMap::new();
     for t in manifest["tensors"].as_array().unwrap() {
         let id = t["id"].as_u64().unwrap();
-        shape.insert(id, (t["rows"].as_u64().unwrap() as usize, t["cols"].as_u64().unwrap() as usize));
+        shape.insert(
+            id,
+            (
+                t["rows"].as_u64().unwrap() as usize,
+                t["cols"].as_u64().unwrap() as usize,
+            ),
+        );
         if t["is_source"].as_bool().unwrap_or(false) {
             sources.insert(id, read_f32(&dir.join(format!("t{id}.bin"))));
         }
@@ -61,8 +67,10 @@ fn main() {
         });
     }
 
-    let iters: usize =
-        std::env::var("SMOLLM2_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let iters: usize = std::env::var("SMOLLM2_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     eprintln!("profiling {} nodes x {iters} passes...", nodes.len());
     for _ in 0..iters {
         let mut buf = sources.clone();
@@ -76,13 +84,25 @@ fn main() {
                 let tid = a["tensor"].as_u64().unwrap();
                 let is_out = a["is_output"].as_bool().unwrap_or(false);
                 let (r, c) = shape[&tid];
-                let data = if is_out { vec![0.0f32; r * c] } else { buf[&tid].clone() };
-                owned.push((nm.clone(), Arg::Tensor { data, shape: vec![r, c], dtype: DType::F16 }));
+                let data = if is_out {
+                    vec![0.0f32; r * c]
+                } else {
+                    buf[&tid].clone()
+                };
+                owned.push((
+                    nm.clone(),
+                    Arg::Tensor {
+                        data,
+                        shape: vec![r, c],
+                        dtype: DType::F16,
+                    },
+                ));
                 if is_out {
                     outs.push((nm, tid));
                 }
             }
-            let refs: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+            let refs: Vec<(&str, Arg)> =
+                owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
             let out = execute_function(module, func, &refs).unwrap();
             for (nm, tid) in outs {
                 buf.insert(tid, out[&nm].data.clone());

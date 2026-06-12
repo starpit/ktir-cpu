@@ -19,7 +19,11 @@ pub fn register(d: &mut Dispatch) {
     d.register("func.return", LatencyCategory::Zero, ret);
 }
 
-fn ret(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn ret(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let mut vals: Vec<Value> = op
         .operands
         .iter()

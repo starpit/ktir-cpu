@@ -65,7 +65,7 @@
 //!   fault-injection seam is private. An `#[ignore]` stub records the gap.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::parser::parse_module;
 
 /// Build a ring-reduce kernel over an `n`-core 1-D grid.
@@ -239,7 +239,11 @@ module {{
     .expect("execute_function");
     let row = &out["%out_ptr"].data;
     let vals: Vec<f32> = (0..N).map(|i| row[i * 128]).collect();
-    assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0], "every core ran to completion");
+    assert_eq!(
+        vals,
+        vec![1.0, 2.0, 3.0, 4.0],
+        "every core ran to completion"
+    );
 }
 
 // ===========================================================================

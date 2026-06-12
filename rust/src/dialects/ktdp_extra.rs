@@ -26,7 +26,11 @@ use crate::ir::{Attr, Operation, Scalar, Value};
 use crate::memref::{DimSubscript, DistributedMemRef, IndirectAccessTile, MemRef};
 
 pub fn register(d: &mut Dispatch) {
-    d.register("ktdp.get_compute_tile_id", LatencyCategory::Zero, get_compute_tile_id);
+    d.register(
+        "ktdp.get_compute_tile_id",
+        LatencyCategory::Zero,
+        get_compute_tile_id,
+    );
     d.register("ktdp.coreid", LatencyCategory::Zero, coreid);
     d.register(
         "ktdp.construct_distributed_memory_view",
@@ -82,11 +86,18 @@ fn get_compute_tile_id(
 /// `grid_executor.get_cores_in_group((x, y, z))`. `get_cores_in_group` is not
 /// surfaced on the Rust `GridExecutor`, so the wildcard match is performed here
 /// over `env.grid` using its linear<->grid transforms.
-fn coreid(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn coreid(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let mut coords: Vec<i64> = op
         .operands
         .iter()
-        .map(|name| ctx.get_value(name).and_then(|v| scalar_i64(v, "coreid coord")))
+        .map(|name| {
+            ctx.get_value(name)
+                .and_then(|v| scalar_i64(v, "coreid coord"))
+        })
         .collect::<Result<_, _>>()?;
 
     // Pad to 3 dims with trailing zeros, then read (x, y, z).
@@ -184,7 +195,7 @@ fn construct_indirect_access_tile(
         other => {
             return Err(format!(
                 "construct_indirect_access_tile: parent is {other:?}, expected MemRef"
-            ))
+            ));
         }
     };
 
@@ -204,15 +215,14 @@ fn construct_indirect_access_tile(
         .map(|&n| n as usize)
         .collect::<Vec<_>>();
 
-    let variables_space_set = match op.attributes.get("variables_space_set") {
-        Some(Attr::AffineSet(s)) => s.clone(),
-        _ => {
-            return Err(
+    let variables_space_set =
+        match op.attributes.get("variables_space_set") {
+            Some(Attr::AffineSet(s)) => s.clone(),
+            _ => return Err(
                 "construct_indirect_access_tile: missing/invalid 'variables_space_set' attribute"
                     .into(),
-            )
-        }
-    };
+            ),
+        };
 
     let variables_space_order = match op.attributes.get("variables_space_order") {
         // Python normalizes an identity order to None.
@@ -243,7 +253,7 @@ fn parse_dim_subscripts(op: &Operation, ndims: usize) -> Result<Vec<DimSubscript
         _ => {
             return Err(
                 "construct_indirect_access_tile: missing/invalid 'dim_kinds' attribute".into(),
-            )
+            );
         }
     };
     if kinds.len() != ndims {
@@ -260,7 +270,7 @@ fn parse_dim_subscripts(op: &Operation, ndims: usize) -> Result<Vec<DimSubscript
         Some(other) => {
             return Err(format!(
                 "construct_indirect_access_tile: 'dim_data' is {other:?}, expected IntList"
-            ))
+            ));
         }
     };
     if data.len() != ndims {
@@ -274,8 +284,12 @@ fn parse_dim_subscripts(op: &Operation, ndims: usize) -> Result<Vec<DimSubscript
     let mut expr_cursor = 0usize;
     for (d, kind) in kinds.iter().enumerate() {
         let sub = match kind.as_str() {
-            "direct" => DimSubscript::Direct { var_index: data[d] as usize },
-            "indirect" => DimSubscript::Indirect { view: data[d] as usize },
+            "direct" => DimSubscript::Direct {
+                var_index: data[d] as usize,
+            },
+            "indirect" => DimSubscript::Indirect {
+                view: data[d] as usize,
+            },
             "direct_expr" => {
                 let key = format!("dim_map_{expr_cursor}");
                 let map = match op.attributes.get(&key) {
@@ -284,7 +298,7 @@ fn parse_dim_subscripts(op: &Operation, ndims: usize) -> Result<Vec<DimSubscript
                         return Err(format!(
                             "construct_indirect_access_tile: dim {d} is direct_expr but \
                              attribute '{key}' is missing/invalid"
-                        ))
+                        ));
                     }
                 };
                 expr_cursor += 1;
@@ -294,7 +308,7 @@ fn parse_dim_subscripts(op: &Operation, ndims: usize) -> Result<Vec<DimSubscript
                 return Err(format!(
                     "construct_indirect_access_tile: dim {d} has unknown kind {other:?} \
                      (expected direct/direct_expr/indirect)"
-                ))
+                ));
             }
         };
         subs.push(sub);
@@ -307,8 +321,14 @@ fn parse_dim_subscripts(op: &Operation, ndims: usize) -> Result<Vec<DimSubscript
 fn int_list<'a>(op: &'a Operation, key: &str) -> Result<&'a Vec<i64>, String> {
     match op.attributes.get(key) {
         Some(Attr::IntList(v)) => Ok(v),
-        Some(other) => Err(format!("{}: attr '{key}' is {other:?}, expected IntList", op.op_type)),
-        None => Err(format!("{}: missing required attribute '{key}'", op.op_type)),
+        Some(other) => Err(format!(
+            "{}: attr '{key}' is {other:?}, expected IntList",
+            op.op_type
+        )),
+        None => Err(format!(
+            "{}: missing required attribute '{key}'",
+            op.op_type
+        )),
     }
 }
 
@@ -316,7 +336,10 @@ fn dtype_attr(op: &Operation, key: &str) -> Result<DType, String> {
     match op.attributes.get(key) {
         Some(Attr::Dtype(d)) => Ok(*d),
         Some(Attr::Str(s)) => DType::parse(s),
-        _ => Err(format!("{}: missing/invalid dtype attribute '{key}'", op.op_type)),
+        _ => Err(format!(
+            "{}: missing/invalid dtype attribute '{key}'",
+            op.op_type
+        )),
     }
 }
 
@@ -332,12 +355,12 @@ fn scalar_i64(v: &Value, ctx: &str) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
     use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
     use crate::dialects::Dispatch;
     use crate::env::{ExecutionEnv, GridExecutor};
     use crate::interpreter::{execute_ops, single_core_context};
     use crate::memref::{CoordinateSet, MemorySpace};
+    use std::rc::Rc;
 
     fn run_on(
         ops: &[Operation],
@@ -370,7 +393,11 @@ mod tests {
                 kind: ConstraintKind::GreaterEq,
             });
         }
-        AffineSet { num_dims: lo.len(), num_syms: 0, constraints }
+        AffineSet {
+            num_dims: lo.len(),
+            num_syms: 0,
+            constraints,
+        }
     }
 
     fn hbm_part(base_stick: i64, lo: &[i64], hi: &[i64]) -> MemRef {
@@ -624,8 +651,14 @@ mod tests {
                 assert_eq!(iat.shape, vec![4, 4]);
                 assert_eq!(iat.index_views.len(), 1);
                 assert_eq!(iat.dim_subscripts.len(), 2);
-                assert!(matches!(iat.dim_subscripts[0], DimSubscript::Indirect { view: 0 }));
-                assert!(matches!(iat.dim_subscripts[1], DimSubscript::Direct { var_index: 1 }));
+                assert!(matches!(
+                    iat.dim_subscripts[0],
+                    DimSubscript::Indirect { view: 0 }
+                ));
+                assert!(matches!(
+                    iat.dim_subscripts[1],
+                    DimSubscript::Direct { var_index: 1 }
+                ));
                 assert!(iat.variables_space_order.is_none());
                 assert_eq!(iat.parent_ref.shape, vec![16, 16]);
             }
@@ -678,7 +711,10 @@ mod tests {
         .with_attr("shape", Attr::IntList(vec![4, 4]))
         .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
         .with_attr("variables_space_order", Attr::AffineMap(swap.clone()))
-        .with_attr("dim_kinds", Attr::StrList(vec!["indirect".into(), "direct".into()]))
+        .with_attr(
+            "dim_kinds",
+            Attr::StrList(vec!["indirect".into(), "direct".into()]),
+        )
         .with_attr("dim_data", Attr::IntList(vec![0, 1]));
 
         run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();
@@ -697,7 +733,10 @@ mod tests {
         let op = Operation::new(Some("%t"), "ktdp.construct_indirect_access_tile", &["%X"])
             .with_attr("shape", Attr::IntList(vec![4]))
             .with_attr("variables_space_set", Attr::AffineSet(vss_2d()))
-            .with_attr("variables_space_order", Attr::AffineMap(AffineMap::identity(2)))
+            .with_attr(
+                "variables_space_order",
+                Attr::AffineMap(AffineMap::identity(2)),
+            )
             .with_attr("dim_kinds", Attr::StrList(vec!["direct".into()]))
             .with_attr("dim_data", Attr::IntList(vec![0]));
         run_on(&[op], &mut ctx, (1, 1, 1)).unwrap();

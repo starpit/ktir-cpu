@@ -361,8 +361,7 @@ fn lower_accept_1d_range() {
 #[test]
 fn lower_accept_2d_box() {
     let b =
-        try_lower("affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 3 >= 0)>")
-            .unwrap();
+        try_lower("affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 3 >= 0)>").unwrap();
     assert_eq!(b, box_of(&[0, 0], &[2, 4]));
 }
 
@@ -376,8 +375,8 @@ fn lower_accept_nonzero_origin() {
 #[test]
 fn lower_accept_tightest_bounds() {
     // lo = max(0, 2) = 2, hi = min(6, 4) = 4.
-    let b = try_lower("affine_set<(d0) : (d0 >= 0, d0 - 2 >= 0, -d0 + 5 >= 0, -d0 + 3 >= 0)>")
-        .unwrap();
+    let b =
+        try_lower("affine_set<(d0) : (d0 >= 0, d0 - 2 >= 0, -d0 + 5 >= 0, -d0 + 3 >= 0)>").unwrap();
     assert_eq!(b, box_of(&[2], &[4]));
 }
 
@@ -405,8 +404,7 @@ fn lower_reject_nonunit_coefficient() {
 #[test]
 fn lower_accept_eq_and_range() {
     // d0 == 2, 1 <= d1 <= 3 -> BoxSet(lo=(2,1), hi=(3,4)).
-    let b = try_lower("affine_set<(d0, d1) : (d0 - 2 == 0, d1 - 1 >= 0, -d1 + 3 >= 0)>")
-        .unwrap();
+    let b = try_lower("affine_set<(d0, d1) : (d0 - 2 == 0, d1 - 1 >= 0, -d1 + 3 >= 0)>").unwrap();
     assert_eq!(b, box_of(&[2, 1], &[3, 4]));
 }
 
@@ -560,10 +558,10 @@ fn sym_translate_concrete_offset_preserves_symbols() {
 #[test]
 fn sym_reject_multi_dim_with_symbol() {
     // Symbol mixed with two dims in one constraint — not separable.
-    assert!(try_lower(
-        "affine_set<(d0, d1)[s0] : (d0 + d1 - s0 >= 0, -d0 + 3 >= 0, -d1 + 3 >= 0)>"
-    )
-    .is_none());
+    assert!(
+        try_lower("affine_set<(d0, d1)[s0] : (d0 + d1 - s0 >= 0, -d0 + 3 >= 0, -d1 + 3 >= 0)>")
+            .is_none()
+    );
 }
 
 #[test]
@@ -580,8 +578,7 @@ fn sym_negative_symbol_coefficient_in_bound() {
     assert_eq!(s.hi, vec![Bound::Concrete(1024)]); // concrete fold
     assert!(!s.lo[0].is_concrete()); // symbolic AST retained
 
-    let aset =
-        parse_affine_set("affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>").unwrap();
+    let aset = parse_affine_set("affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>").unwrap();
     for n in [0i64, 3, 1023] {
         assert_eq!(s.specialize(&[n]), box_of(&[n], &[1024]));
         for pt in [[n - 1], [n], [n + 1], [1022], [1023]] {
@@ -619,8 +616,7 @@ fn lower_symbolic_eq_with_offset() {
 #[test]
 fn end_to_end_axis_aligned_becomes_box() {
     let b =
-        try_lower("affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>")
-            .unwrap();
+        try_lower("affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>").unwrap();
     assert_eq!(b, box_of(&[0, 0], &[4, 4]));
 }
 

@@ -16,7 +16,7 @@
 //! parser gap (multi-result SSA binding) — see `matmul_2d_grid_gap`.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::parser::parse_module;
 
@@ -84,9 +84,30 @@ fn matmul_1d_kernel() -> String {
 
 fn args<'a>(a: &'a [f32], b: &'a [f32], c: &'a [f32]) -> Vec<(&'a str, Arg)> {
     vec![
-        ("a_ptr", Arg::Tensor { data: a.to_vec(), shape: vec![M, K], dtype: DType::F16 }),
-        ("b_ptr", Arg::Tensor { data: b.to_vec(), shape: vec![K, N], dtype: DType::F16 }),
-        ("c_ptr", Arg::Tensor { data: c.to_vec(), shape: vec![M, N], dtype: DType::F16 }),
+        (
+            "a_ptr",
+            Arg::Tensor {
+                data: a.to_vec(),
+                shape: vec![M, K],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "b_ptr",
+            Arg::Tensor {
+                data: b.to_vec(),
+                shape: vec![K, N],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "c_ptr",
+            Arg::Tensor {
+                data: c.to_vec(),
+                shape: vec![M, N],
+                dtype: DType::F16,
+            },
+        ),
         ("K", Arg::Scalar(Scalar::I64(K as i64))),
     ]
 }
@@ -98,8 +119,12 @@ fn f16(x: f32) -> f32 {
 #[test]
 fn matmul_kernel_end_to_end_correct() {
     let module = parse_module(&matmul_1d_kernel()).expect("parse matmul kernel");
-    let a: Vec<f32> = (0..M * K).map(|i| f16(((i % 13) as f32 - 6.0) * 0.1)).collect();
-    let b: Vec<f32> = (0..K * N).map(|i| f16(((i % 11) as f32 - 5.0) * 0.1)).collect();
+    let a: Vec<f32> = (0..M * K)
+        .map(|i| f16(((i % 13) as f32 - 6.0) * 0.1))
+        .collect();
+    let b: Vec<f32> = (0..K * N)
+        .map(|i| f16(((i % 11) as f32 - 5.0) * 0.1))
+        .collect();
     let c0 = vec![0.0f32; M * N];
 
     let outputs =
@@ -112,8 +137,13 @@ fn matmul_kernel_end_to_end_correct() {
     for (g, w) in got.iter().zip(&want) {
         max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
     }
-    assert!(max_rel < 0.05, "e2e matmul max relative error {max_rel} exceeds f16 tolerance");
-    eprintln!("e2e matmul ({M}×{K}×{N}, grid [{CORES}], K-tiled) correct — max rel err {max_rel:.4} ✓");
+    assert!(
+        max_rel < 0.05,
+        "e2e matmul max relative error {max_rel} exceeds f16 tolerance"
+    );
+    eprintln!(
+        "e2e matmul ({M}×{K}×{N}, grid [{CORES}], K-tiled) correct — max rel err {max_rel:.4} ✓"
+    );
 }
 
 /// E2E perf baseline: whole-program run time (parse excluded). The per-core tile
@@ -134,5 +164,8 @@ fn matmul_kernel_end_to_end_perf() {
         std::hint::black_box(execute_function(&module, "matmul_1d", &args(&a, &b, &c0)).unwrap());
     }
     let each = t0.elapsed().as_secs_f64() / iters as f64;
-    eprintln!("e2e matmul whole-program: {:.1} µs/run ({CORES} cores, K-tiled)", each * 1e6);
+    eprintln!(
+        "e2e matmul whole-program: {:.1} µs/run ({CORES} cores, K-tiled)",
+        each * 1e6
+    );
 }

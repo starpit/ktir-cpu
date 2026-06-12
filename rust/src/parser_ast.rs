@@ -24,8 +24,8 @@
 //! `lhs - rhs` / `rhs - lhs`; `lhs == rhs` becomes `expr == 0`
 //! ([`ConstraintKind::Equal`]) over `lhs - rhs`.
 
-use std::rc::Rc;
 use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Tokeniser — mirrors `_tokenise` / `_TOKEN_RE` in parser_ast.py.
@@ -163,9 +163,10 @@ impl Parser {
             .ok_or_else(|| "Unexpected end of expression".to_string())?
             .clone();
         if let Some(exp) = expected
-            && tok != exp {
-                return Err(format!("Expected {exp:?}, got {tok:?} (pos {})", self.pos));
-            }
+            && tok != exp
+        {
+            return Err(format!("Expected {exp:?}, got {tok:?} (pos {})", self.pos));
+        }
         self.pos += 1;
         Ok(tok)
     }
@@ -234,21 +235,22 @@ impl Parser {
 
         // Integer that may be a coefficient: `N * expr`.
         if let Some(tok) = self.peek()
-            && is_int_literal(tok) {
-                let num: i64 = self
-                    .consume(None)?
-                    .parse()
-                    .map_err(|_| "bad integer literal".to_string())?;
-                if self.peek() == Some("*") {
-                    self.consume(Some("*"))?;
-                    let operand = self.atom()?;
-                    return Ok(AffineExpr::Mul(
-                        Rc::new(AffineExpr::Const(num)),
-                        Rc::new(operand),
-                    ));
-                }
-                return Ok(AffineExpr::Const(num));
+            && is_int_literal(tok)
+        {
+            let num: i64 = self
+                .consume(None)?
+                .parse()
+                .map_err(|_| "bad integer literal".to_string())?;
+            if self.peek() == Some("*") {
+                self.consume(Some("*"))?;
+                let operand = self.atom()?;
+                return Ok(AffineExpr::Mul(
+                    Rc::new(AffineExpr::Const(num)),
+                    Rc::new(operand),
+                ));
             }
+            return Ok(AffineExpr::Const(num));
+        }
 
         // Atom that may be followed by a coefficient: `expr * N`.
         let node = self.atom()?;
@@ -309,10 +311,11 @@ impl Parser {
         }
         // Fallback: canonical `dN` when no dim map is present.
         if self.dim_index.is_empty()
-            && let Some(n) = canonical_index(&tok, 'd') {
-                self.consume(None)?;
-                return Ok(AffineExpr::Dim(n));
-            }
+            && let Some(n) = canonical_index(&tok, 'd')
+        {
+            self.consume(None)?;
+            return Ok(AffineExpr::Dim(n));
+        }
 
         // Symbol variable named in the symbol list.
         if let Some(idx) = lookup(&self.sym_index, &tok) {
@@ -321,10 +324,11 @@ impl Parser {
         }
         // Fallback: canonical `sN` when no sym map is present.
         if self.sym_index.is_empty()
-            && let Some(n) = canonical_index(&tok, 's') {
-                self.consume(None)?;
-                return Ok(AffineExpr::Sym(n));
-            }
+            && let Some(n) = canonical_index(&tok, 's')
+        {
+            self.consume(None)?;
+            return Ok(AffineExpr::Sym(n));
+        }
 
         // Positive integer constant (negatives are consumed in `term`).
         if is_unsigned_int(&tok) {
@@ -677,8 +681,7 @@ mod tests {
     #[test]
     fn parse_set_with_symbols() {
         // (d0)[s0] : 0 <= d0 <= s0 - 1
-        let set =
-            parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>").unwrap();
+        let set = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>").unwrap();
         assert_eq!(set.num_syms, 1);
         assert!(set.contains(&[0], &[4]));
         assert!(set.contains(&[3], &[4]));

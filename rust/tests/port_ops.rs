@@ -170,7 +170,10 @@ fn test_addf() {
     // element-wise addition of two tiles
     let r = run_op(
         &op("arith.addf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 2.0, 3.0, 4.0])), ("%b", f16_tile(&[5.0, 6.0, 7.0, 8.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
+            ("%b", f16_tile(&[5.0, 6.0, 7.0, 8.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![6.0, 8.0, 10.0, 12.0]);
 }
@@ -179,7 +182,10 @@ fn test_addf() {
 fn test_subf() {
     let r = run_op(
         &op("arith.subf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[5.0, 6.0, 7.0, 8.0])), ("%b", f16_tile(&[1.0, 2.0, 3.0, 4.0]))],
+        &[
+            ("%a", f16_tile(&[5.0, 6.0, 7.0, 8.0])),
+            ("%b", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 4.0, 4.0, 4.0]);
 }
@@ -188,7 +194,10 @@ fn test_subf() {
 fn test_mulf() {
     let r = run_op(
         &op("arith.mulf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 2.0, 3.0, 4.0])), ("%b", f16_tile(&[5.0, 6.0, 7.0, 8.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 2.0, 3.0, 4.0])),
+            ("%b", f16_tile(&[5.0, 6.0, 7.0, 8.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![5.0, 12.0, 21.0, 32.0]);
 }
@@ -197,7 +206,10 @@ fn test_mulf() {
 fn test_divf() {
     let r = run_op(
         &op("arith.divf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[4.0, 6.0, 8.0, 10.0])), ("%b", f16_tile(&[2.0, 2.0, 2.0, 2.0]))],
+        &[
+            ("%a", f16_tile(&[4.0, 6.0, 8.0, 10.0])),
+            ("%b", f16_tile(&[2.0, 2.0, 2.0, 2.0])),
+        ],
     );
     data_close(&as_tile(&r).data, &[2.0, 3.0, 4.0, 5.0], 1e-2);
 }
@@ -206,7 +218,10 @@ fn test_divf() {
 fn test_maxf() {
     let r = run_op(
         &op("arith.maxf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])), ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])),
+            ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 5.0, 6.0, 8.0]);
 }
@@ -215,7 +230,10 @@ fn test_maxf() {
 fn test_minf() {
     let r = run_op(
         &op("arith.minf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])), ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])),
+            ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0, 7.0]);
 }
@@ -250,7 +268,10 @@ fn test_maxnumf_nan() {
 fn test_minnumf() {
     let r = run_op(
         &op("arith.minnumf", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])), ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 5.0, 3.0, 8.0])),
+            ("%b", f16_tile(&[4.0, 2.0, 6.0, 7.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0, 7.0]);
 }
@@ -279,7 +300,10 @@ fn test_addf_2d_tiles() {
     let expected: Vec<f32> = data1.iter().zip(&data2).map(|(a, b)| a + b).collect();
     let r = run_op(
         &op("arith.addf", &["%a", "%b"]),
-        &[("%a", tile_with(&data1, DType::F16, &[4, 4])), ("%b", tile_with(&data2, DType::F16, &[4, 4]))],
+        &[
+            ("%a", tile_with(&data1, DType::F16, &[4, 4])),
+            ("%b", tile_with(&data2, DType::F16, &[4, 4])),
+        ],
     );
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4, 4]);
@@ -294,7 +318,10 @@ fn test_mulf_2d_tiles() {
     let expected: Vec<f32> = data1.iter().map(|a| a * 2.0).collect();
     let r = run_op(
         &op("arith.mulf", &["%a", "%b"]),
-        &[("%a", tile_with(&data1, DType::F16, &[4, 4])), ("%b", tile_with(&data2, DType::F16, &[4, 4]))],
+        &[
+            ("%a", tile_with(&data1, DType::F16, &[4, 4])),
+            ("%b", tile_with(&data2, DType::F16, &[4, 4])),
+        ],
     );
     let t = as_tile(&r);
     assert_eq!(t.shape, vec![4, 4]);
@@ -304,7 +331,10 @@ fn test_mulf_2d_tiles() {
 #[test]
 fn test_extf_promotes_f32() {
     // extf widens f16 -> f32 (tile path)
-    let r = run_op(&op("arith.extf", &["%a"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0]))]);
+    let r = run_op(
+        &op("arith.extf", &["%a"]),
+        &[("%a", f16_tile(&[1.0, 2.0, 3.0]))],
+    );
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::F32);
     assert_eq!(t.data.to_vec(), vec![1.0, 2.0, 3.0]);
@@ -315,7 +345,10 @@ fn test_extf_promotes_f32() {
 #[test]
 fn test_truncf_passthrough() {
     // truncf is a no-op in simulation; values round-trip unchanged.
-    let r = run_op(&op("arith.truncf", &["%a"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0]))]);
+    let r = run_op(
+        &op("arith.truncf", &["%a"]),
+        &[("%a", f16_tile(&[1.0, 2.0, 3.0]))],
+    );
     assert_eq!(as_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0]);
 }
 
@@ -325,16 +358,25 @@ fn test_truncf_passthrough() {
 
 #[test]
 fn test_addi_scalars() {
-    let r = run_op(&op("arith.addi", &["%a", "%b"]), &[("%a", si(3)), ("%b", si(4))]);
+    let r = run_op(
+        &op("arith.addi", &["%a", "%b"]),
+        &[("%a", si(3)), ("%b", si(4))],
+    );
     assert_eq!(as_i64(&r), 7);
 }
 
 #[test]
 fn test_addi_tile_scalar() {
     // tile + scalar and scalar + tile broadcast
-    let r1 = run_op(&op("arith.addi", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", si(10))]);
+    let r1 = run_op(
+        &op("arith.addi", &["%a", "%b"]),
+        &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", si(10))],
+    );
     assert_eq!(as_tile(&r1).data.to_vec(), vec![11.0, 12.0, 13.0]);
-    let r2 = run_op(&op("arith.addi", &["%a", "%b"]), &[("%a", si(10)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))]);
+    let r2 = run_op(
+        &op("arith.addi", &["%a", "%b"]),
+        &[("%a", si(10)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
+    );
     assert_eq!(as_tile(&r2).data.to_vec(), vec![11.0, 12.0, 13.0]);
 }
 
@@ -342,22 +384,34 @@ fn test_addi_tile_scalar() {
 fn test_addi_tile_tile() {
     let r = run_op(
         &op("arith.addi", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", f16_tile(&[4.0, 5.0, 6.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 2.0, 3.0])),
+            ("%b", f16_tile(&[4.0, 5.0, 6.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![5.0, 7.0, 9.0]);
 }
 
 #[test]
 fn test_muli_scalars() {
-    let r = run_op(&op("arith.muli", &["%a", "%b"]), &[("%a", si(3)), ("%b", si(4))]);
+    let r = run_op(
+        &op("arith.muli", &["%a", "%b"]),
+        &[("%a", si(3)), ("%b", si(4))],
+    );
     assert_eq!(as_i64(&r), 12);
 }
 
 #[test]
 fn test_muli_tile_scalar() {
-    let r1 = run_op(&op("arith.muli", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", si(3))]);
+    let r1 = run_op(
+        &op("arith.muli", &["%a", "%b"]),
+        &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", si(3))],
+    );
     assert_eq!(as_tile(&r1).data.to_vec(), vec![3.0, 6.0, 9.0]);
-    let r2 = run_op(&op("arith.muli", &["%a", "%b"]), &[("%a", si(3)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))]);
+    let r2 = run_op(
+        &op("arith.muli", &["%a", "%b"]),
+        &[("%a", si(3)), ("%b", f16_tile(&[1.0, 2.0, 3.0]))],
+    );
     assert_eq!(as_tile(&r2).data.to_vec(), vec![3.0, 6.0, 9.0]);
 }
 
@@ -365,28 +419,40 @@ fn test_muli_tile_scalar() {
 fn test_muli_tile_tile() {
     let r = run_op(
         &op("arith.muli", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 2.0, 3.0])), ("%b", f16_tile(&[4.0, 5.0, 6.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 2.0, 3.0])),
+            ("%b", f16_tile(&[4.0, 5.0, 6.0])),
+        ],
     );
     assert_eq!(as_tile(&r).data.to_vec(), vec![4.0, 10.0, 18.0]);
 }
 
 #[test]
 fn test_subi() {
-    let r = run_op(&op("arith.subi", &["%a", "%b"]), &[("%a", si(10)), ("%b", si(3))]);
+    let r = run_op(
+        &op("arith.subi", &["%a", "%b"]),
+        &[("%a", si(10)), ("%b", si(3))],
+    );
     assert_eq!(as_i64(&r), 7);
 }
 
 #[test]
 fn test_divui() {
     // unsigned integer floor division: 10 / 3 == 3
-    let r = run_op(&op("arith.divui", &["%a", "%b"]), &[("%a", si(10)), ("%b", si(3))]);
+    let r = run_op(
+        &op("arith.divui", &["%a", "%b"]),
+        &[("%a", si(10)), ("%b", si(3))],
+    );
     assert_eq!(as_i64(&r), 3);
 }
 
 #[test]
 fn test_remui() {
     // unsigned integer remainder: 10 % 3 == 1
-    let r = run_op(&op("arith.remui", &["%a", "%b"]), &[("%a", si(10)), ("%b", si(3))]);
+    let r = run_op(
+        &op("arith.remui", &["%a", "%b"]),
+        &[("%a", si(10)), ("%b", si(3))],
+    );
     assert_eq!(as_i64(&r), 1);
 }
 
@@ -414,7 +480,10 @@ fn test_scalar_predicates() {
         (1, 1, "uge", true),
     ];
     for &(a, b, pred, expected) in cases {
-        let r = run_op(&cmpi_op(pred, &["%a", "%b"]), &[("%a", si(a)), ("%b", si(b))]);
+        let r = run_op(
+            &cmpi_op(pred, &["%a", "%b"]),
+            &[("%a", si(a)), ("%b", si(b))],
+        );
         assert_eq!(as_bool(&r), expected, "cmpi({a},{b},{pred})");
     }
 }
@@ -424,7 +493,10 @@ fn test_cmpi_tile_tile() {
     // element-wise comparison returns i1 tile (stored as 0/1 f32 in Rust)
     let r = run_op(
         &cmpi_op("slt", &["%a", "%b"]),
-        &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", f16_tile(&[2.0, 4.0, 3.0]))],
+        &[
+            ("%a", f16_tile(&[1.0, 5.0, 3.0])),
+            ("%b", f16_tile(&[2.0, 4.0, 3.0])),
+        ],
     );
     let t = as_tile(&r);
     assert_eq!(t.dtype, DType::Bool);
@@ -434,9 +506,15 @@ fn test_cmpi_tile_tile() {
 #[test]
 fn test_cmpi_tile_scalar() {
     // tile compared against a scalar, and scalar against a tile
-    let r1 = run_op(&cmpi_op("slt", &["%a", "%b"]), &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", si(3))]);
+    let r1 = run_op(
+        &cmpi_op("slt", &["%a", "%b"]),
+        &[("%a", f16_tile(&[1.0, 5.0, 3.0])), ("%b", si(3))],
+    );
     assert_eq!(as_tile(&r1).data.to_vec(), vec![1.0, 0.0, 0.0]); // [1,5,3] < 3
-    let r2 = run_op(&cmpi_op("sgt", &["%a", "%b"]), &[("%a", si(3)), ("%b", f16_tile(&[1.0, 5.0, 3.0]))]);
+    let r2 = run_op(
+        &cmpi_op("sgt", &["%a", "%b"]),
+        &[("%a", si(3)), ("%b", f16_tile(&[1.0, 5.0, 3.0]))],
+    );
     assert_eq!(as_tile(&r2).data.to_vec(), vec![1.0, 0.0, 0.0]); // 3 > [1,5,3]
 }
 
@@ -448,12 +526,20 @@ fn test_cmpi_tile_scalar() {
 fn test_select_scalar() {
     let rt = run_op(
         &op("arith.select", &["%c", "%t", "%f"]),
-        &[("%c", Value::Scalar(Scalar::Bool(true))), ("%t", si(10)), ("%f", si(20))],
+        &[
+            ("%c", Value::Scalar(Scalar::Bool(true))),
+            ("%t", si(10)),
+            ("%f", si(20)),
+        ],
     );
     assert_eq!(as_i64(&rt), 10);
     let rf = run_op(
         &op("arith.select", &["%c", "%t", "%f"]),
-        &[("%c", Value::Scalar(Scalar::Bool(false))), ("%t", si(10)), ("%f", si(20))],
+        &[
+            ("%c", Value::Scalar(Scalar::Bool(false))),
+            ("%t", si(10)),
+            ("%f", si(20)),
+        ],
     );
     assert_eq!(as_i64(&rf), 20);
 }
@@ -478,7 +564,10 @@ fn test_select_tile() {
 
 #[test]
 fn test_exp_tile() {
-    let r = run_op(&op("math.exp", &["%x"]), &[("%x", f16_tile(&[0.0, 1.0, 2.0]))]);
+    let r = run_op(
+        &op("math.exp", &["%x"]),
+        &[("%x", f16_tile(&[0.0, 1.0, 2.0]))],
+    );
     data_close(&as_tile(&r).data, &[1.0, 1.0f32.exp(), 2.0f32.exp()], 1e-1);
 }
 
@@ -491,7 +580,10 @@ fn test_exp_scalar() {
 
 #[test]
 fn test_sqrt_tile() {
-    let r = run_op(&op("math.sqrt", &["%x"]), &[("%x", f16_tile(&[1.0, 4.0, 9.0, 16.0]))]);
+    let r = run_op(
+        &op("math.sqrt", &["%x"]),
+        &[("%x", f16_tile(&[1.0, 4.0, 9.0, 16.0]))],
+    );
     data_close(&as_tile(&r).data, &[1.0, 2.0, 3.0, 4.0], 1e-2);
 }
 
@@ -554,12 +646,16 @@ fn test_coreid_wildcard() {
 
     let wild = Operation::new(Some("%ids"), "ktdp.coreid", &["%x"]);
     ctx.set_value("%x", idx(-1));
-    let r = dispatch.handler("ktdp.coreid").unwrap()(&wild, &mut ctx, &env).unwrap().unwrap();
+    let r = dispatch.handler("ktdp.coreid").unwrap()(&wild, &mut ctx, &env)
+        .unwrap()
+        .unwrap();
     assert_eq!(as_ids(&r).len(), 8);
 
     let exact = Operation::new(Some("%ids"), "ktdp.coreid", &["%x"]);
     ctx.set_value("%x", idx(3));
-    let r = dispatch.handler("ktdp.coreid").unwrap()(&exact, &mut ctx, &env).unwrap().unwrap();
+    let r = dispatch.handler("ktdp.coreid").unwrap()(&exact, &mut ctx, &env)
+        .unwrap()
+        .unwrap();
     assert_eq!(as_ids(&r), vec![3]);
 }
 
@@ -572,7 +668,9 @@ fn test_coreid_pads_to_3d() {
     let mut ctx = ctx_at(0, (0, 0, 0), 4);
     ctx.set_value("%x", idx(2));
     let o = Operation::new(Some("%ids"), "ktdp.coreid", &["%x"]);
-    let r = dispatch.handler("ktdp.coreid").unwrap()(&o, &mut ctx, &env).unwrap().unwrap();
+    let r = dispatch.handler("ktdp.coreid").unwrap()(&o, &mut ctx, &env)
+        .unwrap()
+        .unwrap();
     assert_eq!(as_ids(&r), vec![2]);
 }
 
@@ -594,9 +692,13 @@ fn for_op_ir(
 ) -> Operation {
     let mut operands = vec![lb, ub, step];
     operands.extend_from_slice(iter_inits);
-    let mut o = Operation::new(result, "scf.for", &operands).with_attr("iter_var", Attr::Str(iter_var.into()));
+    let mut o = Operation::new(result, "scf.for", &operands)
+        .with_attr("iter_var", Attr::Str(iter_var.into()));
     if !iter_args.is_empty() {
-        o = o.with_attr("iter_args", Attr::StrList(iter_args.iter().map(|s| s.to_string()).collect()));
+        o = o.with_attr(
+            "iter_args",
+            Attr::StrList(iter_args.iter().map(|s| s.to_string()).collect()),
+        );
     }
     o.regions = vec![body];
     o
@@ -612,7 +714,8 @@ fn run_seeded(o: &Operation, seed: &[(&str, Value)]) -> CoreContext {
     for (n, v) in seed {
         ctx.set_value(n, v.clone());
     }
-    execute_op(o, &mut ctx, &env).unwrap_or_else(|e| panic!("execute_op {:?} failed: {e}", o.op_type));
+    execute_op(o, &mut ctx, &env)
+        .unwrap_or_else(|e| panic!("execute_op {:?} failed: {e}", o.op_type));
     ctx
 }
 
@@ -679,7 +782,16 @@ fn test_for_op() {
         Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]),
         Operation::new(None, "scf.yield", &["%s"]),
     ];
-    let f = for_op_ir(Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"], body);
+    let f = for_op_ir(
+        Some("%r"),
+        "%lb",
+        "%ub",
+        "%step",
+        "%i",
+        &["%init"],
+        &["%acc"],
+        body,
+    );
     let ctx = run_seeded(
         &f,
         &[
@@ -739,7 +851,16 @@ fn test_for_op_iter_args_running_sum() {
         Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]),
         Operation::new(None, "scf.yield", &["%s"]),
     ];
-    let f = for_op_ir(Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"], body);
+    let f = for_op_ir(
+        Some("%r"),
+        "%lb",
+        "%ub",
+        "%step",
+        "%i",
+        &["%init"],
+        &["%acc"],
+        body,
+    );
     let ctx = run_seeded(
         &f,
         &[
@@ -788,8 +909,12 @@ fn matmul_add_fusion_matches_separate() {
     // core a large LX to exercise the NAX-fused path end-to-end. (Per-op tiles in
     // real KTIR programs are LX-bounded and thus below the NAX gate — see the
     // note in metal_backend::choose_matmul_backend.)
-    let big_lx = Rc::new(std::cell::RefCell::new(ktir_cpu::memory::LXScratchpad::new(0, 256)));
-    let hbm = Rc::new(std::cell::RefCell::new(ktir_cpu::memory::HBMSimulator::default()));
+    let big_lx = Rc::new(std::cell::RefCell::new(
+        ktir_cpu::memory::LXScratchpad::new(0, 256),
+    ));
+    let hbm = Rc::new(std::cell::RefCell::new(
+        ktir_cpu::memory::HBMSimulator::default(),
+    ));
     let mut ctx = CoreContext::new(0, (0, 0, 0), hbm, Rc::clone(&big_lx), vec![big_lx]);
     ctx.set_value("%A", tile_with(&a, DType::F32, &[m, k]));
     ctx.set_value("%B", tile_with(&b, DType::F32, &[k, n]));
@@ -810,5 +935,8 @@ fn matmul_add_fusion_matches_separate() {
         max_rel = max_rel.max((got - w).abs() / w.abs().max(1.0));
     }
     // bf16 tolerance (NAX path); exact on the CPU-fallback path.
-    assert!(max_rel < 0.05, "fused matmul+add: max rel err {max_rel} too large");
+    assert!(
+        max_rel < 0.05,
+        "fused matmul+add: max rel err {max_rel} too large"
+    );
 }

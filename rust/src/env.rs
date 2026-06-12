@@ -81,7 +81,11 @@ pub struct ExecutionEnv<'a> {
 impl<'a> ExecutionEnv<'a> {
     /// Env with latency tracking disabled (the common case).
     pub fn new(dispatch: &'a Dispatch, grid: &'a GridExecutor) -> Self {
-        ExecutionEnv { dispatch, grid, tracker: None }
+        ExecutionEnv {
+            dispatch,
+            grid,
+            tracker: None,
+        }
     }
 
     /// Env that records per-op latency into `tracker`.
@@ -90,7 +94,11 @@ impl<'a> ExecutionEnv<'a> {
         grid: &'a GridExecutor,
         tracker: &'a RefCell<LatencyTracker>,
     ) -> Self {
-        ExecutionEnv { dispatch, grid, tracker: Some(tracker) }
+        ExecutionEnv {
+            dispatch,
+            grid,
+            tracker: Some(tracker),
+        }
     }
 }
 

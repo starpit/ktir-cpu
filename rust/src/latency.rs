@@ -81,8 +81,8 @@ impl HardwareConfig {
 use std::collections::BTreeMap;
 
 use crate::ir::Value;
-use crate::memref::MemorySpace;
 use crate::memory::STICK_BYTES;
+use crate::memref::MemorySpace;
 use crate::tile::Tile;
 
 /// Coarse bucket a recorded op's cycles land in. Mirrors the Python
@@ -420,7 +420,11 @@ fn memory_space(operands: &[Option<Value>]) -> SpaceKind {
                         .index_views
                         .iter()
                         .all(|iv| space_of(iv.space) == SpaceKind::Lx);
-                return if all_lx { SpaceKind::Lx } else { SpaceKind::Hbm };
+                return if all_lx {
+                    SpaceKind::Lx
+                } else {
+                    SpaceKind::Hbm
+                };
             }
             _ => {}
         }
@@ -475,7 +479,13 @@ fn matmul_dims(operands: &[Option<Value>]) -> (usize, usize, usize) {
     let tiles: Vec<&Tile> = operands
         .iter()
         .flatten()
-        .filter_map(|v| if let Value::Tile(t) = v { Some(t) } else { None })
+        .filter_map(|v| {
+            if let Value::Tile(t) = v {
+                Some(t)
+            } else {
+                None
+            }
+        })
         .collect();
     if tiles.len() >= 2 {
         let a = tiles[0];
@@ -540,9 +550,13 @@ impl LatencyReport {
     /// The critical-path core (max total cycles). Ties resolve to the first
     /// (lowest core_id) — `BTreeMap` iteration is ordered.
     fn critical(&self) -> Option<&CoreLatencyCounters> {
-        self.counters
-            .values()
-            .reduce(|a, b| if b.total_cycles() > a.total_cycles() { b } else { a })
+        self.counters.values().reduce(|a, b| {
+            if b.total_cycles() > a.total_cycles() {
+                b
+            } else {
+                a
+            }
+        })
     }
 
     /// Kernel latency = max total cycles across all cores. Mirrors `kernel_cycles`.
@@ -703,7 +717,13 @@ mod tests {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         // 4 sticks * 128 B = 512 B; bw = 1000/32 B/cycle.
         let operands = [Some(Value::TileRef(hbm_tileref()))];
-        t.record_op(0, "ktdp.load", LatencyCategory::Memory, &load_result(4, None), &operands);
+        t.record_op(
+            0,
+            "ktdp.load",
+            LatencyCategory::Memory,
+            &load_result(4, None),
+            &operands,
+        );
         let c = &t.counters()[&0];
         let expect = 512.0 / (1000.0 / 32.0);
         assert!((c.memory_cycles - expect).abs() < 1e-9);
@@ -715,7 +735,13 @@ mod tests {
     fn lx_memory_op_is_free() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         let operands = [Some(Value::TileRef(lx_tileref()))];
-        t.record_op(0, "ktdp.load", LatencyCategory::Memory, &load_result(99, None), &operands);
+        t.record_op(
+            0,
+            "ktdp.load",
+            LatencyCategory::Memory,
+            &load_result(99, None),
+            &operands,
+        );
         let c = &t.counters()[&0];
         assert_eq!(c.memory_cycles, 0.0);
         assert_eq!(c.total_bytes, 0);
@@ -726,7 +752,13 @@ mod tests {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         // store handler returns unique_sticks as Value::Index; no view operand
         // means default HBM space.
-        t.record_op(0, "ktdp.store", LatencyCategory::Memory, &Some(Value::Index(3)), &[]);
+        t.record_op(
+            0,
+            "ktdp.store",
+            LatencyCategory::Memory,
+            &Some(Value::Index(3)),
+            &[],
+        );
         let c = &t.counters()[&0];
         assert_eq!(c.total_bytes, 3 * 128);
         let expect = (3.0 * 128.0) / (1000.0 / 32.0);
@@ -738,14 +770,24 @@ mod tests {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         let operands = [Some(Value::TileRef(hbm_tileref()))];
         // 2 data sticks + 5 idx sticks = 7 sticks * 128 B.
-        t.record_op(0, "ktdp.load", LatencyCategory::Memory, &load_result(2, Some(5)), &operands);
+        t.record_op(
+            0,
+            "ktdp.load",
+            LatencyCategory::Memory,
+            &load_result(2, Some(5)),
+            &operands,
+        );
         assert_eq!(t.counters()[&0].total_bytes, 7 * 128);
     }
 
     #[test]
     fn compute_float_one_flop_per_elem() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
-        let res = Some(Value::Tile(Tile::compute(vec![0.0; 128], DType::F32, vec![128])));
+        let res = Some(Value::Tile(Tile::compute(
+            vec![0.0; 128],
+            DType::F32,
+            vec![128],
+        )));
         t.record_op(0, "arith.addf", LatencyCategory::ComputeFloat, &res, &[]);
         let c = &t.counters()[&0];
         assert_eq!(c.total_flops, 128.0);
@@ -756,8 +798,18 @@ mod tests {
     #[test]
     fn transcendental_applies_penalty() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
-        let res = Some(Value::Tile(Tile::compute(vec![0.0; 64], DType::F32, vec![64])));
-        t.record_op(0, "math.exp", LatencyCategory::ComputeTranscendental, &res, &[]);
+        let res = Some(Value::Tile(Tile::compute(
+            vec![0.0; 64],
+            DType::F32,
+            vec![64],
+        )));
+        t.record_op(
+            0,
+            "math.exp",
+            LatencyCategory::ComputeTranscendental,
+            &res,
+            &[],
+        );
         let c = &t.counters()[&0];
         // (64/64) * penalty(4) = 4 cycles; flops = 64 (penalty doesn't add flops).
         assert!((c.compute_cycles - 4.0).abs() < 1e-9);
@@ -768,7 +820,13 @@ mod tests {
     fn scalar_int_is_free() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         // no tile operands/result => n_elems == 1 => free.
-        t.record_op(0, "arith.addi", LatencyCategory::ComputeInt, &Some(Value::Index(5)), &[]);
+        t.record_op(
+            0,
+            "arith.addi",
+            LatencyCategory::ComputeInt,
+            &Some(Value::Index(5)),
+            &[],
+        );
         let c = &t.counters()[&0];
         assert_eq!(c.compute_cycles, 0.0);
         assert_eq!(c.total_flops, 0.0);
@@ -777,7 +835,11 @@ mod tests {
     #[test]
     fn vector_int_charges_elements() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
-        let res = Some(Value::Tile(Tile::compute(vec![0.0; 128], DType::I32, vec![128])));
+        let res = Some(Value::Tile(Tile::compute(
+            vec![0.0; 128],
+            DType::I32,
+            vec![128],
+        )));
         t.record_op(0, "arith.addi", LatencyCategory::ComputeInt, &res, &[]);
         let c = &t.counters()[&0];
         assert!((c.compute_cycles - 2.0).abs() < 1e-9);
@@ -790,7 +852,13 @@ mod tests {
         let a = Value::Tile(Tile::compute(vec![0.0; 64 * 64], DType::F16, vec![64, 64]));
         let b = Value::Tile(Tile::compute(vec![0.0; 64 * 64], DType::F16, vec![64, 64]));
         let operands = [Some(a), Some(b)];
-        t.record_op(0, "linalg.matmul", LatencyCategory::ComputeMatmul, &None, &operands);
+        t.record_op(
+            0,
+            "linalg.matmul",
+            LatencyCategory::ComputeMatmul,
+            &None,
+            &operands,
+        );
         let c = &t.counters()[&0];
         let flops = 2.0 * 64.0 * 64.0 * 64.0;
         assert_eq!(c.total_flops, flops);
@@ -803,7 +871,13 @@ mod tests {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         // 64 f16 elems = 128 bytes; ring bw = 4000 B/cycle.
         let tile = Value::Tile(Tile::compute(vec![0.0; 64], DType::F16, vec![64]));
-        t.record_op(0, "ktdp.allgather", LatencyCategory::Comm, &None, &[Some(tile)]);
+        t.record_op(
+            0,
+            "ktdp.allgather",
+            LatencyCategory::Comm,
+            &None,
+            &[Some(tile)],
+        );
         let c = &t.counters()[&0];
         assert_eq!(c.total_bytes, 128);
         assert!((c.comm_cycles - 128.0 / 4000.0).abs() < 1e-9);
@@ -813,7 +887,13 @@ mod tests {
     fn reduce_multiplies_by_log2_rounds() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         let tile = Value::Tile(Tile::compute(vec![0.0; 64], DType::F16, vec![64]));
-        t.record_op(0, "ktdp.reduce", LatencyCategory::Comm, &None, &[Some(tile)]);
+        t.record_op(
+            0,
+            "ktdp.reduce",
+            LatencyCategory::Comm,
+            &None,
+            &[Some(tile)],
+        );
         let c = &t.counters()[&0];
         // ceil(log2(32)) = 5 rounds.
         let base = 128.0 / 4000.0;
@@ -824,9 +904,17 @@ mod tests {
     fn report_kernel_cycles_is_max_and_bottleneck() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         // core 0: heavy compute. core 1: light.
-        let big = Some(Value::Tile(Tile::compute(vec![0.0; 64 * 100], DType::F32, vec![6400])));
+        let big = Some(Value::Tile(Tile::compute(
+            vec![0.0; 64 * 100],
+            DType::F32,
+            vec![6400],
+        )));
         t.record_op(0, "arith.addf", LatencyCategory::ComputeFloat, &big, &[]);
-        let small = Some(Value::Tile(Tile::compute(vec![0.0; 64], DType::F32, vec![64])));
+        let small = Some(Value::Tile(Tile::compute(
+            vec![0.0; 64],
+            DType::F32,
+            vec![64],
+        )));
         t.record_op(1, "arith.addf", LatencyCategory::ComputeFloat, &small, &[]);
         let rep = t.report();
         assert!((rep.kernel_cycles() - 100.0).abs() < 1e-9);
@@ -839,7 +927,13 @@ mod tests {
         let mut t = LatencyTracker::new(HardwareConfig::default());
         // pure HBM load: bytes > 0, flops == 0 => AI 0 => memory bound.
         let operands = [Some(Value::TileRef(hbm_tileref()))];
-        t.record_op(0, "ktdp.load", LatencyCategory::Memory, &load_result(8, None), &operands);
+        t.record_op(
+            0,
+            "ktdp.load",
+            LatencyCategory::Memory,
+            &load_result(8, None),
+            &operands,
+        );
         let rep = t.report();
         assert_eq!(rep.bottleneck(), "memory");
         let rf = rep.roofline().unwrap();
@@ -850,7 +944,11 @@ mod tests {
     #[test]
     fn reset_clears_counters() {
         let mut t = LatencyTracker::new(HardwareConfig::default());
-        let res = Some(Value::Tile(Tile::compute(vec![0.0; 64], DType::F32, vec![64])));
+        let res = Some(Value::Tile(Tile::compute(
+            vec![0.0; 64],
+            DType::F32,
+            vec![64],
+        )));
         t.record_op(0, "arith.addf", LatencyCategory::ComputeFloat, &res, &[]);
         assert!(!t.counters().is_empty());
         t.reset();
@@ -861,7 +959,11 @@ mod tests {
     #[test]
     fn trace_records_per_op_entries() {
         let mut t = LatencyTracker::with_trace(HardwareConfig::default(), true);
-        let res = Some(Value::Tile(Tile::compute(vec![0.0; 64], DType::F32, vec![64])));
+        let res = Some(Value::Tile(Tile::compute(
+            vec![0.0; 64],
+            DType::F32,
+            vec![64],
+        )));
         t.record_op(0, "arith.addf", LatencyCategory::ComputeFloat, &res, &[]);
         let trace = t.counters()[&0].trace.as_ref().unwrap();
         assert_eq!(trace.len(), 1);

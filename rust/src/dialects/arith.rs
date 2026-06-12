@@ -95,23 +95,43 @@ pub fn register(d: &mut Dispatch) {
 // Float binary ops
 // ===========================================================================
 
-fn addf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn addf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_float(op, ctx, "arith.addf", |a, b| a + b)
 }
 
-fn subf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn subf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_float(op, ctx, "arith.subf", |a, b| a - b)
 }
 
-fn mulf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn mulf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_float(op, ctx, "arith.mulf", |a, b| a * b)
 }
 
-fn divf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn divf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_float(op, ctx, "arith.divf", |a, b| a / b)
 }
 
-fn remf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn remf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // operator.mod on floats: numpy/Python `%` — result takes divisor's sign.
     binary_float(op, ctx, "arith.remf", py_fmod)
 }
@@ -120,11 +140,19 @@ fn remf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
 // Float unary ops
 // ===========================================================================
 
-fn negf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn negf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary_float(op, ctx, "arith.negf", |x| -x)
 }
 
-fn absf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn absf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     unary_float(op, ctx, "arith.absf", f32::abs)
 }
 
@@ -132,7 +160,11 @@ fn absf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
 // Float min/max
 // ===========================================================================
 
-fn maxf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn maxf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // np.maximum — NaN-propagating.
     binary_float(op, ctx, "arith.maxf", |a, b| {
         if a.is_nan() || b.is_nan() {
@@ -145,12 +177,20 @@ fn maxf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
     })
 }
 
-fn maxnumf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn maxnumf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // np.fmax — NaN non-propagating.
     binary_float(op, ctx, "arith.maxnumf", f32::max)
 }
 
-fn minf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn minf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_float(op, ctx, "arith.minf", |a, b| {
         if a.is_nan() || b.is_nan() {
             f32::NAN
@@ -162,7 +202,11 @@ fn minf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Op
     })
 }
 
-fn minnumf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn minnumf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_float(op, ctx, "arith.minnumf", f32::min)
 }
 
@@ -170,7 +214,11 @@ fn minnumf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
 // Float comparison
 // ===========================================================================
 
-fn cmpf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn cmpf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let (a, b) = two_operands(op, ctx, "arith.cmpf")?;
     let pred = predicate(op, "arith.cmpf")?;
     let f = cmpf_fn(&pred)?;
@@ -206,65 +254,121 @@ fn cmpf_fn(pred: &str) -> Result<fn(f64, f64) -> bool, String> {
 // Integer binary ops
 // ===========================================================================
 
-fn addi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn addi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.addi", |a, b| a.wrapping_add(b))
 }
 
-fn subi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn subi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.subi", |a, b| a.wrapping_sub(b))
 }
 
-fn muli(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn muli(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.muli", |a, b| a.wrapping_mul(b))
 }
 
-fn divsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn divsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // MLIR divsi truncates toward zero (Rust `/` already does).
     binary_int(op, ctx, "arith.divsi", |a, b| a / b)
 }
 
-fn divui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn divui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Python uses floordiv; for the index ranges here operands are non-negative.
     binary_int(op, ctx, "arith.divui", py_floordiv)
 }
 
-fn floordivsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn floordivsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Python `//` floors toward -inf.
     binary_int(op, ctx, "arith.floordivsi", py_floordiv)
 }
 
-fn remsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn remsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // remsi is remainder after truncating division: a - trunc(a/b)*b (Rust `%`).
     binary_int(op, ctx, "arith.remsi", |a, b| a % b)
 }
 
-fn remui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn remui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Python `%` floors toward -inf (sign follows divisor).
     binary_int(op, ctx, "arith.remui", py_mod)
 }
 
-fn ceildivsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn ceildivsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.ceildivsi", ceil_div)
 }
 
-fn ceildivui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn ceildivui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.ceildivui", ceil_div)
 }
 
-fn minsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn minsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.minsi", i64::min)
 }
 
-fn maxsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn maxsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.maxsi", i64::max)
 }
 
-fn minui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn minui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Operands are non-negative index values; unsigned min == signed min here.
     binary_int(op, ctx, "arith.minui", i64::min)
 }
 
-fn maxui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn maxui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.maxui", i64::max)
 }
 
@@ -272,28 +376,52 @@ fn maxui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
 // Integer bitwise / shift
 // ===========================================================================
 
-fn andi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn andi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.andi", |a, b| a & b)
 }
 
-fn ori(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn ori(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.ori", |a, b| a | b)
 }
 
-fn xori(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn xori(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.xori", |a, b| a ^ b)
 }
 
-fn shli(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn shli(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     binary_int(op, ctx, "arith.shli", |a, b| a << b)
 }
 
-fn shrsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn shrsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Arithmetic (sign-preserving) right shift — Rust `>>` on i64.
     binary_int(op, ctx, "arith.shrsi", |a, b| a >> b)
 }
 
-fn shrui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn shrui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Logical right shift — reinterpret as unsigned 32-bit (Python uses uint32).
     binary_int(op, ctx, "arith.shrui", |a, b| {
         ((a as u32) >> (b as u32)) as i64
@@ -304,14 +432,20 @@ fn shrui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
 // Integer comparison
 // ===========================================================================
 
-fn cmpi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn cmpi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let (a, b) = two_operands(op, ctx, "arith.cmpi")?;
     let pred = predicate(op, "arith.cmpi")?;
     let f = cmpi_fn(&pred)?;
     // Compare element values as integers. Unsigned predicates use the same
     // comparison as signed: the interpreter operates on non-negative index
     // integers, so sign-bit reinterpretation never occurs (matches Python).
-    compare(a, b, "arith.cmpi", move |x, y| f(round_i64(x), round_i64(y)))
+    compare(a, b, "arith.cmpi", move |x, y| {
+        f(round_i64(x), round_i64(y))
+    })
 }
 
 fn cmpi_fn(pred: &str) -> Result<fn(i64, i64) -> bool, String> {
@@ -333,7 +467,11 @@ fn cmpi_fn(pred: &str) -> Result<fn(i64, i64) -> bool, String> {
 /// `%r = arith.select %cond, %t, %f`. Scalar cond picks one operand whole;
 /// tile cond does element-wise `np.where`, taking the result dtype/shape from
 /// whichever of true/false is a tile (mirrors the Python handler).
-fn select(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn select(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.len() != 3 {
         return Err(format!(
             "arith.select expects 3 operands, got {}",
@@ -386,7 +524,11 @@ fn select(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
 /// the tensor form (`is_tensor`) splats a scalar across `shape`, or — for the
 /// `dense<[..]>` list form (`dense_list`) — lays the per-element list out
 /// directly. Mirrors `arith__constant`.
-fn constant(op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn constant(
+    op: &Operation,
+    _ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let is_tensor = matches!(op.attributes.get("is_tensor"), Some(Attr::Bool(true)));
     if is_tensor {
         let shape: Vec<usize> = match op.attributes.get("shape") {
@@ -407,7 +549,7 @@ fn constant(op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resu
                 other => {
                     return Err(format!(
                         "arith.constant dense_list: bad 'value' attr {other:?}"
-                    ))
+                    ));
                 }
             }
         } else {
@@ -438,12 +580,20 @@ fn constant(op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resu
     Ok(Some(val))
 }
 
-fn extf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn extf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Widen float (e.g. f16 -> f32). Storage is already f32; relabel tiles.
     cast_to_float(op, ctx, "arith.extf", DType::F32)
 }
 
-fn truncf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn truncf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Narrow float (e.g. f32 -> f16). Round element values through f16.
     let v = unary_operand(op, ctx, "arith.truncf")?;
     match v {
@@ -459,19 +609,35 @@ fn truncf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
     }
 }
 
-fn extsi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn extsi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     cast_to_int(op, ctx, "arith.extsi", DType::I64)
 }
 
-fn extui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn extui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     cast_to_int(op, ctx, "arith.extui", DType::I64)
 }
 
-fn trunci(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn trunci(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     cast_to_int(op, ctx, "arith.trunci", DType::I32)
 }
 
-fn sitofp(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn sitofp(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Convert signed int -> float, target dtype from result_type (default f32).
     let dtype = op
         .result_type
@@ -497,7 +663,11 @@ fn sitofp(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
 /// change. Scalar 32-bit pairs only (`i32`<->`f32`), which covers the ±inf/NaN
 /// bit-pattern idiom (`0xFF800000 : i32` -> `-inf : f32`). Tile bitcasts need
 /// the dtype-faithful storage fork (see tile.rs) and are rejected for now.
-fn bitcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn bitcast(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // result_type is "<src> to <dst>"; take the destination spelling.
     let dst = op
         .result_type
@@ -517,9 +687,9 @@ fn bitcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
             // Extract the 32-bit source pattern (int as-is, float via to_bits).
             let bits: u32 = match &scalar {
                 Value::Scalar(Scalar::F32(f)) => f.to_bits(),
-                Value::Scalar(s) => s
-                    .as_i64()
-                    .ok_or("arith.bitcast: non-numeric scalar")? as i32 as u32,
+                Value::Scalar(s) => {
+                    s.as_i64().ok_or("arith.bitcast: non-numeric scalar")? as i32 as u32
+                }
                 Value::Index(i) => *i as i32 as u32,
                 other => return Err(format!("arith.bitcast: bad operand {other:?}")),
             };
@@ -529,7 +699,7 @@ fn bitcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
                 other => {
                     return Err(format!(
                         "arith.bitcast: unsupported scalar target {other} (32-bit i32/f32 only)"
-                    ))
+                    ));
                 }
             };
             Ok(Some(out))
@@ -537,7 +707,11 @@ fn bitcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
     }
 }
 
-fn uitofp(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn uitofp(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Unsigned int -> f32.
     let v = unary_operand(op, ctx, "arith.uitofp")?;
     match v {
@@ -554,7 +728,11 @@ fn uitofp(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
     }
 }
 
-fn fptosi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn fptosi(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Float -> signed int (truncation toward zero); tiles become i32.
     let v = unary_operand(op, ctx, "arith.fptosi")?;
     match v {
@@ -570,7 +748,11 @@ fn fptosi(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
     }
 }
 
-fn fptoui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn fptoui(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     // Float -> unsigned int (truncation toward zero); tiles become ui32 (-> i32 here).
     let v = unary_operand(op, ctx, "arith.fptoui")?;
     match v {
@@ -587,7 +769,11 @@ fn fptoui(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
 }
 
 /// `arith.index_cast` / `index_castui` — coerce a scalar to an integer index.
-fn index_cast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn index_cast(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let v = unary_operand(op, ctx, "arith.index_cast")?;
     let i = match v {
         Value::Index(i) => i,
@@ -602,12 +788,20 @@ fn index_cast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Res
 
 /// `arith.convertf` — float-to-float conversion; direction inferred from the
 /// input dtype (f16 widens to f32, otherwise narrow to f16). Mirrors `convertf`.
-fn convertf(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn convertf(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let v = unary_operand(op, ctx, "arith.convertf")?;
     match v {
         Value::Tile(t) => {
             if t.dtype == DType::F16 {
-                Ok(Some(Value::Tile(Tile::compute(t.data.to_vec(), DType::F32, t.shape))))
+                Ok(Some(Value::Tile(Tile::compute(
+                    t.data.to_vec(),
+                    DType::F32,
+                    t.shape,
+                ))))
             } else {
                 let data: Vec<f32> = t.data.iter().map(|&x| widen_f16(narrow_f16(x))).collect();
                 Ok(Some(Value::Tile(Tile::compute(data, DType::F16, t.shape))))
@@ -629,7 +823,10 @@ fn two_operands<'s>(
     name: &str,
 ) -> Result<(&'s Value, &'s Value), String> {
     if op.operands.len() != 2 {
-        return Err(format!("{name} expects 2 operands, got {}", op.operands.len()));
+        return Err(format!(
+            "{name} expects 2 operands, got {}",
+            op.operands.len()
+        ));
     }
     let a = ctx.get_value(&op.operands[0])?;
     let b = ctx.get_value(&op.operands[1])?;
@@ -638,7 +835,10 @@ fn two_operands<'s>(
 
 fn unary_operand(op: &Operation, ctx: &CoreContext, name: &str) -> Result<Value, String> {
     if op.operands.len() != 1 {
-        return Err(format!("{name} expects 1 operand, got {}", op.operands.len()));
+        return Err(format!(
+            "{name} expects 1 operand, got {}",
+            op.operands.len()
+        ));
     }
     Ok(ctx.get_value(&op.operands[0])?.clone())
 }
@@ -654,27 +854,55 @@ fn binary_float(
     let (a, b) = two_operands(op, ctx, name)?;
     match (a, b) {
         (Value::Scalar(x), Value::Scalar(y)) => {
-            let x = x.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
-            let y = y.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
+            let x = x
+                .as_f32()
+                .ok_or_else(|| format!("{name}: non-float scalar"))?;
+            let y = y
+                .as_f32()
+                .ok_or_else(|| format!("{name}: non-float scalar"))?;
             Ok(Some(Value::Scalar(Scalar::F32(f(x, y)))))
         }
         (Value::Tile(x), Value::Tile(y)) => {
             if x.shape != y.shape {
-                return Err(format!("{name}: shape mismatch {:?} vs {:?}", x.shape, y.shape));
+                return Err(format!(
+                    "{name}: shape mismatch {:?} vs {:?}",
+                    x.shape, y.shape
+                ));
             }
-            let data: Vec<f32> = x.data.iter().zip(y.data.iter()).map(|(&p, &q)| f(p, q)).collect();
+            let data: Vec<f32> = x
+                .data
+                .iter()
+                .zip(y.data.iter())
+                .map(|(&p, &q)| f(p, q))
+                .collect();
             let dtype = result_float_dtype(x.dtype, y.dtype);
-            Ok(Some(Value::Tile(Tile::compute(data, dtype, x.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                dtype,
+                x.shape.clone(),
+            ))))
         }
         (Value::Tile(x), Value::Scalar(y)) => {
-            let y = y.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
+            let y = y
+                .as_f32()
+                .ok_or_else(|| format!("{name}: non-float scalar"))?;
             let data: Vec<f32> = x.data.iter().map(|&p| f(p, y)).collect();
-            Ok(Some(Value::Tile(Tile::compute(data, x.dtype, x.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                x.dtype,
+                x.shape.clone(),
+            ))))
         }
         (Value::Scalar(x), Value::Tile(y)) => {
-            let x = x.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
+            let x = x
+                .as_f32()
+                .ok_or_else(|| format!("{name}: non-float scalar"))?;
             let data: Vec<f32> = y.data.iter().map(|&q| f(x, q)).collect();
-            Ok(Some(Value::Tile(Tile::compute(data, y.dtype, y.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                y.dtype,
+                y.shape.clone(),
+            ))))
         }
         _ => Err(format!("{name}: operand kinds not float-compatible")),
     }
@@ -689,7 +917,9 @@ fn unary_float(
     let v = unary_operand(op, ctx, name)?;
     match v {
         Value::Scalar(s) => {
-            let x = s.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
+            let x = s
+                .as_f32()
+                .ok_or_else(|| format!("{name}: non-float scalar"))?;
             Ok(Some(Value::Scalar(Scalar::F32(f(x)))))
         }
         Value::Tile(t) => {
@@ -714,7 +944,10 @@ fn binary_int(
     match (a, b) {
         (Value::Tile(x), Value::Tile(y)) => {
             if x.shape != y.shape {
-                return Err(format!("{name}: shape mismatch {:?} vs {:?}", x.shape, y.shape));
+                return Err(format!(
+                    "{name}: shape mismatch {:?} vs {:?}",
+                    x.shape, y.shape
+                ));
             }
             let data: Vec<f32> = x
                 .data
@@ -722,17 +955,29 @@ fn binary_int(
                 .zip(y.data.iter())
                 .map(|(&p, &q)| f(round_i64(p), round_i64(q)) as f32)
                 .collect();
-            Ok(Some(Value::Tile(Tile::compute(data, x.dtype, x.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                x.dtype,
+                x.shape.clone(),
+            ))))
         }
         (Value::Tile(x), _) => {
             let s = scalar_i64(b, name)?;
             let data: Vec<f32> = x.data.iter().map(|&p| f(round_i64(p), s) as f32).collect();
-            Ok(Some(Value::Tile(Tile::compute(data, x.dtype, x.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                x.dtype,
+                x.shape.clone(),
+            ))))
         }
         (_, Value::Tile(y)) => {
             let s = scalar_i64(a, name)?;
             let data: Vec<f32> = y.data.iter().map(|&q| f(s, round_i64(q)) as f32).collect();
-            Ok(Some(Value::Tile(Tile::compute(data, y.dtype, y.shape.clone()))))
+            Ok(Some(Value::Tile(Tile::compute(
+                data,
+                y.dtype,
+                y.shape.clone(),
+            ))))
         }
         _ => {
             let (x, y) = (scalar_i64(a, name)?, scalar_i64(b, name)?);
@@ -799,9 +1044,15 @@ fn cast_to_float(
 ) -> Result<Option<Value>, String> {
     let v = unary_operand(op, ctx, name)?;
     match v {
-        Value::Tile(t) => Ok(Some(Value::Tile(Tile::compute(t.data.to_vec(), dtype, t.shape)))),
+        Value::Tile(t) => Ok(Some(Value::Tile(Tile::compute(
+            t.data.to_vec(),
+            dtype,
+            t.shape,
+        )))),
         Value::Scalar(s) => {
-            let x = s.as_f32().ok_or_else(|| format!("{name}: non-float scalar"))?;
+            let x = s
+                .as_f32()
+                .ok_or_else(|| format!("{name}: non-float scalar"))?;
             Ok(Some(Value::Scalar(Scalar::F32(x))))
         }
         other => Err(format!("{name}: bad operand {other:?}")),
@@ -821,7 +1072,9 @@ fn cast_to_int(
             Ok(Some(Value::Tile(Tile::compute(data, dtype, t.shape))))
         }
         Value::Scalar(s) => {
-            let i = s.as_i64().ok_or_else(|| format!("{name}: non-int scalar"))?;
+            let i = s
+                .as_i64()
+                .ok_or_else(|| format!("{name}: non-int scalar"))?;
             Ok(Some(Value::Scalar(Scalar::I64(i))))
         }
         Value::Index(i) => Ok(Some(Value::Scalar(Scalar::I64(i)))),
@@ -1012,7 +1265,9 @@ mod tests {
             ctx.set_value(n, v.clone());
         }
         let handler = dispatch.handler(&op.op_type).expect("handler registered");
-        handler(op, &mut ctx, &env).unwrap().expect("op produced a value")
+        handler(op, &mut ctx, &env)
+            .unwrap()
+            .expect("op produced a value")
     }
 
     fn f32s(name: &str, op_ty: &str, ops: &[&str]) -> Operation {
@@ -1059,17 +1314,32 @@ mod tests {
     #[test]
     fn float_binops_scalar() {
         let seed = [("%a", sf(6.0)), ("%b", sf(4.0))];
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed)), 10.0);
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.subf", &["%a", "%b"]), &seed)), 2.0);
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.mulf", &["%a", "%b"]), &seed)), 24.0);
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.divf", &["%a", "%b"]), &seed)), 1.5);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed)),
+            10.0
+        );
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.subf", &["%a", "%b"]), &seed)),
+            2.0
+        );
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.mulf", &["%a", "%b"]), &seed)),
+            24.0
+        );
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.divf", &["%a", "%b"]), &seed)),
+            1.5
+        );
     }
 
     #[test]
     fn remf_takes_divisor_sign() {
         let seed = [("%a", sf(-7.0)), ("%b", sf(3.0))];
         // numpy mod: -7 % 3 == 2.0
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.remf", &["%a", "%b"]), &seed)), 2.0);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.remf", &["%a", "%b"]), &seed)),
+            2.0
+        );
     }
 
     #[test]
@@ -1091,7 +1361,10 @@ mod tests {
         let r = run_op(&f32s("%r", "arith.addf", &["%a", "%b"]), &seed);
         assert_eq!(expect_tile(&r).data.to_vec(), vec![11.0, 12.0, 13.0]);
         // scalar-on-left broadcasts too
-        let seed2 = [("%a", sf(10.0)), ("%b", tile(vec![1.0, 2.0], DType::F32, vec![2]))];
+        let seed2 = [
+            ("%a", sf(10.0)),
+            ("%b", tile(vec![1.0, 2.0], DType::F32, vec![2])),
+        ];
         let r2 = run_op(&f32s("%r", "arith.subf", &["%a", "%b"]), &seed2);
         assert_eq!(expect_tile(&r2).data.to_vec(), vec![9.0, 8.0]);
     }
@@ -1101,8 +1374,14 @@ mod tests {
     #[test]
     fn negf_and_absf() {
         let seed = [("%a", sf(-3.5))];
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.negf", &["%a"]), &seed)), 3.5);
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.absf", &["%a"]), &seed)), 3.5);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.negf", &["%a"]), &seed)),
+            3.5
+        );
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.absf", &["%a"]), &seed)),
+            3.5
+        );
         let tseed = [("%a", tile(vec![-1.0, 2.0, -3.0], DType::F32, vec![3]))];
         let r = run_op(&f32s("%r", "arith.absf", &["%a"]), &tseed);
         assert_eq!(expect_tile(&r).data.to_vec(), vec![1.0, 2.0, 3.0]);
@@ -1116,22 +1395,33 @@ mod tests {
         assert!(expect_f32(&run_op(&f32s("%r", "arith.maximumf", &["%a", "%b"]), &seed)).is_nan());
         assert!(expect_f32(&run_op(&f32s("%r", "arith.minimumf", &["%a", "%b"]), &seed)).is_nan());
         // numf variants ignore NaN
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.maxnumf", &["%a", "%b"]), &seed)), 1.0);
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.minnumf", &["%a", "%b"]), &seed)), 1.0);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.maxnumf", &["%a", "%b"]), &seed)),
+            1.0
+        );
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.minnumf", &["%a", "%b"]), &seed)),
+            1.0
+        );
     }
 
     #[test]
     fn maxf_minf_pick_extreme() {
         let seed = [("%a", sf(2.0)), ("%b", sf(5.0))];
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.maxf", &["%a", "%b"]), &seed)), 5.0);
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.minf", &["%a", "%b"]), &seed)), 2.0);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.maxf", &["%a", "%b"]), &seed)),
+            5.0
+        );
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.minf", &["%a", "%b"]), &seed)),
+            2.0
+        );
     }
 
     // --- cmpf --------------------------------------------------------------
 
     fn cmpf_op(pred: &str, ops: &[&str]) -> Operation {
-        Operation::new(Some("%r"), "arith.cmpf", ops)
-            .with_attr("predicate", Attr::Str(pred.into()))
+        Operation::new(Some("%r"), "arith.cmpf", ops).with_attr("predicate", Attr::Str(pred.into()))
     }
 
     #[test]
@@ -1163,7 +1453,10 @@ mod tests {
     fn cmpf_true_false_constants() {
         let seed = [("%a", sf(1.0)), ("%b", sf(2.0))];
         assert!(expect_bool(&run_op(&cmpf_op("true", &["%a", "%b"]), &seed)));
-        assert!(!expect_bool(&run_op(&cmpf_op("false", &["%a", "%b"]), &seed)));
+        assert!(!expect_bool(&run_op(
+            &cmpf_op("false", &["%a", "%b"]),
+            &seed
+        )));
     }
 
     #[test]
@@ -1183,49 +1476,106 @@ mod tests {
     #[test]
     fn int_binops_scalar() {
         let seed = [("%a", si(17)), ("%b", si(5))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.addi", &["%a", "%b"]), &seed)), 22);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.subi", &["%a", "%b"]), &seed)), 12);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.muli", &["%a", "%b"]), &seed)), 85);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.divsi", &["%a", "%b"]), &seed)), 3);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.remsi", &["%a", "%b"]), &seed)), 2);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.addi", &["%a", "%b"]), &seed)),
+            22
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.subi", &["%a", "%b"]), &seed)),
+            12
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.muli", &["%a", "%b"]), &seed)),
+            85
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.divsi", &["%a", "%b"]), &seed)),
+            3
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.remsi", &["%a", "%b"]), &seed)),
+            2
+        );
     }
 
     #[test]
     fn divsi_truncates_toward_zero_remsi_matches() {
         // -7 / 2: divsi truncates -> -3 ; remsi = -7 - (-3*2) = -1
         let seed = [("%a", si(-7)), ("%b", si(2))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.divsi", &["%a", "%b"]), &seed)), -3);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.remsi", &["%a", "%b"]), &seed)), -1);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.divsi", &["%a", "%b"]), &seed)),
+            -3
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.remsi", &["%a", "%b"]), &seed)),
+            -1
+        );
     }
 
     #[test]
     fn floordivsi_floors_toward_neg_inf() {
         // -7 // 2 floors -> -4
         let seed = [("%a", si(-7)), ("%b", si(2))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.floordivsi", &["%a", "%b"]), &seed)), -4);
+        assert_eq!(
+            expect_i64(&run_op(
+                &f32s("%r", "arith.floordivsi", &["%a", "%b"]),
+                &seed
+            )),
+            -4
+        );
     }
 
     #[test]
     fn divui_remui_nonneg() {
         let seed = [("%a", si(17)), ("%b", si(5))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.divui", &["%a", "%b"]), &seed)), 3);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.remui", &["%a", "%b"]), &seed)), 2);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.divui", &["%a", "%b"]), &seed)),
+            3
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.remui", &["%a", "%b"]), &seed)),
+            2
+        );
     }
 
     #[test]
     fn ceildiv_rounds_up() {
         let seed = [("%a", si(7)), ("%b", si(2))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.ceildivsi", &["%a", "%b"]), &seed)), 4);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.ceildivui", &["%a", "%b"]), &seed)), 4);
+        assert_eq!(
+            expect_i64(&run_op(
+                &f32s("%r", "arith.ceildivsi", &["%a", "%b"]),
+                &seed
+            )),
+            4
+        );
+        assert_eq!(
+            expect_i64(&run_op(
+                &f32s("%r", "arith.ceildivui", &["%a", "%b"]),
+                &seed
+            )),
+            4
+        );
     }
 
     #[test]
     fn int_min_max() {
         let seed = [("%a", si(3)), ("%b", si(8))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.minsi", &["%a", "%b"]), &seed)), 3);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.maxsi", &["%a", "%b"]), &seed)), 8);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.minui", &["%a", "%b"]), &seed)), 3);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.maxui", &["%a", "%b"]), &seed)), 8);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.minsi", &["%a", "%b"]), &seed)),
+            3
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.maxsi", &["%a", "%b"]), &seed)),
+            8
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.minui", &["%a", "%b"]), &seed)),
+            3
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.maxui", &["%a", "%b"]), &seed)),
+            8
+        );
     }
 
     #[test]
@@ -1237,7 +1587,10 @@ mod tests {
         let r = run_op(&f32s("%r", "arith.addi", &["%a", "%b"]), &seed);
         assert_eq!(expect_tile(&r).data.to_vec(), vec![5.0, 7.0, 9.0]);
         // scalar broadcast
-        let seed2 = [("%a", tile(vec![1.0, 2.0, 3.0], DType::I32, vec![3])), ("%b", si(10))];
+        let seed2 = [
+            ("%a", tile(vec![1.0, 2.0, 3.0], DType::I32, vec![3])),
+            ("%b", si(10)),
+        ];
         let r2 = run_op(&f32s("%r", "arith.muli", &["%a", "%b"]), &seed2);
         assert_eq!(expect_tile(&r2).data.to_vec(), vec![10.0, 20.0, 30.0]);
     }
@@ -1247,25 +1600,42 @@ mod tests {
     #[test]
     fn bitwise_ops() {
         let seed = [("%a", si(0b1100)), ("%b", si(0b1010))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.andi", &["%a", "%b"]), &seed)), 0b1000);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.ori", &["%a", "%b"]), &seed)), 0b1110);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.xori", &["%a", "%b"]), &seed)), 0b0110);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.andi", &["%a", "%b"]), &seed)),
+            0b1000
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.ori", &["%a", "%b"]), &seed)),
+            0b1110
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.xori", &["%a", "%b"]), &seed)),
+            0b0110
+        );
     }
 
     #[test]
     fn shift_ops() {
         let seed = [("%a", si(1)), ("%b", si(4))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.shli", &["%a", "%b"]), &seed)), 16);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.shli", &["%a", "%b"]), &seed)),
+            16
+        );
         let seed2 = [("%a", si(256)), ("%b", si(2))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.shrsi", &["%a", "%b"]), &seed2)), 64);
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.shrui", &["%a", "%b"]), &seed2)), 64);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.shrsi", &["%a", "%b"]), &seed2)),
+            64
+        );
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.shrui", &["%a", "%b"]), &seed2)),
+            64
+        );
     }
 
     // --- cmpi --------------------------------------------------------------
 
     fn cmpi_op(pred: &str, ops: &[&str]) -> Operation {
-        Operation::new(Some("%r"), "arith.cmpi", ops)
-            .with_attr("predicate", Attr::Str(pred.into()))
+        Operation::new(Some("%r"), "arith.cmpi", ops).with_attr("predicate", Attr::Str(pred.into()))
     }
 
     #[test]
@@ -1277,7 +1647,10 @@ mod tests {
         assert!(expect_bool(&run_op(&cmpi_op("ne", &["%a", "%b"]), &seed)));
         let eqseed = [("%a", si(5)), ("%b", si(5))];
         assert!(expect_bool(&run_op(&cmpi_op("eq", &["%a", "%b"]), &eqseed)));
-        assert!(expect_bool(&run_op(&cmpi_op("sle", &["%a", "%b"]), &eqseed)));
+        assert!(expect_bool(&run_op(
+            &cmpi_op("sle", &["%a", "%b"]),
+            &eqseed
+        )));
     }
 
     #[test]
@@ -1297,9 +1670,17 @@ mod tests {
     #[test]
     fn select_scalar_cond() {
         let t = Operation::new(Some("%r"), "arith.select", &["%c", "%t", "%f"]);
-        let seed_true = [("%c", Value::Scalar(Scalar::Bool(true))), ("%t", si(1)), ("%f", si(2))];
+        let seed_true = [
+            ("%c", Value::Scalar(Scalar::Bool(true))),
+            ("%t", si(1)),
+            ("%f", si(2)),
+        ];
         assert_eq!(expect_i64(&run_op(&t, &seed_true)), 1);
-        let seed_false = [("%c", Value::Scalar(Scalar::Bool(false))), ("%t", si(1)), ("%f", si(2))];
+        let seed_false = [
+            ("%c", Value::Scalar(Scalar::Bool(false))),
+            ("%t", si(1)),
+            ("%f", si(2)),
+        ];
         assert_eq!(expect_i64(&run_op(&t, &seed_false)), 2);
     }
 
@@ -1331,11 +1712,14 @@ mod tests {
 
     #[test]
     fn constant_scalar_forms() {
-        let cf = Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Float(2.5));
+        let cf =
+            Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Float(2.5));
         assert_eq!(expect_f32(&run_op(&cf, &[])), 2.5);
-        let ci = Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Int(42));
+        let ci =
+            Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Int(42));
         assert_eq!(expect_i64(&run_op(&ci, &[])), 42);
-        let cb = Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Bool(true));
+        let cb =
+            Operation::new(Some("%r"), "arith.constant", &[]).with_attr("value", Attr::Bool(true));
         assert!(expect_bool(&run_op(&cb, &[])));
     }
 
@@ -1387,9 +1771,15 @@ mod tests {
     fn extf_truncf_roundtrip() {
         // extf scalar passes value through (widening is a no-op on f32 storage).
         let seed = [("%a", sf(1.5))];
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.extf", &["%a"]), &seed)), 1.5);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.extf", &["%a"]), &seed)),
+            1.5
+        );
         // truncf on a representable f16 value is exact.
-        assert_eq!(expect_f32(&run_op(&f32s("%r", "arith.truncf", &["%a"]), &seed)), 1.5);
+        assert_eq!(
+            expect_f32(&run_op(&f32s("%r", "arith.truncf", &["%a"]), &seed)),
+            1.5
+        );
     }
 
     #[test]
@@ -1436,7 +1826,10 @@ mod tests {
     #[test]
     fn fptosi_truncates_toward_zero() {
         let seed = [("%a", sf(-2.7))];
-        assert_eq!(expect_i64(&run_op(&f32s("%r", "arith.fptosi", &["%a"]), &seed)), -2);
+        assert_eq!(
+            expect_i64(&run_op(&f32s("%r", "arith.fptosi", &["%a"]), &seed)),
+            -2
+        );
         let tseed = [("%a", tile(vec![1.9, -1.9, 2.5], DType::F32, vec![3]))];
         let r = run_op(&f32s("%r", "arith.fptosi", &["%a"]), &tseed);
         assert_eq!(expect_tile(&r).data.to_vec(), vec![1.0, -1.0, 2.0]);

@@ -10,7 +10,7 @@
 //! RMSNorm/LayerNorm path runs after the dedup fix.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::parser::parse_module;
 
@@ -28,14 +28,24 @@ fn layernorm_fixture_runs_end_to_end() {
     let module = parse_module(SRC).expect("parse layernorm");
 
     // Small f16 inputs; weight = 1, bias = 0 so Y = (X - mean) * rstd.
-    let x: Vec<f32> = (0..ROWS * COLS).map(|i| f16(((i % 17) as f32 - 8.0) * 0.01)).collect();
+    let x: Vec<f32> = (0..ROWS * COLS)
+        .map(|i| f16(((i % 17) as f32 - 8.0) * 0.01))
+        .collect();
     let w = vec![1.0f32; ROWS * COLS];
     let b = vec![0.0f32; ROWS * COLS];
     let zeros_big = vec![0.0f32; ROWS * COLS];
     let zeros_vec = vec![0.0f32; ROWS];
 
-    let big = |data: Vec<f32>| Arg::Tensor { data, shape: vec![ROWS, COLS], dtype: DType::F16 };
-    let vec1 = |data: Vec<f32>| Arg::Tensor { data, shape: vec![ROWS], dtype: DType::F16 };
+    let big = |data: Vec<f32>| Arg::Tensor {
+        data,
+        shape: vec![ROWS, COLS],
+        dtype: DType::F16,
+    };
+    let vec1 = |data: Vec<f32>| Arg::Tensor {
+        data,
+        shape: vec![ROWS],
+        dtype: DType::F16,
+    };
     let args: Vec<(&str, Arg)> = vec![
         ("X", big(x.clone())),
         ("Y", big(zeros_big)),
@@ -48,8 +58,8 @@ fn layernorm_fixture_runs_end_to_end() {
         ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(1024))),
     ];
 
-    let out = execute_function(&module, "_layer_norm_fwd_fused", &args)
-        .expect("run layernorm fixture");
+    let out =
+        execute_function(&module, "_layer_norm_fwd_fused", &args).expect("run layernorm fixture");
     let mean = &out.get("Mean").expect("Mean output").data;
     let rstd = &out.get("Rstd").expect("Rstd output").data;
     let y = &out.get("Y").expect("Y output").data;
@@ -69,8 +79,14 @@ fn layernorm_fixture_runs_end_to_end() {
         max_rstd_err = max_rstd_err.max((rstd[r] - rs).abs() / rs.abs().max(1e-3));
     }
     // Generous f16 tolerance: 8192-wide reductions accumulate rounding.
-    assert!(max_mean_err < 0.1, "Mean max rel err {max_mean_err} too large");
-    assert!(max_rstd_err < 0.1, "Rstd max rel err {max_rstd_err} too large");
+    assert!(
+        max_mean_err < 0.1,
+        "Mean max rel err {max_mean_err} too large"
+    );
+    assert!(
+        max_rstd_err < 0.1,
+        "Rstd max rel err {max_rstd_err} too large"
+    );
     eprintln!(
         "e2e layernorm ({ROWS}×{COLS}, grid 32) ran — Mean err {max_mean_err:.4}, Rstd err {max_rstd_err:.4} ✓"
     );

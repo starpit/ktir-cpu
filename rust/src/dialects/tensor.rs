@@ -32,7 +32,11 @@ pub fn register(d: &mut Dispatch) {
     d.register("tensor.splat", LatencyCategory::Zero, splat);
     d.register("tensor.extract", LatencyCategory::Zero, extract);
     d.register("tensor.expand_shape", LatencyCategory::Zero, expand_shape);
-    d.register("tensor.collapse_shape", LatencyCategory::Zero, collapse_shape);
+    d.register(
+        "tensor.collapse_shape",
+        LatencyCategory::Zero,
+        collapse_shape,
+    );
     d.register("tensor.reshape", LatencyCategory::Zero, reshape);
     d.register("tensor.from_elements", LatencyCategory::Zero, from_elements);
     d.register("tensor.generate", LatencyCategory::Zero, generate);
@@ -43,7 +47,11 @@ pub fn register(d: &mut Dispatch) {
 ///
 /// Mirrors `tensor__empty`: shape/dtype come from the result-type attributes
 /// (`shape` defaults to `(1,)`, `dtype` to `f16`); data is `np.zeros`.
-fn empty(op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn empty(
+    op: &Operation,
+    _ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let shape = shape_attr(op).unwrap_or_else(|| vec![1]);
     let dtype = dtype_attr_or(op, DType::F16)?;
     let n: usize = shape.iter().product();
@@ -61,7 +69,11 @@ fn empty(op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
 ///      tile already in scope), otherwise `(1,)`.
 ///   3. Integer scalars force an `i32` result tensor (NumPy `np.int32`);
 ///      everything else uses the declared dtype.
-fn splat(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn splat(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("tensor.splat: missing scalar operand".into());
     }
@@ -71,14 +83,21 @@ fn splat(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
     let (scalar, is_int) = match &operand {
         Value::Tile(t) => {
             let v = *t.data.first().unwrap_or(&0.0);
-            (v, t.dtype == DType::I32 || t.dtype == DType::I64 || t.dtype == DType::Bool)
+            (
+                v,
+                t.dtype == DType::I32 || t.dtype == DType::I64 || t.dtype == DType::Bool,
+            )
         }
         Value::Scalar(Scalar::F32(v)) => (*v, false),
         Value::Scalar(Scalar::I32(v)) => (*v as f32, true),
         Value::Scalar(Scalar::I64(v)) => (*v as f32, true),
         Value::Scalar(Scalar::Bool(b)) => (if *b { 1.0 } else { 0.0 }, true),
         Value::Index(i) => (*i as f32, true),
-        other => return Err(format!("tensor.splat: unsupported scalar operand {other:?}")),
+        other => {
+            return Err(format!(
+                "tensor.splat: unsupported scalar operand {other:?}"
+            ));
+        }
     };
 
     let mut dtype = dtype_attr_or(op, DType::F16)?;
@@ -105,7 +124,11 @@ fn splat(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<O
 /// element is returned. A non-Tile operand is passed through unchanged (the
 /// Python "already a scalar" branch). The extracted element is returned as a
 /// scalar whose flavor matches the tile dtype (float vs int/index).
-fn extract(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn extract(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("tensor.extract: missing source operand".into());
     }
@@ -119,7 +142,10 @@ fn extract(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
 
     let indices: Vec<i64> = op.operands[1..]
         .iter()
-        .map(|name| ctx.get_value(name).and_then(|v| as_i64(v, "tensor.extract index")))
+        .map(|name| {
+            ctx.get_value(name)
+                .and_then(|v| as_i64(v, "tensor.extract index"))
+        })
         .collect::<Result<_, _>>()?;
 
     let flat = if indices.is_empty() {
@@ -138,13 +164,21 @@ fn extract(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
 
 /// `%t = tensor.expand_shape %src ... into tensor<...>` — reinterpret under a
 /// larger-rank shape. Mirrors `tensor__expand_shape`.
-fn expand_shape(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn expand_shape(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     reshape_via_target(op, ctx, "tensor.expand_shape")
 }
 
 /// `%t = tensor.collapse_shape %src ... into tensor<...>` — reinterpret under a
 /// smaller-rank shape. Mirrors `tensor__collapse_shape` (identical body).
-fn collapse_shape(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn collapse_shape(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     reshape_via_target(op, ctx, "tensor.collapse_shape")
 }
 
@@ -155,9 +189,17 @@ fn collapse_shape(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) ->
 /// result-type-pinned) `target_shape` attribute — never the runtime shape
 /// operand — so the second operand is ignored here. A non-Tile source passes
 /// through unchanged; a missing `target_shape` is a hard error.
-fn reshape(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
-    let target = target_shape_attr(op)
-        .ok_or_else(|| format!("tensor.reshape: missing 'target_shape' attribute on op {}", op.op_type))?;
+fn reshape(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
+    let target = target_shape_attr(op).ok_or_else(|| {
+        format!(
+            "tensor.reshape: missing 'target_shape' attribute on op {}",
+            op.op_type
+        )
+    })?;
     if op.operands.is_empty() {
         return Err("tensor.reshape: missing source operand".into());
     }
@@ -166,7 +208,11 @@ fn reshape(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
         Value::Tile(t) => t,
         other => return Ok(Some(other)),
     };
-    Ok(Some(Value::Tile(reshaped(&tile, target, "tensor.reshape")?)))
+    Ok(Some(Value::Tile(reshaped(
+        &tile,
+        target,
+        "tensor.reshape",
+    )?)))
 }
 
 /// `%shape = tensor.from_elements %d0, %d1, ... : tensor<NxT>` — build a 1-D
@@ -174,11 +220,23 @@ fn reshape(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result
 ///
 /// Each operand is coerced to a scalar (a Tile operand contributes its first
 /// flat element). The values are stacked then reshaped into the declared shape.
-fn from_elements(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
-    let shape = shape_attr(op)
-        .ok_or_else(|| format!("tensor.from_elements: missing 'shape' attribute on op {}", op.op_type))?;
-    let dtype = dtype_attr(op)
-        .ok_or_else(|| format!("tensor.from_elements: missing 'dtype' attribute on op {}", op.op_type))??;
+fn from_elements(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
+    let shape = shape_attr(op).ok_or_else(|| {
+        format!(
+            "tensor.from_elements: missing 'shape' attribute on op {}",
+            op.op_type
+        )
+    })?;
+    let dtype = dtype_attr(op).ok_or_else(|| {
+        format!(
+            "tensor.from_elements: missing 'dtype' attribute on op {}",
+            op.op_type
+        )
+    })??;
 
     let mut values: Vec<f32> = Vec::with_capacity(op.operands.len());
     for name in &op.operands {
@@ -196,7 +254,11 @@ fn from_elements(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> 
                 }
             }
             Value::Index(i) => *i as f32,
-            other => return Err(format!("tensor.from_elements: unsupported operand {other:?}")),
+            other => {
+                return Err(format!(
+                    "tensor.from_elements: unsupported operand {other:?}"
+                ));
+            }
         };
         values.push(s);
     }
@@ -224,7 +286,11 @@ fn from_elements(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> 
 ///
 /// The yielded value (captured from the body's `tensor.yield`) is cast to the
 /// declared dtype; a scalar yield is broadcast to the full shape.
-fn generate(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn generate(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let shape = shape_attr(op).unwrap_or_default();
     let dtype = dtype_attr_or(op, DType::F16)?;
     let n: usize = shape.iter().product();
@@ -249,7 +315,10 @@ fn generate(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result
     ctx.push_scope();
     let result = (|| -> Result<Value, String> {
         for (arg_name, grid) in block_args.iter().zip(grids) {
-            ctx.set_value(arg_name, Value::Tile(Tile::compute(grid, DType::I32, shape.clone())));
+            ctx.set_value(
+                arg_name,
+                Value::Tile(Tile::compute(grid, DType::I32, shape.clone())),
+            );
         }
         // Execute the body; `tensor.yield` returns the produced value, which is
         // the region result (single-value yield, mirroring scf.yield).
@@ -290,7 +359,11 @@ fn generate(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result
 /// `tensor.yield %v` — terminate a `tensor.generate` body. Same semantics as
 /// `scf.yield`: returns the (single) yielded operand value. Mirrors
 /// `tensor__yield` (which wraps a single value in a `YieldSignal`).
-fn yield_op(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn yield_op(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     match op.operands.first() {
         Some(name) => Ok(Some(ctx.get_value(name)?.clone())),
         None => Ok(None),
@@ -303,7 +376,11 @@ fn yield_op(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resul
 /// the `target_shape` attribute, keeping the source dtype. A non-Tile source
 /// (or a missing target shape) passes through unchanged, mirroring the Python
 /// guard `isinstance(src, Tile) and target_shape`.
-fn reshape_via_target(op: &Operation, ctx: &mut CoreContext, name: &str) -> Result<Option<Value>, String> {
+fn reshape_via_target(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    name: &str,
+) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err(format!("{name}: missing source operand"));
     }
@@ -567,7 +644,10 @@ mod tests {
         let mut ctx = single_core_context();
         // 2x3 tile: [[0,1,2],[3,4,5]]
         let data = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![2, 3])));
+        ctx.set_value(
+            "%t",
+            Value::Tile(Tile::compute(data, DType::F32, vec![2, 3])),
+        );
         ctx.set_value("%i", Value::Index(1));
         ctx.set_value("%j", Value::Index(2));
         let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i", "%j"]);
@@ -581,7 +661,10 @@ mod tests {
     #[test]
     fn extract_zero_d_returns_only_element() {
         let mut ctx = single_core_context();
-        ctx.set_value("%t", Value::Tile(Tile::compute(vec![42.0], DType::F32, vec![1])));
+        ctx.set_value(
+            "%t",
+            Value::Tile(Tile::compute(vec![42.0], DType::F32, vec![1])),
+        );
         let op = Operation::new(Some("%s"), "tensor.extract", &["%t"]);
         run(&[op], &mut ctx).unwrap();
         match ctx.get_value("%s").unwrap() {
@@ -593,7 +676,10 @@ mod tests {
     #[test]
     fn extract_index_tile_returns_index_scalar() {
         let mut ctx = single_core_context();
-        ctx.set_value("%t", Value::Tile(Tile::compute(vec![3.0, 8.0], DType::I32, vec![2])));
+        ctx.set_value(
+            "%t",
+            Value::Tile(Tile::compute(vec![3.0, 8.0], DType::I32, vec![2])),
+        );
         ctx.set_value("%i", Value::Index(1));
         let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i"]);
         run(&[op], &mut ctx).unwrap();
@@ -618,7 +704,10 @@ mod tests {
     #[test]
     fn extract_out_of_bounds_errors() {
         let mut ctx = single_core_context();
-        ctx.set_value("%t", Value::Tile(Tile::compute(vec![0.0, 1.0], DType::F32, vec![2])));
+        ctx.set_value(
+            "%t",
+            Value::Tile(Tile::compute(vec![0.0, 1.0], DType::F32, vec![2])),
+        );
         ctx.set_value("%i", Value::Index(5));
         let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i"]);
         assert!(run(&[op], &mut ctx).is_err());
@@ -630,9 +719,15 @@ mod tests {
     fn reshape_reinterprets_row_major() {
         let mut ctx = single_core_context();
         let data = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        ctx.set_value("%src", Value::Tile(Tile::compute(data.clone(), DType::F32, vec![6])));
+        ctx.set_value(
+            "%src",
+            Value::Tile(Tile::compute(data.clone(), DType::F32, vec![6])),
+        );
         // shape operand is ignored; target_shape attr drives the result
-        ctx.set_value("%shape", Value::Tile(Tile::compute(vec![2.0, 3.0], DType::I32, vec![2])));
+        ctx.set_value(
+            "%shape",
+            Value::Tile(Tile::compute(vec![2.0, 3.0], DType::I32, vec![2])),
+        );
         let op = Operation::new(Some("%out"), "tensor.reshape", &["%src", "%shape"])
             .with_attr("target_shape", Attr::IntList(vec![2, 3]))
             .with_attr("dtype", Attr::Str("f32".into()));
@@ -645,7 +740,10 @@ mod tests {
     #[test]
     fn reshape_missing_target_errors() {
         let mut ctx = single_core_context();
-        ctx.set_value("%src", Value::Tile(Tile::compute(vec![1.0], DType::F32, vec![1])));
+        ctx.set_value(
+            "%src",
+            Value::Tile(Tile::compute(vec![1.0], DType::F32, vec![1])),
+        );
         let op = Operation::new(Some("%out"), "tensor.reshape", &["%src", "%shape"]);
         let err = run(&[op], &mut ctx).unwrap_err();
         assert!(err.contains("target_shape"));
@@ -654,7 +752,10 @@ mod tests {
     #[test]
     fn reshape_wrong_count_errors() {
         let mut ctx = single_core_context();
-        ctx.set_value("%src", Value::Tile(Tile::compute(vec![1.0, 2.0], DType::F32, vec![2])));
+        ctx.set_value(
+            "%src",
+            Value::Tile(Tile::compute(vec![1.0, 2.0], DType::F32, vec![2])),
+        );
         let op = Operation::new(Some("%out"), "tensor.reshape", &["%src"])
             .with_attr("target_shape", Attr::IntList(vec![3]));
         assert!(run(&[op], &mut ctx).is_err());
@@ -664,7 +765,10 @@ mod tests {
     fn expand_shape_keeps_dtype_and_data() {
         let mut ctx = single_core_context();
         let data = vec![1.0, 2.0, 3.0, 4.0];
-        ctx.set_value("%src", Value::Tile(Tile::compute(data.clone(), DType::F16, vec![4])));
+        ctx.set_value(
+            "%src",
+            Value::Tile(Tile::compute(data.clone(), DType::F16, vec![4])),
+        );
         let op = Operation::new(Some("%out"), "tensor.expand_shape", &["%src"])
             .with_attr("target_shape", Attr::IntList(vec![2, 2]));
         run(&[op], &mut ctx).unwrap();
@@ -678,7 +782,10 @@ mod tests {
     fn collapse_shape_flattens() {
         let mut ctx = single_core_context();
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        ctx.set_value("%src", Value::Tile(Tile::compute(data.clone(), DType::F32, vec![2, 3])));
+        ctx.set_value(
+            "%src",
+            Value::Tile(Tile::compute(data.clone(), DType::F32, vec![2, 3])),
+        );
         let op = Operation::new(Some("%out"), "tensor.collapse_shape", &["%src"])
             .with_attr("target_shape", Attr::IntList(vec![6]));
         run(&[op], &mut ctx).unwrap();
@@ -720,9 +827,13 @@ mod tests {
         for (n, v) in ["%a", "%b", "%c", "%d"].iter().zip([1.0, 2.0, 3.0, 4.0]) {
             ctx.set_value(n, Value::Scalar(Scalar::F32(v)));
         }
-        let op = Operation::new(Some("%t"), "tensor.from_elements", &["%a", "%b", "%c", "%d"])
-            .with_attr("shape", Attr::IntList(vec![2, 2]))
-            .with_attr("dtype", Attr::Str("f32".into()));
+        let op = Operation::new(
+            Some("%t"),
+            "tensor.from_elements",
+            &["%a", "%b", "%c", "%d"],
+        )
+        .with_attr("shape", Attr::IntList(vec![2, 2]))
+        .with_attr("dtype", Attr::Str("f32".into()));
         run(&[op], &mut ctx).unwrap();
         let t = tile(&ctx, "%t");
         assert_eq!(t.shape, vec![2, 2]);
@@ -792,7 +903,8 @@ mod tests {
         let mut ctx = single_core_context();
         let bb0 = Operation::new(None, "region.bb0_args", &[])
             .with_attr("names", Attr::StrList(vec!["%i".into()]));
-        let c = Operation::new(Some("%v"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
+        let c =
+            Operation::new(Some("%v"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
         let yld = Operation::new(None, "tensor.yield", &["%v"]);
         let mut gen_op = Operation::new(Some("%t"), "tensor.generate", &[])
             .with_attr("shape", Attr::IntList(vec![3]))

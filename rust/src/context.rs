@@ -9,8 +9,8 @@
 //! wiring (`send_to` / remote `get_lx`) is present as the locked seam; the
 //! scheduler that fills it is implement-phase.
 
-use std::cell::RefCell;
 use crate::fxhash::FxHashMap;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ir::Value;

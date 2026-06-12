@@ -38,7 +38,7 @@
 //!   reaches the LX-overflow capacity limit the Python reason cites. We assert
 //!   the run fails; see `skipped` for the classification.
 
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::parser::parse_module;
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,10 @@ fn linalg_add_tensor_empty_runs() {
     // Rust implements both `scf.for` and `linalg.add`, so the kernel executes
     // (unlike Python, whose non-strict xfail reflects its missing `linalg.add`).
     let res = run(ADD_WITH_CONTROL_FLOW, "add", &[]);
-    assert!(res.is_ok(), "add-with-control-flow should now run to completion: {res:?}");
+    assert!(
+        res.is_ok(),
+        "add-with-control-flow should now run to completion: {res:?}"
+    );
 }
 
 // ===========================================================================

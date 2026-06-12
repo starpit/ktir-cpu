@@ -1,4 +1,10 @@
-#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items, clippy::needless_range_loop, clippy::type_complexity, clippy::approx_constant)]
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::approx_constant
+)]
 // Copyright 2025 The Torch-Spyre Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
@@ -49,7 +55,7 @@
 //! same stick-ceiling math as Python). Each affected site documents this.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function_with_latency, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function_with_latency};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::latency::{HardwareConfig, LatencyReport};
 use ktir_cpu::parser::parse_module;
@@ -260,12 +266,25 @@ fn matmul_kernel_mlir(grid_x: usize, grid_y: usize, block_m: usize) -> String {
 
 fn f16_tensor(name: &str, n: usize) -> (String, Arg) {
     let data: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1).collect();
-    (name.to_string(), Arg::Tensor { data, shape: vec![n], dtype: DType::F16 })
+    (
+        name.to_string(),
+        Arg::Tensor {
+            data,
+            shape: vec![n],
+            dtype: DType::F16,
+        },
+    )
 }
 
 /// Run an inline 1-D add/exp/copy kernel and return the report. `total` sizes
 /// each tensor argument; `nargs` is 3 for add (x, y, out) or 2 otherwise.
-fn run_inline(mlir: &str, func: &str, total: usize, nargs: usize, cfg: HardwareConfig) -> LatencyReport {
+fn run_inline(
+    mlir: &str,
+    func: &str,
+    total: usize,
+    nargs: usize,
+    cfg: HardwareConfig,
+) -> LatencyReport {
     let module = parse_module(mlir).unwrap_or_else(|e| panic!("parse {func}: {e}"));
     let mut args: Vec<(String, Arg)> = Vec::new();
     let names: &[&str] = if nargs == 3 {
@@ -300,7 +319,11 @@ fn test_default_values() {
 
 #[test]
 fn test_custom_config() {
-    let cfg = HardwareConfig { num_cores: 8, hbm_bandwidth_tb_s: 2.0, ..HardwareConfig::default() };
+    let cfg = HardwareConfig {
+        num_cores: 8,
+        hbm_bandwidth_tb_s: 2.0,
+        ..HardwareConfig::default()
+    };
     assert_eq!(cfg.num_cores, 8);
     assert_eq!(cfg.hbm_bandwidth_tb_s, 2.0);
 }
@@ -322,7 +345,10 @@ fn test_ring_bytes_per_cycle() {
 #[test]
 fn test_derived_scales_with_clock() {
     // 1 TB/s at 2 GHz = 500 bytes/cycle total; per core: 500 / 32 = 15.625.
-    let cfg = HardwareConfig { clock_ghz: 2.0, ..HardwareConfig::default() };
+    let cfg = HardwareConfig {
+        clock_ghz: 2.0,
+        ..HardwareConfig::default()
+    };
     assert!(approx(cfg.hbm_bytes_per_cycle_per_core(), 15.625, 1e-9));
 }
 
@@ -339,8 +365,17 @@ fn shared_bus_case(num_cores: usize) {
     // constant (fixed tile).
     let tile = 128usize;
     let total = tile * num_cores;
-    let cfg = HardwareConfig { num_cores, ..HardwareConfig::default() };
-    let report = run_inline(&add_kernel_mlir(num_cores, total, tile), "add_kernel", total, 3, cfg);
+    let cfg = HardwareConfig {
+        num_cores,
+        ..HardwareConfig::default()
+    };
+    let report = run_inline(
+        &add_kernel_mlir(num_cores, total, tile),
+        "add_kernel",
+        total,
+        3,
+        cfg,
+    );
 
     assert_eq!(report.counters.len(), num_cores);
 
@@ -348,8 +383,14 @@ fn shared_bus_case(num_cores: usize) {
     let compute0 = summary[0].compute_cycles;
     let memory0 = summary[0].memory_cycles;
     for c in &summary {
-        assert!(approx(c.compute_cycles, compute0, 1e-6), "unequal compute_cycles");
-        assert!(approx(c.memory_cycles, memory0, 1e-6), "unequal memory_cycles");
+        assert!(
+            approx(c.compute_cycles, compute0, 1e-6),
+            "unequal compute_cycles"
+        );
+        assert!(
+            approx(c.memory_cycles, memory0, 1e-6),
+            "unequal memory_cycles"
+        );
     }
 
     // compute: 1 addf per element, tile/simd cycles.
@@ -368,7 +409,10 @@ fn shared_bus_case(num_cores: usize) {
     let bytes_per_op = sticks_per_op * STICK_BYTES;
     let mem_bytes = 2 * bytes_per_op;
     let expected_mem = mem_bytes as f64 / cfg.hbm_bytes_per_cycle_per_core();
-    assert!(approx(memory0, expected_mem, 1e-6), "mem {memory0} vs {expected_mem}");
+    assert!(
+        approx(memory0, expected_mem, 1e-6),
+        "mem {memory0} vs {expected_mem}"
+    );
 
     // The shared-bus penalty: at fixed tile, memory_cycles grow ∝ num_cores
     // (because bw_pc = total_bw / num_cores shrinks). Pin that against 1 core.
@@ -393,8 +437,17 @@ fn work_splitting_elementwise_case(num_cores: usize) {
     // cancellation), modulo stick-ceiling rounding for tiny tiles.
     let total = 128usize;
     let tile = total / num_cores;
-    let cfg = HardwareConfig { num_cores, ..HardwareConfig::default() };
-    let report = run_inline(&add_kernel_mlir(num_cores, total, tile), "add_kernel", total, 3, cfg);
+    let cfg = HardwareConfig {
+        num_cores,
+        ..HardwareConfig::default()
+    };
+    let report = run_inline(
+        &add_kernel_mlir(num_cores, total, tile),
+        "add_kernel",
+        total,
+        3,
+        cfg,
+    );
 
     assert_eq!(report.counters.len(), num_cores);
     let summary = report.per_core_summary();
@@ -446,14 +499,38 @@ fn test_work_splitting_matmul() {
     let run = |gx: usize, block_m: usize| -> LatencyReport {
         let module = parse_module(&matmul_kernel_mlir(gx, 2, block_m))
             .unwrap_or_else(|e| panic!("parse matmul gx={gx}: {e}"));
-        let cfg = HardwareConfig { num_cores: gx * 2, ..HardwareConfig::default() };
+        let cfg = HardwareConfig {
+            num_cores: gx * 2,
+            ..HardwareConfig::default()
+        };
         let a = vec![0.05f32; 16 * 64];
         let b = vec![0.05f32; 64 * 64];
         let c = vec![0.0f32; 16 * 64];
         let args: Vec<(&str, Arg)> = vec![
-            ("a_ptr", Arg::Tensor { data: a, shape: vec![16, 64], dtype: DType::F16 }),
-            ("b_ptr", Arg::Tensor { data: b, shape: vec![64, 64], dtype: DType::F16 }),
-            ("c_ptr", Arg::Tensor { data: c, shape: vec![16, 64], dtype: DType::F16 }),
+            (
+                "a_ptr",
+                Arg::Tensor {
+                    data: a,
+                    shape: vec![16, 64],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "b_ptr",
+                Arg::Tensor {
+                    data: b,
+                    shape: vec![64, 64],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "c_ptr",
+                Arg::Tensor {
+                    data: c,
+                    shape: vec![16, 64],
+                    dtype: DType::F16,
+                },
+            ),
             ("K", Arg::Scalar(Scalar::I64(64))),
         ];
         let (_out, report) =
@@ -483,8 +560,17 @@ fn test_work_splitting_matmul() {
 fn work_splitting_transcendental_case(num_cores: usize) {
     let total = 128usize;
     let tile = total / num_cores;
-    let cfg = HardwareConfig { num_cores, ..HardwareConfig::default() };
-    let report = run_inline(&exp_kernel_mlir(num_cores, total, tile), "exp_kernel", total, 2, cfg);
+    let cfg = HardwareConfig {
+        num_cores,
+        ..HardwareConfig::default()
+    };
+    let report = run_inline(
+        &exp_kernel_mlir(num_cores, total, tile),
+        "exp_kernel",
+        total,
+        2,
+        cfg,
+    );
 
     assert_eq!(report.counters.len(), num_cores);
     let summary = report.per_core_summary();
@@ -521,8 +607,17 @@ fn test_work_splitting_transcendental() {
 
 fn tile_size_memory_cycles_case(tile_size: usize) {
     // Single-core HBM load/store: memory_cycles ∝ tile_size.
-    let cfg = HardwareConfig { num_cores: 1, ..HardwareConfig::default() };
-    let report = run_inline(&add_kernel_mlir(1, tile_size, tile_size), "add_kernel", tile_size, 3, cfg);
+    let cfg = HardwareConfig {
+        num_cores: 1,
+        ..HardwareConfig::default()
+    };
+    let report = run_inline(
+        &add_kernel_mlir(1, tile_size, tile_size),
+        "add_kernel",
+        tile_size,
+        3,
+        cfg,
+    );
     let summary = report.per_core_summary();
     // 2 HBM loads (store uncharged — see `skipped`), each tile_size*2 bytes
     // (f16). These sizes (64, 128, 256, 512) are stick-aligned multiples of 128
@@ -553,8 +648,17 @@ fn test_lx_ops_zero_cycles() {
     // copy kernel below stores then... here we build a single-core LX add
     // kernel: an LX load reads whatever lives there, but latency for LX ops is
     // unconditionally 0 regardless of data, so no seeding is required.
-    let cfg = HardwareConfig { num_cores: 1, ..HardwareConfig::default() };
-    let report = run_inline(&copy_kernel_mlir("lx_kernel", "LX"), "lx_kernel", 128, 2, cfg);
+    let cfg = HardwareConfig {
+        num_cores: 1,
+        ..HardwareConfig::default()
+    };
+    let report = run_inline(
+        &copy_kernel_mlir("lx_kernel", "LX"),
+        "lx_kernel",
+        128,
+        2,
+        cfg,
+    );
     for c in report.per_core_summary() {
         assert_eq!(
             c.memory_cycles, 0.0,
@@ -570,14 +674,29 @@ fn test_lx_ops_zero_cycles() {
 fn test_lx_reuse_vs_hbm_reload() {
     // LX variant has strictly lower memory_cycles than HBM variant, and is 0.
     let cfg = HardwareConfig::default();
-    let lx_report = run_inline(&copy_kernel_mlir("lx_kernel", "LX"), "lx_kernel", 128, 2, cfg);
-    let hbm_report = run_inline(&copy_kernel_mlir("hbm_kernel", "HBM"), "hbm_kernel", 128, 2, cfg);
+    let lx_report = run_inline(
+        &copy_kernel_mlir("lx_kernel", "LX"),
+        "lx_kernel",
+        128,
+        2,
+        cfg,
+    );
+    let hbm_report = run_inline(
+        &copy_kernel_mlir("hbm_kernel", "HBM"),
+        "hbm_kernel",
+        128,
+        2,
+        cfg,
+    );
 
     let lx_mem = lx_report.per_core_summary()[0].memory_cycles;
     let hbm_mem = hbm_report.per_core_summary()[0].memory_cycles;
 
     assert!(lx_mem < hbm_mem, "expected LX ({lx_mem}) < HBM ({hbm_mem})");
-    assert_eq!(lx_mem, 0.0, "LX ops should cost 0 memory cycles, got {lx_mem}");
+    assert_eq!(
+        lx_mem, 0.0,
+        "LX ops should cost 0 memory cycles, got {lx_mem}"
+    );
 }
 
 // --- Test 7: balanced work distribution ---
@@ -596,13 +715,23 @@ fn test_balanced_work_distribution() {
         ("BLOCK_SIZE".to_string(), Arg::Scalar(Scalar::I64(128))),
     ];
     let arg_refs: Vec<(&str, Arg)> = args.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-    let cfg = HardwareConfig { num_cores: 32, ..HardwareConfig::default() };
-    let (_o, report) =
-        execute_function_with_latency(&module, "add_kernel", &arg_refs, cfg).expect("run add_kernel");
+    let cfg = HardwareConfig {
+        num_cores: 32,
+        ..HardwareConfig::default()
+    };
+    let (_o, report) = execute_function_with_latency(&module, "add_kernel", &arg_refs, cfg)
+        .expect("run add_kernel");
 
     assert_eq!(report.counters.len(), 32);
-    let totals: Vec<f64> = report.per_core_summary().iter().map(|c| c.total_cycles).collect();
+    let totals: Vec<f64> = report
+        .per_core_summary()
+        .iter()
+        .map(|c| c.total_cycles)
+        .collect();
     let max = totals.iter().cloned().fold(f64::MIN, f64::max);
     let min = totals.iter().cloned().fold(f64::MAX, f64::min);
-    assert!(approx(max, min, 1e-9), "load imbalance: max={max} min={min}");
+    assert!(
+        approx(max, min, 1e-9),
+        "load imbalance: max={max} min={min}"
+    );
 }

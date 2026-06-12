@@ -41,7 +41,11 @@ fn make_comm_op(op: &Operation, ctx: &CoreContext) -> Result<Box<dyn CommOp>, St
         "ktdp.reduce" => {
             let tile = match ctx.get_value(&op.operands[0])? {
                 Value::Tile(t) => t.clone(),
-                other => return Err(format!("ktdp.reduce: operand 0 must be a Tile, got {other:?}")),
+                other => {
+                    return Err(format!(
+                        "ktdp.reduce: operand 0 must be a Tile, got {other:?}"
+                    ));
+                }
             };
             let core_group = read_core_group(ctx.get_value(&op.operands[1])?)?;
             Ok(Box::new(RingReduce::new(tile, core_group)))
@@ -55,7 +59,11 @@ fn make_comm_op(op: &Operation, ctx: &CoreContext) -> Result<Box<dyn CommOp>, St
 fn read_core_group(v: &Value) -> Result<Vec<usize>, String> {
     let items = match v {
         Value::Tuple(items) => items,
-        other => return Err(format!("ktdp.reduce: core_group must be a tuple, got {other:?}")),
+        other => {
+            return Err(format!(
+                "ktdp.reduce: core_group must be a tuple, got {other:?}"
+            ));
+        }
     };
     items
         .iter()
@@ -99,16 +107,28 @@ enum RingState {
 
 impl RingReduce {
     fn new(tile: Tile, core_group: Vec<usize>) -> Self {
-        RingReduce { tile, core_group, state: RingState::Init }
+        RingReduce {
+            tile,
+            core_group,
+            state: RingState::Init,
+        }
     }
 }
 
 /// Element-wise sum of two tiles (the default `reduce_fn`, `ArithOps.addf`).
 fn tile_add(a: &Tile, b: &Tile) -> Result<Tile, String> {
     if a.shape != b.shape {
-        return Err(format!("ktdp.reduce: tile shape mismatch {:?} vs {:?}", a.shape, b.shape));
+        return Err(format!(
+            "ktdp.reduce: tile shape mismatch {:?} vs {:?}",
+            a.shape, b.shape
+        ));
     }
-    let data = a.data.iter().zip(b.data.iter()).map(|(x, y)| x + y).collect();
+    let data = a
+        .data
+        .iter()
+        .zip(b.data.iter())
+        .map(|(x, y)| x + y)
+        .collect();
     Ok(Tile::compute(data, a.dtype, a.shape.clone()))
 }
 
@@ -118,11 +138,15 @@ impl CommOp for RingReduce {
             RingState::Init => {
                 // Not in the group: identity passthrough, no comm.
                 let Some(my_idx) = self.core_group.iter().position(|&c| c == ctx.core_id) else {
-                    return Ok(CommStep::Done(Box::new(Some(Value::Tile(self.tile.clone())))));
+                    return Ok(CommStep::Done(Box::new(Some(Value::Tile(
+                        self.tile.clone(),
+                    )))));
                 };
                 let n = self.core_group.len();
                 if n <= 1 {
-                    return Ok(CommStep::Done(Box::new(Some(Value::Tile(self.tile.clone())))));
+                    return Ok(CommStep::Done(Box::new(Some(Value::Tile(
+                        self.tile.clone(),
+                    )))));
                 }
                 let next_core = self.core_group[(my_idx + 1) % n];
                 let prev_core = self.core_group[(my_idx + n - 1) % n];
@@ -137,9 +161,14 @@ impl CommOp for RingReduce {
                 };
                 Ok(CommStep::Recv(RecvRequest { src: prev_core }))
             }
-            RingState::Running { result, to_forward, rounds_left, next_core, prev_core } => {
-                let received = incoming
-                    .ok_or("ktdp.reduce: resumed without an incoming tile")?;
+            RingState::Running {
+                result,
+                to_forward,
+                rounds_left,
+                next_core,
+                prev_core,
+            } => {
+                let received = incoming.ok_or("ktdp.reduce: resumed without an incoming tile")?;
                 *result = tile_add(result, &received)?;
                 *to_forward = received;
                 *rounds_left -= 1;
@@ -227,7 +256,11 @@ impl CoreRunner {
 
 /// Bind a comm op's result value to its SSA name, tracking LX for Tiles
 /// (mirrors the binding `execute_op` / `_store` perform).
-fn bind_result(ctx: &mut CoreContext, name: Option<&str>, val: Option<Value>) -> Result<(), String> {
+fn bind_result(
+    ctx: &mut CoreContext,
+    name: Option<&str>,
+    val: Option<Value>,
+) -> Result<(), String> {
     if let (Some(name), Some(val)) = (name, val) {
         if let Value::Tile(t) = &val {
             ctx.track_lx(name, t.size_bytes() as i64)?;
@@ -266,7 +299,14 @@ pub fn execute_with_communication(
         for (name, val) in input_ptrs {
             ctx.set_value(name, val.clone());
         }
-        runners.insert(core_id, CoreRunner { ctx, op_idx: 0, active: None });
+        runners.insert(
+            core_id,
+            CoreRunner {
+                ctx,
+                op_idx: 0,
+                active: None,
+            },
+        );
     }
 
     let mut messages: HashMap<(usize, usize), VecDeque<Tile>> = HashMap::new();
@@ -300,7 +340,15 @@ pub fn execute_with_communication(
 
     // Initial pass: run every core to its first block (or completion).
     for core_id in 0..num_cores {
-        advance(core_id, None, &mut runners, &mut messages, &mut waiting, ops, &env)?;
+        advance(
+            core_id,
+            None,
+            &mut runners,
+            &mut messages,
+            &mut waiting,
+            ops,
+            &env,
+        )?;
     }
 
     // Deliver messages and resume until all cores finish.
@@ -310,14 +358,23 @@ pub fn execute_with_communication(
         for core_id in live {
             if let Some(&src) = waiting.get(&core_id)
                 && let Some(q) = messages.get_mut(&(src, core_id))
-                    && let Some(tile) = q.pop_front() {
-                        if q.is_empty() {
-                            messages.remove(&(src, core_id));
-                        }
-                        waiting.remove(&core_id);
-                        advance(core_id, Some(tile), &mut runners, &mut messages, &mut waiting, ops, &env)?;
-                        progressed = true;
-                    }
+                && let Some(tile) = q.pop_front()
+            {
+                if q.is_empty() {
+                    messages.remove(&(src, core_id));
+                }
+                waiting.remove(&core_id);
+                advance(
+                    core_id,
+                    Some(tile),
+                    &mut runners,
+                    &mut messages,
+                    &mut waiting,
+                    ops,
+                    &env,
+                )?;
+                progressed = true;
+            }
         }
         if !progressed {
             let desc = waiting
@@ -362,7 +419,11 @@ mod tests {
                 for (name, val) in &seeds[core_id] {
                     ctx.set_value(name, val.clone());
                 }
-                CoreRunner { ctx, op_idx: 0, active: None }
+                CoreRunner {
+                    ctx,
+                    op_idx: 0,
+                    active: None,
+                }
             })
             .collect();
 
@@ -382,27 +443,51 @@ mod tests {
                 messages.entry((core_id, dst)).or_default().push_back(tile);
             }
             match poll {
-                Poll::Block(src) => { waiting.insert(core_id, src); }
-                Poll::Done => { done[core_id] = true; }
+                Poll::Block(src) => {
+                    waiting.insert(core_id, src);
+                }
+                Poll::Done => {
+                    done[core_id] = true;
+                }
             }
             Ok(())
         };
 
         for core_id in 0..n {
-            advance_one(&mut runners, &mut messages, &mut waiting, &mut done, core_id, None).unwrap();
+            advance_one(
+                &mut runners,
+                &mut messages,
+                &mut waiting,
+                &mut done,
+                core_id,
+                None,
+            )
+            .unwrap();
         }
         let mut guard = 0;
         while done.iter().any(|d| !d) {
             let mut progressed = false;
             for core_id in 0..n {
-                if done[core_id] { continue; }
+                if done[core_id] {
+                    continue;
+                }
                 if let Some(&src) = waiting.get(&core_id)
                     && let Some(q) = messages.get_mut(&(src, core_id))
                     && let Some(tile) = q.pop_front()
                 {
-                    if q.is_empty() { messages.remove(&(src, core_id)); }
+                    if q.is_empty() {
+                        messages.remove(&(src, core_id));
+                    }
                     waiting.remove(&core_id);
-                    advance_one(&mut runners, &mut messages, &mut waiting, &mut done, core_id, Some(tile)).unwrap();
+                    advance_one(
+                        &mut runners,
+                        &mut messages,
+                        &mut waiting,
+                        &mut done,
+                        core_id,
+                        Some(tile),
+                    )
+                    .unwrap();
                     progressed = true;
                 }
             }
@@ -426,7 +511,10 @@ mod tests {
         let seeds: Vec<Vec<(String, Value)>> = (0..4)
             .map(|c| {
                 vec![
-                    ("t".into(), Value::Tile(Tile::compute(vec![(c + 1) as f32], DType::F32, vec![1]))),
+                    (
+                        "t".into(),
+                        Value::Tile(Tile::compute(vec![(c + 1) as f32], DType::F32, vec![1])),
+                    ),
                     ("g".into(), group.clone()),
                 ]
             })
@@ -451,7 +539,10 @@ mod tests {
         let seeds: Vec<Vec<(String, Value)>> = (0..3)
             .map(|c| {
                 vec![
-                    ("t".into(), Value::Tile(Tile::compute(starts[c].to_vec(), DType::F32, vec![2]))),
+                    (
+                        "t".into(),
+                        Value::Tile(Tile::compute(starts[c].to_vec(), DType::F32, vec![2])),
+                    ),
                     ("g".into(), group.clone()),
                 ]
             })
@@ -489,7 +580,10 @@ mod tests {
         let seeds: Vec<Vec<(String, Value)>> = (0..2)
             .map(|c| {
                 vec![
-                    ("t".into(), Value::Tile(Tile::compute(vec![(c + 1) as f32], DType::F32, vec![1]))),
+                    (
+                        "t".into(),
+                        Value::Tile(Tile::compute(vec![(c + 1) as f32], DType::F32, vec![1])),
+                    ),
                     ("g".into(), group.clone()),
                 ]
             })
@@ -497,7 +591,13 @@ mod tests {
         let ops = vec![Operation::new(Some("%r"), "ktdp.reduce", &["%t", "%g"])];
         let results = run_capturing(&grid, &mem, &ops, &seeds, "%r");
         // each core keeps its own value (no reduction)
-        match &results[0] { Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![1.0]), o => panic!("{o:?}") }
-        match &results[1] { Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![2.0]), o => panic!("{o:?}") }
+        match &results[0] {
+            Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![1.0]),
+            o => panic!("{o:?}"),
+        }
+        match &results[1] {
+            Some(Value::Tile(t)) => assert_eq!(t.data.to_vec(), vec![2.0]),
+            o => panic!("{o:?}"),
+        }
     }
 }

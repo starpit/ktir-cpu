@@ -33,8 +33,8 @@
 
 use std::rc::Rc;
 
-use ktir_cpu::affine::{eval_bound, sym_add, sym_max, sym_min, sym_neg};
 use ktir_cpu::affine::{AffineExpr, Bound, ConstraintKind};
+use ktir_cpu::affine::{eval_bound, sym_add, sym_max, sym_min, sym_neg};
 use ktir_cpu::parser_ast::{parse_affine_map, parse_affine_set, parse_expr};
 
 // Convenience constructors mirroring the Python tuple AST.
@@ -88,7 +88,11 @@ fn tokenise_constraint_tokens() {
 
 #[test]
 fn tokenise_arrow_token() {
-    assert!(ktir_cpu::parser_ast::tokenise("(d0) -> (d0)").iter().any(|t| t == "->"));
+    assert!(
+        ktir_cpu::parser_ast::tokenise("(d0) -> (d0)")
+            .iter()
+            .any(|t| t == "->")
+    );
 }
 
 #[test]
@@ -449,10 +453,9 @@ fn contains_outside_1d() {
 
 #[test]
 fn contains_2d_boundary() {
-    let s = parse_affine_set(
-        "affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0)>",
-    )
-    .unwrap();
+    let s =
+        parse_affine_set("affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0)>")
+            .unwrap();
     assert!(s.contains(&[0, 0], &[]));
     assert!(s.contains(&[1, 1], &[]));
     assert!(!s.contains(&[2, 0], &[]));
@@ -493,10 +496,9 @@ fn enumerate_1d_range() {
 
 #[test]
 fn enumerate_2d_rect_64x64() {
-    let s = parse_affine_set(
-        "affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>",
-    )
-    .unwrap();
+    let s =
+        parse_affine_set("affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>")
+            .unwrap();
     let pts = s.enumerate(&[64, 64], &[]);
     assert_eq!(pts.len(), 64 * 64);
     assert_eq!(pts[0], vec![0, 0]);
@@ -515,8 +517,7 @@ fn enumerate_shape_larger_than_set() {
 #[test]
 fn enumerate_empty_set() {
     // infeasible: d0 >= 5 and d0 <= 3
-    let s =
-        parse_affine_set("affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0, d0 + -5 >= 0)>").unwrap();
+    let s = parse_affine_set("affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0, d0 + -5 >= 0)>").unwrap();
     let pts = s.enumerate(&[10], &[]);
     assert_eq!(pts, Vec::<Vec<i64>>::new());
 }
@@ -555,7 +556,11 @@ fn enumerate_symbolic_symbol_larger_than_shape() {
 
 #[test]
 fn tokenise_eq_operator() {
-    assert!(ktir_cpu::parser_ast::tokenise("(g == 0)").iter().any(|t| t == "=="));
+    assert!(
+        ktir_cpu::parser_ast::tokenise("(g == 0)")
+            .iter()
+            .any(|t| t == "==")
+    );
 }
 
 #[test]
@@ -681,7 +686,12 @@ fn triangular_affine_set_sum_constraint() {
     let pts = s.enumerate(&[4, 4], &[]);
     assert_eq!(pts.len(), 10);
     for p in &pts {
-        assert!(p[0] + p[1] <= 3, "({},{}) violates d0 + d1 <= 3", p[0], p[1]);
+        assert!(
+            p[0] + p[1] <= 3,
+            "({},{}) violates d0 + d1 <= 3",
+            p[0],
+            p[1]
+        );
     }
 }
 

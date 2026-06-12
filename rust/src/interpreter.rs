@@ -22,7 +22,7 @@ use crate::dialects::Dispatch;
 use crate::dtypes::DType;
 use crate::env::{ExecutionEnv, GridExecutor};
 use crate::ir::{IRModule, Operation, Scalar, Value};
-use crate::memory::{SpyreMemoryHierarchy, STICK_BYTES};
+use crate::memory::{STICK_BYTES, SpyreMemoryHierarchy};
 
 /// Execute one operation: dispatch, then bind its result (tracking LX for
 /// Tiles). Mirrors `_execute_op`. Comm ops (which suspend) are driven by the
@@ -147,18 +147,29 @@ fn try_fuse_matmul_epilogue(
     if mm.op_type != "linalg.matmul" || mm.operands.len() != 2 {
         return Ok(None);
     }
-    let Some(cname) = mm.result.as_deref() else { return Ok(None) };
-    let Some(ep) = ops.get(i + 1) else { return Ok(None) };
-    let Some(dname) = ep.result.as_deref() else { return Ok(None) };
+    let Some(cname) = mm.result.as_deref() else {
+        return Ok(None);
+    };
+    let Some(ep) = ops.get(i + 1) else {
+        return Ok(None);
+    };
+    let Some(dname) = ep.result.as_deref() else {
+        return Ok(None);
+    };
 
     // The consumer must be a fusable binary elementwise op with `%c` as one
     // operand; `%e` is the other. For non-commutative ops the kernel computes
     // `c BINOP e`, so `%c` must be the FIRST operand.
-    let Some(epi) = Epilogue::from_binary_op(&ep.op_type) else { return Ok(None) };
+    let Some(epi) = Epilogue::from_binary_op(&ep.op_type) else {
+        return Ok(None);
+    };
     if ep.operands.len() != 2 {
         return Ok(None);
     }
-    let commutative = matches!(epi, Epilogue::ADD | Epilogue::MUL | Epilogue::MAX | Epilogue::MIN);
+    let commutative = matches!(
+        epi,
+        Epilogue::ADD | Epilogue::MUL | Epilogue::MAX | Epilogue::MIN
+    );
     let ename = if ep.operands[0] == cname {
         ep.operands[1].as_str()
     } else if ep.operands[1] == cname && commutative {
@@ -172,8 +183,15 @@ fn try_fuse_matmul_epilogue(
     if ename == cname {
         return Ok(None);
     }
-    let reused = ops[i + 2..].iter().any(|o| o.operands.iter().any(|x| x == cname))
-        || ops[i + 1].operands.iter().filter(|x| x.as_str() == cname).count() > 1;
+    let reused = ops[i + 2..]
+        .iter()
+        .any(|o| o.operands.iter().any(|x| x == cname))
+        || ops[i + 1]
+            .operands
+            .iter()
+            .filter(|x| x.as_str() == cname)
+            .count()
+            > 1;
     if reused {
         return Ok(None);
     }
@@ -191,8 +209,7 @@ fn try_fuse_matmul_epilogue(
     if e.shape != [m, n] {
         return Ok(None);
     }
-    let (a_data, b_data, e_data, dtype) =
-        (a.data.clone(), b.data.clone(), e.data.clone(), a.dtype);
+    let (a_data, b_data, e_data, dtype) = (a.data.clone(), b.data.clone(), e.data.clone(), a.dtype);
 
     // Fuse only if the gate picks NAX and the kernel runs; else fall through.
     let Some(out) = crate::metal_backend::metal_gemm_fused(m, k, n, &a_data, &b_data, &e_data, epi)
@@ -247,11 +264,19 @@ pub enum Arg {
     /// f32 host data, narrowed to `dtype` on the way into HBM. The dtype-agnostic
     /// oracle path — convenient, but for an all-f16 model it pays an f32→f16
     /// narrow per input (and f16→f32 widen per output) and 2× host memory.
-    Tensor { data: Vec<f32>, shape: Vec<usize>, dtype: DType },
+    Tensor {
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        dtype: DType,
+    },
     /// Pre-encoded typed bytes (already in `dtype` layout, e.g. f16), copied
     /// straight into HBM with no conversion — mirrors Spyre's typed host→AIU DMA.
     /// Use this to avoid the f32 round-trip for typed (f16/…) host buffers.
-    TensorBytes { data: Vec<u8>, shape: Vec<usize>, dtype: DType },
+    TensorBytes {
+        data: Vec<u8>,
+        shape: Vec<usize>,
+        dtype: DType,
+    },
     Scalar(Scalar),
 }
 
@@ -368,18 +393,36 @@ fn marshal_inputs(
             stick
         };
         input_ptrs.push((name.to_string(), Value::Index(stick)));
-        tensor_meta.push((name.to_string(), stick, shape.iter().product(), shape.to_vec(), dtype));
+        tensor_meta.push((
+            name.to_string(),
+            stick,
+            shape.iter().product(),
+            shape.to_vec(),
+            dtype,
+        ));
     }
     for (name, arg) in args {
         match arg {
             // f32 host data: narrow to `dtype` on the way in.
-            Arg::Tensor { data, shape, dtype } => {
-                place(mem, &mut input_ptrs, &mut tensor_meta, name, codec::encode(data, *dtype), shape, *dtype)
-            }
+            Arg::Tensor { data, shape, dtype } => place(
+                mem,
+                &mut input_ptrs,
+                &mut tensor_meta,
+                name,
+                codec::encode(data, *dtype),
+                shape,
+                *dtype,
+            ),
             // Pre-encoded typed bytes: straight to HBM, no conversion.
-            Arg::TensorBytes { data, shape, dtype } => {
-                place(mem, &mut input_ptrs, &mut tensor_meta, name, data.clone(), shape, *dtype)
-            }
+            Arg::TensorBytes { data, shape, dtype } => place(
+                mem,
+                &mut input_ptrs,
+                &mut tensor_meta,
+                name,
+                data.clone(),
+                shape,
+                *dtype,
+            ),
             Arg::Scalar(s) => input_ptrs.push((name.to_string(), Value::Scalar(*s))),
         }
     }
@@ -477,7 +520,10 @@ fn try_combine_matmul(
         None => return Ok(false),
     };
     // Read core 0's operands to fix the shapes and the shared weights.
-    let (a0, b0) = (as_tile(&ctxs[0], &op.operands[0])?, as_tile(&ctxs[0], &op.operands[1])?);
+    let (a0, b0) = (
+        as_tile(&ctxs[0], &op.operands[0])?,
+        as_tile(&ctxs[0], &op.operands[1])?,
+    );
     if a0.shape.len() != 2 || b0.shape.len() != 2 || a0.shape[1] != b0.shape[0] {
         return Ok(false);
     }
@@ -502,7 +548,16 @@ fn try_combine_matmul(
     let ua = gemm.unified_from(&a_stack)?;
     let ub = gemm.unified_from(&shared_b)?;
     let mut uc = gemm.unified(ctxs.len() * m * n)?;
-    gemm.matmul_unified(ctxs.len() * m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+    gemm.matmul_unified(
+        ctxs.len() * m,
+        k,
+        n,
+        &ua,
+        &ub,
+        &mut uc,
+        None,
+        Epilogue::NONE,
+    )?;
 
     // Scatter each core's row-block back as its matmul result.
     let c = uc.as_slice();
@@ -525,7 +580,15 @@ fn read_back(
         let nbytes = n * dtype.bytes_per_elem();
         let bytes = mem.hbm.borrow().read_bytes(stick * STICK_BYTES, nbytes);
         let data = codec::decode(&bytes, n, dtype);
-        outputs.insert(name, Output { data, shape, dtype, raw: bytes });
+        outputs.insert(
+            name,
+            Output {
+                data,
+                shape,
+                dtype,
+                raw: bytes,
+            },
+        );
     }
     Ok(outputs)
 }
@@ -569,8 +632,14 @@ mod tests {
         let grid = GridExecutor::new((1, 1, 1));
         let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
-        ctx.set_value("%x", Value::Tile(Tile::compute(vec![1.0, 2.0, 3.0], DType::F32, vec![3])));
-        ctx.set_value("%y", Value::Tile(Tile::compute(vec![10.0, 20.0, 30.0], DType::F32, vec![3])));
+        ctx.set_value(
+            "%x",
+            Value::Tile(Tile::compute(vec![1.0, 2.0, 3.0], DType::F32, vec![3])),
+        );
+        ctx.set_value(
+            "%y",
+            Value::Tile(Tile::compute(vec![10.0, 20.0, 30.0], DType::F32, vec![3])),
+        );
         let ops = vec![Operation::new(Some("%z"), "arith.addf", &["%x", "%y"])];
         execute_ops(&ops, &mut ctx, &env).unwrap();
         match ctx.get_value("%z").unwrap() {

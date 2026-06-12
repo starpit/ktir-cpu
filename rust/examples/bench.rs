@@ -2,9 +2,9 @@
 // Run: cargo run --release --example bench
 use ktir_cpu::codec;
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
-use ktir_cpu::memory::{SpyreMemoryHierarchy, STICK_BYTES};
+use ktir_cpu::memory::{STICK_BYTES, SpyreMemoryHierarchy};
 use ktir_cpu::parser::parse_module;
 use std::time::Instant;
 
@@ -22,9 +22,30 @@ fn main() {
 
     let mk_args = || {
         [
-            ("x_ptr", Arg::Tensor { data: x.clone(), shape: vec![n], dtype: DType::F16 }),
-            ("y_ptr", Arg::Tensor { data: y.clone(), shape: vec![n], dtype: DType::F16 }),
-            ("output_ptr", Arg::Tensor { data: vec![0.0; n], shape: vec![n], dtype: DType::F16 }),
+            (
+                "x_ptr",
+                Arg::Tensor {
+                    data: x.clone(),
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "y_ptr",
+                Arg::Tensor {
+                    data: y.clone(),
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "output_ptr",
+                Arg::Tensor {
+                    data: vec![0.0; n],
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
             ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
         ]
     };
@@ -35,14 +56,20 @@ fn main() {
         let out = execute_function(&module, "add_kernel", &mk_args()).unwrap();
         std::hint::black_box(&out);
     }
-    println!("execute_function (pre-parsed)   : {:.1} us/iter", us(t, iters));
+    println!(
+        "execute_function (pre-parsed)   : {:.1} us/iter",
+        us(t, iters)
+    );
 
     // Phase 1: memory hierarchy construction (32 cores: HBM + 32 LX).
     let t = Instant::now();
     for _ in 0..iters {
         std::hint::black_box(SpyreMemoryHierarchy::new(32));
     }
-    println!("  SpyreMemoryHierarchy::new(32)  : {:.1} us/iter", us(t, iters));
+    println!(
+        "  SpyreMemoryHierarchy::new(32)  : {:.1} us/iter",
+        us(t, iters)
+    );
 
     // Phase 2: input marshalling (codec::encode + HBM write) for 3 tensors.
     let t = Instant::now();
@@ -56,7 +83,10 @@ fn main() {
         }
         std::hint::black_box(&mem);
     }
-    println!("  marshal 2x4096 f16 (+mem)      : {:.1} us/iter", us(t, iters));
+    println!(
+        "  marshal 2x4096 f16 (+mem)      : {:.1} us/iter",
+        us(t, iters)
+    );
 
     // Phase 3: round_to_dtype micro-bench (f16), a 128-elem tile.
     let tile: Vec<f32> = (0..128).map(|i| i as f32 * 0.01).collect();
@@ -66,7 +96,10 @@ fn main() {
         codec::round_to_dtype(&mut d, DType::F16);
         std::hint::black_box(&d);
     }
-    println!("  round_to_dtype 128 f16 (+clone): {:.3} us/iter", us(t, iters));
+    println!(
+        "  round_to_dtype 128 f16 (+clone): {:.3} us/iter",
+        us(t, iters)
+    );
 
     // Phase 4: codec round-trip for a 4096 f16 buffer (encode then decode).
     let t = Instant::now();
@@ -74,7 +107,10 @@ fn main() {
         let b = codec::encode(&x, DType::F16);
         std::hint::black_box(codec::decode(&b, n, DType::F16));
     }
-    println!("  codec enc+dec 4096 f16         : {:.1} us/iter", us(t, iters));
+    println!(
+        "  codec enc+dec 4096 f16         : {:.1} us/iter",
+        us(t, iters)
+    );
 
     // Phase 5: the load slow-path trigger — affine enumerate of a contiguous
     // 0..127 box (what every vector_add load/store currently does) vs the O(2^n)
@@ -85,12 +121,18 @@ fn main() {
     for _ in 0..iters {
         std::hint::black_box(set.enumerate(&[128], &[]));
     }
-    println!("  AffineSet::enumerate [128] box : {:.2} us/iter", us(t, iters));
+    println!(
+        "  AffineSet::enumerate [128] box : {:.2} us/iter",
+        us(t, iters)
+    );
     let t = Instant::now();
     for _ in 0..iters {
         std::hint::black_box(set.is_full(&[128]));
     }
-    println!("  AffineSet::is_full [128] box   : {:.3} us/iter", us(t, iters));
+    println!(
+        "  AffineSet::is_full [128] box   : {:.3} us/iter",
+        us(t, iters)
+    );
 
     // Phase 6: pure scheduler/context overhead — drive 32 cores over an EMPTY
     // op list (builds 32 CoreContexts incl. the all_lx Vec clone, runs the
@@ -106,5 +148,8 @@ fn main() {
         execute_with_communication(&grid, &mem, &[], &[], &dispatch, None).unwrap();
         std::hint::black_box(&mem);
     }
-    println!("  32-core scheduler, empty ops   : {:.1} us/iter", us(t, iters));
+    println!(
+        "  32-core scheduler, empty ops   : {:.1} us/iter",
+        us(t, iters)
+    );
 }

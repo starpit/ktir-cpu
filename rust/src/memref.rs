@@ -22,7 +22,9 @@ pub enum MemorySpace {
     Hbm,
     /// `core_id = None` means "the executing core's own LX scratchpad"
     /// (default routing), per `#ktdp.spyre_memory_space<LX, core = N>`.
-    Lx { core_id: Option<u32> },
+    Lx {
+        core_id: Option<u32>,
+    },
 }
 
 impl MemorySpace {
@@ -122,7 +124,9 @@ impl DistributedMemRef {
         }
         for (i, p) in partitions.iter().enumerate() {
             if p.coordinate_set.is_none() {
-                return Err(format!("DistributedMemRef partition {i} must have a coordinate_set"));
+                return Err(format!(
+                    "DistributedMemRef partition {i} must have a coordinate_set"
+                ));
             }
             if p.dtype != dtype {
                 return Err(format!(
@@ -131,7 +135,11 @@ impl DistributedMemRef {
                 ));
             }
         }
-        Ok(DistributedMemRef { partitions, shape, dtype })
+        Ok(DistributedMemRef {
+            partitions,
+            shape,
+            dtype,
+        })
     }
 
     /// First partition whose coordinate_set contains `coord`. Per RFC 0682 §3.3,
@@ -143,7 +151,9 @@ impl DistributedMemRef {
                 return Ok((i, p));
             }
         }
-        Err(format!("no partition of DistributedMemRef contains global coord {coord:?}"))
+        Err(format!(
+            "no partition of DistributedMemRef contains global coord {coord:?}"
+        ))
     }
 }
 
@@ -254,8 +264,14 @@ mod tests {
     #[test]
     fn memory_space_invariant_is_structural() {
         assert!(MemorySpace::parse("HBM", Some(0)).is_err());
-        assert_eq!(MemorySpace::parse("LX", Some(3)).unwrap(), MemorySpace::Lx { core_id: Some(3) });
-        assert_eq!(MemorySpace::parse("LX", None).unwrap(), MemorySpace::Lx { core_id: None });
+        assert_eq!(
+            MemorySpace::parse("LX", Some(3)).unwrap(),
+            MemorySpace::Lx { core_id: Some(3) }
+        );
+        assert_eq!(
+            MemorySpace::parse("LX", None).unwrap(),
+            MemorySpace::Lx { core_id: None }
+        );
         assert!(MemorySpace::parse("DDR", None).is_err());
     }
 

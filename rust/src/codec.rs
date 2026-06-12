@@ -331,7 +331,11 @@ mod tests {
         let simd = encode(&vals, DType::F16);
         for (i, &v) in vals.iter().enumerate() {
             let got = u16::from_le_bytes([simd[i * 2], simd[i * 2 + 1]]);
-            assert_eq!(got, f32_to_f16_bits(v), "encode rounding for {v} (slot {i})");
+            assert_eq!(
+                got,
+                f32_to_f16_bits(v),
+                "encode rounding for {v} (slot {i})"
+            );
         }
     }
 
@@ -401,7 +405,10 @@ mod tile_round_tests {
         // an f16 tile stores the f16-rounded value, not the exact f32 input.
         let t = Tile::compute(vec![0.1, 0.2, 0.3], DType::F16, vec![3]);
         for (&got, &raw) in t.data.iter().zip(&[0.1f32, 0.2, 0.3]) {
-            assert_eq!(got, crate::codec::f16_bits_to_f32(crate::codec::f32_to_f16_bits(raw)));
+            assert_eq!(
+                got,
+                crate::codec::f16_bits_to_f32(crate::codec::f32_to_f16_bits(raw))
+            );
         }
         // f32 tiles keep exact values.
         let g = Tile::compute(vec![0.1, 0.2], DType::F32, vec![2]);

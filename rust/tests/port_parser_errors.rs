@@ -121,10 +121,7 @@ fn parse_module_truncated_mid_op() {
     // returns Err on the empty value. Assert the Err faithfully.
     let mlir = minimal_func("  %x = arith.constant");
     let err = parse_module(&mlir).expect_err("truncated arith.constant should error in Rust");
-    assert!(
-        err.contains("arith.constant"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("arith.constant"), "unexpected error: {err}");
 }
 
 // ===========================================================================
@@ -156,7 +153,10 @@ fn parse_module_garbage_op_line_skipped() {
         .iter()
         .filter(|o| o.op_type == "arith.constant")
         .count();
-    assert_eq!(n_const, 2, "both constants should parse around the garbage line");
+    assert_eq!(
+        n_const, 2,
+        "both constants should parse around the garbage line"
+    );
 }
 
 // ===========================================================================
@@ -185,13 +185,9 @@ fn parse_module_unicode_in_op_body() {
     //
     // DIVERGENCE: the Rust `arith.constant` value parser rejects the non-ASCII
     // literal and returns Err rather than skipping the op. Assert the Err.
-    let mlir =
-        "module {\n  func.func @unicode_test() {\n    %x = arith.constant \u{3053} : index\n  }\n}\n";
+    let mlir = "module {\n  func.func @unicode_test() {\n    %x = arith.constant \u{3053} : index\n  }\n}\n";
     let err = parse_module(mlir).expect_err("unicode in op value should error in Rust");
-    assert!(
-        err.contains("arith.constant"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("arith.constant"), "unexpected error: {err}");
 }
 
 // ===========================================================================
@@ -339,7 +335,14 @@ fn arith_constant_attribute_block_region_detection() {
                %x = arith.constant { value = 42 : i32 } : index\n    return\n  }\n}";
     let module = parse_module(src).expect("attribute-block constant parses");
     let f = module.get_function("f").unwrap();
-    let c = f.operations.iter().find(|o| o.op_type == "arith.constant").expect("constant op");
+    let c = f
+        .operations
+        .iter()
+        .find(|o| o.op_type == "arith.constant")
+        .expect("constant op");
     assert!(c.regions.is_empty(), "attribute block must not be a region");
-    assert_eq!(c.attributes.get("value"), Some(&ktir_cpu::ir::Attr::Int(42)));
+    assert_eq!(
+        c.attributes.get("value"),
+        Some(&ktir_cpu::ir::Attr::Int(42))
+    );
 }

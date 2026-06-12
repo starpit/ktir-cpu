@@ -93,13 +93,21 @@ fn row_major(shape: &[usize]) -> Vec<i64> {
 fn read_back(ctx: &mut ktir_cpu::context::CoreContext, stick: i64, shape: &[usize]) -> Vec<f32> {
     let m = hbm_memref(stick, shape, &row_major(shape), DType::F16);
     let tr = m.to_tile_ref();
-    load_data(ctx, &tr, None, None).expect("read back").data.to_vec()
+    load_data(ctx, &tr, None, None)
+        .expect("read back")
+        .data
+        .to_vec()
 }
 
 /// Drive a real `ktdp.construct_access_tile` op over an HBM `MemRef` parent and
 /// return the resulting single-allocation `TileRef` (the Python
 /// `MemoryOps.tile_access(...)` return value).
-fn tile_access(parent: MemRef, indices: &[i64], access_shape: &[usize], base_map_src: &str) -> TileRef {
+fn tile_access(
+    parent: MemRef,
+    indices: &[i64],
+    access_shape: &[usize],
+    base_map_src: &str,
+) -> TileRef {
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
     let env = ExecutionEnv::new(&dispatch, &grid);
@@ -175,7 +183,12 @@ fn scaled_map() {
     let mut ctx = single_core_context();
     let stick = alloc_f16(&mut ctx, &arange(64), &[64]);
     let parent = hbm_memref(stick, &[8, 8], &[8, 1], DType::F16);
-    let tr = tile_access(parent, &[1, 3], &[1, 1], "affine_map<(d0, d1) -> (d0 * 2, d1)>");
+    let tr = tile_access(
+        parent,
+        &[1, 3],
+        &[1, 1],
+        "affine_map<(d0, d1) -> (d0 * 2, d1)>",
+    );
     assert_eq!(tr.base_ptr, stick * STICK_BYTES + 19 * 2);
 }
 
@@ -250,7 +263,10 @@ fn non_rectangular_load_store() {
     assert_eq!(coords.len(), 10);
 
     let tile = load_data(&mut ctx, &tr, Some(&coords), Some(vec![10])).unwrap();
-    let expected_vals: Vec<f32> = coords.iter().map(|c| data[(c[0] * 4 + c[1]) as usize]).collect();
+    let expected_vals: Vec<f32> = coords
+        .iter()
+        .map(|c| data[(c[0] * 4 + c[1]) as usize])
+        .collect();
     assert_eq!(tile.data.to_vec(), expected_vals);
 
     let doubled: Vec<f32> = tile.data.iter().map(|v| v * 2.0).collect();
@@ -293,10 +309,16 @@ fn access_tile_order_inverted() {
     let remapped: Vec<Vec<i64>> = coords.iter().map(|pt| cso.eval(pt, &[])).collect();
     let tile = load_data(&mut ctx, &tr, Some(&remapped), Some(vec![9])).unwrap();
 
-    let expected: Vec<f32> = remapped.iter().map(|c| data[(c[0] * 3 + c[1]) as usize]).collect();
+    let expected: Vec<f32> = remapped
+        .iter()
+        .map(|c| data[(c[0] * 3 + c[1]) as usize])
+        .collect();
     assert_eq!(tile.data.to_vec(), expected);
     // Column-major traversal: 0,3,6,1,4,7,2,5,8.
-    assert_eq!(tile.data.to_vec(), vec![0.0, 3.0, 6.0, 1.0, 4.0, 7.0, 2.0, 5.0, 8.0]);
+    assert_eq!(
+        tile.data.to_vec(),
+        vec![0.0, 3.0, 6.0, 1.0, 4.0, 7.0, 2.0, 5.0, 8.0]
+    );
 }
 
 // ===========================================================================
@@ -310,7 +332,12 @@ fn tile_access_3d_identity() {
     let mut ctx = single_core_context();
     let stick = alloc_f16(&mut ctx, &arange(24), &[2, 3, 4]);
     let parent = hbm_memref(stick, &[2, 3, 4], &[12, 4, 1], DType::F16);
-    let tr = tile_access(parent, &[1, 1, 2], &[1, 1, 1], "affine_map<(d0, d1, d2) -> (d0, d1, d2)>");
+    let tr = tile_access(
+        parent,
+        &[1, 1, 2],
+        &[1, 1, 1],
+        "affine_map<(d0, d1, d2) -> (d0, d1, d2)>",
+    );
     assert_eq!(tr.base_ptr, stick * STICK_BYTES + 18 * 2);
 }
 
@@ -321,9 +348,17 @@ fn tile_access_3d_load() {
     let mut ctx = single_core_context();
     let stick = alloc_f16(&mut ctx, &arange(24), &[2, 3, 4]);
     let parent = hbm_memref(stick, &[2, 3, 4], &[12, 4, 1], DType::F16);
-    let tr = tile_access(parent, &[0, 1, 0], &[1, 2, 4], "affine_map<(d0, d1, d2) -> (d0, d1, d2)>");
+    let tr = tile_access(
+        parent,
+        &[0, 1, 0],
+        &[1, 2, 4],
+        "affine_map<(d0, d1, d2) -> (d0, d1, d2)>",
+    );
     let tile = load_data(&mut ctx, &tr, None, None).unwrap();
-    assert_eq!(tile.data.to_vec(), vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(
+        tile.data.to_vec(),
+        vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]
+    );
     assert_eq!(tile.shape, vec![1, 2, 4]);
 }
 

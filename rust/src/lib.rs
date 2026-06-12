@@ -14,7 +14,12 @@
 // Links the BLAS backend — Accelerate on macOS (default), or the provider chosen
 // by feature elsewhere. `blas-src` must be referenced once at the crate root for
 // its linker directives to take effect. See blas.rs.
-#[cfg(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis"))]
+#[cfg(any(
+    target_os = "macos",
+    feature = "openblas",
+    feature = "mkl",
+    feature = "blis"
+))]
 extern crate blas_src;
 
 pub mod affine;

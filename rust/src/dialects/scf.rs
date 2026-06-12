@@ -42,7 +42,11 @@ pub fn register(d: &mut Dispatch) {
 /// `scf.yield %a, %b, ...` — gather the operand values and hand them back to
 /// the enclosing loop/conditional driver. Mirrors `ControlOps.yield_op`: the
 /// returned `Value::Tuple` is the `_YieldResult` sentinel analogue.
-fn scf_yield(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn scf_yield(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     let values: Vec<Value> = op
         .operands
         .iter()
@@ -61,7 +65,11 @@ fn scf_yield(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Resu
 /// The branch body gets its own scope; body-local LX is freed on `pop_scope`.
 /// If the branch yields Tile values, their LX is freed by `pop_scope` too — the
 /// driver in `execute_op` re-tracks the bound result afterward.
-fn scf_if(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn scf_if(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("scf.if: missing condition operand".into());
     }
@@ -103,7 +111,11 @@ fn scf_if(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<O
 ///
 /// Returns the final iter_arg value (single) or a `Value::Tuple` (multiple);
 /// `None` when there are no iter_args.
-fn scf_for(op: &Operation, ctx: &mut CoreContext, env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn scf_for(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.len() < 3 {
         return Err(format!(
             "scf.for expects at least 3 operands (lb, ub, step), got {}",
@@ -347,13 +359,20 @@ mod tests {
         ctx.set_value("%step", Value::Index(1));
         ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
         // body: %s = addi %acc %one ; yield %s   (counts iterations)
-        let one = Operation::new(Some("%one"), "arith.constant", &[])
-            .with_attr("value", Attr::Int(1));
+        let one =
+            Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1));
         let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%one"]);
         let yld = Operation::new(None, "scf.yield", &["%s"]);
         let body = vec![one, add, yld];
         let f = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"], body,
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%init"],
+            &["%acc"],
+            body,
         );
         run(&[f], &mut ctx).unwrap();
         match ctx.get_value("%r").unwrap() {
@@ -370,12 +389,18 @@ mod tests {
         ctx.set_value("%ub", Value::Index(6));
         ctx.set_value("%step", Value::Index(2));
         ctx.set_value("%init", Value::Scalar(Scalar::I64(0)));
-        let one = Operation::new(Some("%one"), "arith.constant", &[])
-            .with_attr("value", Attr::Int(1));
+        let one =
+            Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1));
         let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%one"]);
         let yld = Operation::new(None, "scf.yield", &["%s"]);
         let f = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"],
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%init"],
+            &["%acc"],
             vec![one, add, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -397,7 +422,13 @@ mod tests {
         let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]);
         let yld = Operation::new(None, "scf.yield", &["%s"]);
         let f = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"],
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%init"],
+            &["%acc"],
             vec![add, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -421,7 +452,13 @@ mod tests {
         let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]);
         let yld = Operation::new(None, "scf.yield", &["%s"]);
         let f = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"],
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%init"],
+            &["%acc"],
             vec![add, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -453,20 +490,26 @@ mod tests {
         ctx.set_value("%step", Value::Index(1));
         ctx.set_value("%a0", Value::Scalar(Scalar::I64(0)));
         ctx.set_value("%b0", Value::Scalar(Scalar::I64(10)));
-        let one = Operation::new(Some("%one"), "arith.constant", &[])
-            .with_attr("value", Attr::Int(1));
+        let one =
+            Operation::new(Some("%one"), "arith.constant", &[]).with_attr("value", Attr::Int(1));
         let na = Operation::new(Some("%na"), "arith.addi", &["%a", "%one"]);
         let nb = Operation::new(Some("%nb"), "arith.addi", &["%b", "%one"]);
         let yld = Operation::new(None, "scf.yield", &["%na", "%nb"]);
         let f = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%a0", "%b0"], &["%a", "%b"],
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%a0", "%b0"],
+            &["%a", "%b"],
             vec![one, na, nb, yld],
         );
         run(&[f], &mut ctx).unwrap();
         match ctx.get_value("%r").unwrap() {
             Value::Tuple(vals) => {
                 assert_eq!(vals.len(), 2);
-                assert!(matches!(vals[0], Value::Scalar(Scalar::I64(3))));  // 0+3
+                assert!(matches!(vals[0], Value::Scalar(Scalar::I64(3)))); // 0+3
                 assert!(matches!(vals[1], Value::Scalar(Scalar::I64(13)))); // 10+3
             }
             other => panic!("expected Tuple, got {other:?}"),
@@ -482,7 +525,10 @@ mod tests {
         ctx.set_value("%ub", Value::Index(3));
         ctx.set_value("%step", Value::Index(1));
         // init tile: 4 x f32 = 16 bytes
-        ctx.set_value("%init", Value::Tile(Tile::compute(vec![0.0; 4], DType::F32, vec![4])));
+        ctx.set_value(
+            "%init",
+            Value::Tile(Tile::compute(vec![0.0; 4], DType::F32, vec![4])),
+        );
         ctx.track_lx("%init", 16).unwrap();
         let one = Operation::new(Some("%one"), "arith.constant", &[])
             .with_attr("value", Attr::Float(1.0));
@@ -490,7 +536,13 @@ mod tests {
         let add = Operation::new(Some("%s"), "arith.addf", &["%acc", "%acc"]);
         let yld = Operation::new(None, "scf.yield", &["%s"]);
         let f = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"],
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%init"],
+            &["%acc"],
             vec![one, add, yld],
         );
         let used_before = ctx.lx.borrow().used;
@@ -510,11 +562,11 @@ mod tests {
     fn if_true_runs_then_branch() {
         let mut ctx = single_core_context();
         ctx.set_value("%cond", Value::Scalar(Scalar::Bool(true)));
-        let c = Operation::new(Some("%t"), "arith.constant", &[])
-            .with_attr("value", Attr::Float(7.0));
+        let c =
+            Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
         let yld = Operation::new(None, "scf.yield", &["%t"]);
-        let e = Operation::new(Some("%f"), "arith.constant", &[])
-            .with_attr("value", Attr::Float(9.0));
+        let e =
+            Operation::new(Some("%f"), "arith.constant", &[]).with_attr("value", Attr::Float(9.0));
         let eyld = Operation::new(None, "scf.yield", &["%f"]);
         let mut iff = Operation::new(Some("%r"), "scf.if", &["%cond"]);
         iff.regions = vec![vec![c, yld], vec![e, eyld]];
@@ -529,11 +581,11 @@ mod tests {
     fn if_false_runs_else_branch() {
         let mut ctx = single_core_context();
         ctx.set_value("%cond", Value::Scalar(Scalar::Bool(false)));
-        let c = Operation::new(Some("%t"), "arith.constant", &[])
-            .with_attr("value", Attr::Float(7.0));
+        let c =
+            Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
         let yld = Operation::new(None, "scf.yield", &["%t"]);
-        let e = Operation::new(Some("%f"), "arith.constant", &[])
-            .with_attr("value", Attr::Float(9.0));
+        let e =
+            Operation::new(Some("%f"), "arith.constant", &[]).with_attr("value", Attr::Float(9.0));
         let eyld = Operation::new(None, "scf.yield", &["%f"]);
         let mut iff = Operation::new(Some("%r"), "scf.if", &["%cond"]);
         iff.regions = vec![vec![c, yld], vec![e, eyld]];
@@ -549,8 +601,8 @@ mod tests {
         let mut ctx = single_core_context();
         ctx.set_value("%cond", Value::Scalar(Scalar::Bool(false)));
         // then has a body, else is empty -> condition false selects empty -> None.
-        let c = Operation::new(Some("%t"), "arith.constant", &[])
-            .with_attr("value", Attr::Float(7.0));
+        let c =
+            Operation::new(Some("%t"), "arith.constant", &[]).with_attr("value", Attr::Float(7.0));
         let yld = Operation::new(None, "scf.yield", &["%t"]);
         // no result name: op produces None, nothing bound.
         let mut iff = Operation::new(None, "scf.if", &["%cond"]);
@@ -564,7 +616,10 @@ mod tests {
     fn if_branch_local_lx_is_freed() {
         let mut ctx = single_core_context();
         ctx.set_value("%cond", Value::Scalar(Scalar::Bool(true)));
-        ctx.set_value("%x", Value::Tile(Tile::compute(vec![1.0, 2.0], DType::F32, vec![2])));
+        ctx.set_value(
+            "%x",
+            Value::Tile(Tile::compute(vec![1.0, 2.0], DType::F32, vec![2])),
+        );
         // then: %y = addf %x %x ; yield nothing (no result) -> body-local tile freed.
         let add = Operation::new(Some("%y"), "arith.addf", &["%x", "%x"]);
         let yld = Operation::new(None, "scf.yield", &[]);
@@ -609,7 +664,13 @@ mod tests {
         let add = Operation::new(Some("%s"), "arith.addi", &["%acc", "%i"]);
         let fyld = Operation::new(None, "scf.yield", &["%s"]);
         let inner_for = for_op_ir(
-            Some("%r"), "%lb", "%ub", "%step", "%i", &["%init"], &["%acc"],
+            Some("%r"),
+            "%lb",
+            "%ub",
+            "%step",
+            "%i",
+            &["%init"],
+            &["%acc"],
             vec![add, fyld],
         );
         let oyld = Operation::new(None, "scf.yield", &["%r"]);

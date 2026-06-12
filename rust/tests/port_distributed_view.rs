@@ -48,18 +48,16 @@
 //!   here drives the slow path with non-axis-aligned (diagonal-masked) partition
 //!   sets so `lower_to_box` returns `None`, and asserts `CoordinateSet::Points`.
 
-use std::rc::Rc;
 use ktir_cpu::affine::{AffineExpr, AffineMap, AffineSet, BoxSet, Constraint, ConstraintKind};
 use ktir_cpu::codec;
 use ktir_cpu::context::CoreContext;
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::interpreter::single_core_context;
 use ktir_cpu::memory::STICK_BYTES;
-use ktir_cpu::memref::{
-    CoordinateSet, DistributedMemRef, DistributedTileRef, MemRef, MemorySpace,
-};
+use ktir_cpu::memref::{CoordinateSet, DistributedMemRef, DistributedTileRef, MemRef, MemorySpace};
 use ktir_cpu::ops_memory::{distributed_load, distributed_store, distributed_tile_access};
 use ktir_cpu::tile::Tile;
+use std::rc::Rc;
 
 // ===========================================================================
 // affine-set / memory helpers
@@ -87,7 +85,11 @@ fn box_affine(lo: &[i64], hi: &[i64]) -> AffineSet {
             kind: ConstraintKind::GreaterEq,
         });
     }
-    AffineSet { num_dims: lo.len(), num_syms: 0, constraints }
+    AffineSet {
+        num_dims: lo.len(),
+        num_syms: 0,
+        constraints,
+    }
 }
 
 /// Allocate a backing region for a partition and write `block` (logical
@@ -155,12 +157,16 @@ fn seed_partition(
 
 /// 4x4 reference tensor: `arange(16)` reshaped row-major, f16-exact.
 fn reference_4x4() -> Vec<Vec<f32>> {
-    (0..4).map(|r| (0..4).map(|c| (r * 4 + c) as f32).collect()).collect()
+    (0..4)
+        .map(|r| (0..4).map(|c| (r * 4 + c) as f32).collect())
+        .collect()
 }
 
 /// Extract the sub-block `[r0, r0+nr) x [c0, c0+nc)` of `full`.
 fn slice_block(full: &[Vec<f32>], r0: usize, c0: usize, nr: usize, nc: usize) -> Vec<Vec<f32>> {
-    (0..nr).map(|i| (0..nc).map(|j| full[r0 + i][c0 + j]).collect()).collect()
+    (0..nr)
+        .map(|i| (0..nc).map(|j| full[r0 + i][c0 + j]).collect())
+        .collect()
 }
 
 // ===========================================================================
@@ -211,95 +217,305 @@ fn cases() -> Vec<DistCopySpec> {
         // --- Row-band partitioning ---
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 1), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            access_shape: (4, 4), indices: [0, 0], id: "row_hbm_hbm_full",
+            p0: PartitionSpec {
+                rows: (0, 1),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (4, 4),
+            indices: [0, 0],
+            id: "row_hbm_hbm_full",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 1), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            access_shape: (2, 4), indices: [0, 0], id: "row_hbm_hbm_partial_p1_pruned",
+            p0: PartitionSpec {
+                rows: (0, 1),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (2, 4),
+            indices: [0, 0],
+            id: "row_hbm_hbm_partial_p1_pruned",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 1), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            access_shape: (2, 2), indices: [1, 1], id: "row_hbm_hbm_subtile_nonzero",
+            p0: PartitionSpec {
+                rows: (0, 1),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (2, 2),
+            indices: [1, 1],
+            id: "row_hbm_hbm_subtile_nonzero",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 1), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (0, 3), space: lx0(), strides: [1, 4], lx_byte_addr: lx_addr },
-            access_shape: (4, 4), indices: [0, 0], id: "row_hbm_lx_col_packed_full",
+            p0: PartitionSpec {
+                rows: (0, 1),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (0, 3),
+                space: lx0(),
+                strides: [1, 4],
+                lx_byte_addr: lx_addr,
+            },
+            access_shape: (4, 4),
+            indices: [0, 0],
+            id: "row_hbm_lx_col_packed_full",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 1), cols: (0, 3), space: lx0(), strides: [1, 4], lx_byte_addr: lx_addr },
-            p1: PartitionSpec { rows: (2, 3), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            access_shape: (4, 4), indices: [0, 0], id: "row_lx_hbm_col_packed_full",
+            p0: PartitionSpec {
+                rows: (0, 1),
+                cols: (0, 3),
+                space: lx0(),
+                strides: [1, 4],
+                lx_byte_addr: lx_addr,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (4, 4),
+            indices: [0, 0],
+            id: "row_lx_hbm_col_packed_full",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 1), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (0, 3), space: lx0(), strides: [1, 4], lx_byte_addr: lx_addr },
-            access_shape: (2, 2), indices: [1, 1], id: "row_hbm_lx_subtile_nonzero",
+            p0: PartitionSpec {
+                rows: (0, 1),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (0, 3),
+                space: lx0(),
+                strides: [1, 4],
+                lx_byte_addr: lx_addr,
+            },
+            access_shape: (2, 2),
+            indices: [1, 1],
+            id: "row_hbm_lx_subtile_nonzero",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 0), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (1, 3), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            access_shape: (4, 4), indices: [0, 0], id: "row_hbm_hbm_unequal_full",
+            p0: PartitionSpec {
+                rows: (0, 0),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (1, 3),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (4, 4),
+            indices: [0, 0],
+            id: "row_hbm_hbm_unequal_full",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 0), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (1, 3), cols: (0, 3), space: hbm(), strides: [4, 1], lx_byte_addr: 0 },
-            access_shape: (2, 4), indices: [1, 0], id: "row_hbm_hbm_unequal_partial_p0_pruned",
+            p0: PartitionSpec {
+                rows: (0, 0),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (1, 3),
+                cols: (0, 3),
+                space: hbm(),
+                strides: [4, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (2, 4),
+            indices: [1, 0],
+            id: "row_hbm_hbm_unequal_partial_p0_pruned",
         },
         // --- Col-band partitioning ---
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (0, 3), cols: (2, 3), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            access_shape: (4, 4), indices: [0, 0], id: "col_hbm_hbm_full",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (0, 3),
+                cols: (2, 3),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (4, 4),
+            indices: [0, 0],
+            id: "col_hbm_hbm_full",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (0, 3), cols: (2, 3), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            access_shape: (4, 2), indices: [0, 0], id: "col_hbm_hbm_partial_p1_pruned",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (0, 3),
+                cols: (2, 3),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (4, 2),
+            indices: [0, 0],
+            id: "col_hbm_hbm_partial_p1_pruned",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (0, 3), cols: (2, 3), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            access_shape: (2, 2), indices: [1, 1], id: "col_hbm_hbm_subtile_nonzero",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (0, 3),
+                cols: (2, 3),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (2, 2),
+            indices: [1, 1],
+            id: "col_hbm_hbm_subtile_nonzero",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (0, 3), cols: (2, 3), space: lx0(), strides: [1, 4], lx_byte_addr: lx_addr },
-            access_shape: (4, 4), indices: [0, 0], id: "col_hbm_lx_col_packed_full",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (0, 3),
+                cols: (2, 3),
+                space: lx0(),
+                strides: [1, 4],
+                lx_byte_addr: lx_addr,
+            },
+            access_shape: (4, 4),
+            indices: [0, 0],
+            id: "col_hbm_lx_col_packed_full",
         },
         // --- Mixed layout ---
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (2, 3), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            access_shape: (4, 2), indices: [0, 0], id: "mixed_left_block_only",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (2, 3),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (4, 2),
+            indices: [0, 0],
+            id: "mixed_left_block_only",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            p1: PartitionSpec { rows: (2, 3), cols: (2, 3), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            access_shape: (2, 2), indices: [2, 0], id: "mixed_bottom_left_only",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (2, 3),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (2, 2),
+            indices: [2, 0],
+            id: "mixed_bottom_left_only",
         },
         DistCopySpec {
             global_shape: (4, 4),
-            p0: PartitionSpec { rows: (0, 3), cols: (0, 1), space: lx0(), strides: [1, 4], lx_byte_addr: lx_addr },
-            p1: PartitionSpec { rows: (2, 3), cols: (2, 3), space: hbm(), strides: [2, 1], lx_byte_addr: 0 },
-            access_shape: (2, 2), indices: [2, 0], id: "mixed_lx_left_hbm_right_bottom_only",
+            p0: PartitionSpec {
+                rows: (0, 3),
+                cols: (0, 1),
+                space: lx0(),
+                strides: [1, 4],
+                lx_byte_addr: lx_addr,
+            },
+            p1: PartitionSpec {
+                rows: (2, 3),
+                cols: (2, 3),
+                space: hbm(),
+                strides: [2, 1],
+                lx_byte_addr: 0,
+            },
+            access_shape: (2, 2),
+            indices: [2, 0],
+            id: "mixed_lx_left_hbm_right_bottom_only",
         },
     ]
 }
@@ -323,8 +539,22 @@ fn run_copy(spec: &DistCopySpec) -> (Vec<f32>, Vec<f32>) {
         &[p1.rows.1 as i64, p1.cols.1 as i64],
     );
 
-    let mr0 = seed_partition(&mut ctx, &p0_block, &p0.strides, p0.space, p0_set, p0.lx_byte_addr);
-    let mr1 = seed_partition(&mut ctx, &p1_block, &p1.strides, p1.space, p1_set, p1.lx_byte_addr);
+    let mr0 = seed_partition(
+        &mut ctx,
+        &p0_block,
+        &p0.strides,
+        p0.space,
+        p0_set,
+        p0.lx_byte_addr,
+    );
+    let mr1 = seed_partition(
+        &mut ctx,
+        &p1_block,
+        &p1.strides,
+        p1.space,
+        p1_set,
+        p1.lx_byte_addr,
+    );
 
     let dist = DistributedMemRef::new(
         vec![mr0, mr1],
@@ -339,7 +569,9 @@ fn run_copy(spec: &DistCopySpec) -> (Vec<f32>, Vec<f32>) {
     // Allocate a contiguous HBM output region for B and zero it.
     let n_out = ac[0] * ac[1];
     let out_stick = ctx.hbm.borrow_mut().allocate((n_out * 2) as i64);
-    ctx.hbm.borrow_mut().write_bytes(out_stick * STICK_BYTES, &vec![0u8; n_out * 2]);
+    ctx.hbm
+        .borrow_mut()
+        .write_bytes(out_stick * STICK_BYTES, &vec![0u8; n_out * 2]);
 
     // Load the access tile from the distributed view.
     let dtr = distributed_tile_access(&dist, &ac, &base_map, &spec.indices, None).unwrap();
@@ -357,7 +589,10 @@ fn run_copy(spec: &DistCopySpec) -> (Vec<f32>, Vec<f32>) {
     ktir_cpu::ops_memory::store_data(&mut ctx, &data, &b.to_tile_ref(), None).unwrap();
 
     // Read B back.
-    let raw = ctx.hbm.borrow().read_bytes(out_stick * STICK_BYTES, n_out * 2);
+    let raw = ctx
+        .hbm
+        .borrow()
+        .read_bytes(out_stick * STICK_BYTES, n_out * 2);
     let actual = codec::decode(&raw, n_out, DType::F16);
 
     // Expected = reference slice at indices, row-major flattened.
@@ -450,7 +685,8 @@ fn distributed_tile_access_parametrised_row_counts_emit_box_set() {
         let dist = DistributedMemRef::new(vec![mr0, mr1], vec![total_rows, 4], DType::F16).unwrap();
 
         let base_map = AffineMap::identity(2);
-        let out = distributed_tile_access(&dist, &[total_rows, 4], &base_map, &[0, 0], None).unwrap();
+        let out =
+            distributed_tile_access(&dist, &[total_rows, 4], &base_map, &[0, 0], None).unwrap();
         assert_eq!(out.partitions.len(), 2, "rows={partition_rows}");
         for part in &out.partitions {
             assert!(
@@ -493,13 +729,24 @@ const ACCESS_SHAPE: (usize, usize) = (32, 128);
 /// Fixture entries: (id, indices, [(C_i_lo, C_i_hi half-open, origin), ...]).
 fn fixture() -> Vec<(&'static str, [i64; 2], Vec<([i64; 2], [i64; 2], [i64; 2])>)> {
     vec![
-        ("single_partition", [10, 0], vec![([10, 0], [42, 128], [0, 0])]),
+        (
+            "single_partition",
+            [10, 0],
+            vec![([10, 0], [42, 128], [0, 0])],
+        ),
         (
             "cross_boundary",
             [50, 64],
-            vec![([50, 64], [64, 192], [0, 0]), ([64, 64], [82, 192], [64, 0])],
+            vec![
+                ([50, 64], [64, 192], [0, 0]),
+                ([64, 64], [82, 192], [64, 0]),
+            ],
         ),
-        ("last_partition", [200, 256], vec![([200, 256], [232, 384], [192, 0])]),
+        (
+            "last_partition",
+            [200, 256],
+            vec![([200, 256], [232, 384], [192, 0])],
+        ),
         ("origin", [0, 0], vec![([0, 0], [32, 128], [0, 0])]),
     ]
 }
@@ -589,7 +836,11 @@ fn distributed_tile_access_fast_path_fixture() {
     for (case_id, indices, expected) in fixture() {
         let dist = build_partitions(false);
         let got = run_and_collect(&dist, indices);
-        assert_eq!(got.len(), expected.len(), "{case_id}: partition count mismatch");
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "{case_id}: partition count mismatch"
+        );
         for ((pts_got, origin_got, is_box), (exp_lo, exp_hi, exp_origin)) in
             got.iter().zip(expected.iter())
         {
@@ -610,7 +861,11 @@ fn distributed_tile_access_slow_path_fixture() {
         // diagonal_mask=true defeats box lowering -> Points (slow) path.
         let dist = build_partitions(true);
         let got = run_and_collect(&dist, indices);
-        assert_eq!(got.len(), expected.len(), "{case_id}: partition count mismatch");
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "{case_id}: partition count mismatch"
+        );
         for ((pts_got, origin_got, is_box), (exp_lo, exp_hi, exp_origin)) in
             got.iter().zip(expected.iter())
         {
@@ -783,12 +1038,15 @@ fn distributed_view_copy_rfc() {
         .collect();
 
     // Parse the RFC example module.
-    let text = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/rfc/distributed-view-copy.mlir"),
-    )
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/rfc/distributed-view-copy.mlir"
+    ))
     .expect("read distributed-view-copy.mlir");
     let module = ktir_cpu::parser::parse_module(&text).expect("parse module");
-    let func = module.get_function("distributed_view_copy").expect("function");
+    let func = module
+        .get_function("distributed_view_copy")
+        .expect("function");
 
     // Build the memory hierarchy for the function's grid ([2,1,1] -> 2 cores)
     // and seed it the way `_prepare_execution` does in Python.
@@ -849,7 +1107,10 @@ fn distributed_view_copy_rfc() {
     let raw = mem.hbm.borrow().read_bytes(24576 * STICK_BYTES, n * 2);
     let actual = codec::decode(&raw, n, DType::F16);
     let expected: Vec<f32> = full.iter().flat_map(|r| r.iter().copied()).collect();
-    assert_eq!(actual, expected, "distributed_view_copy: B != reference tensor");
+    assert_eq!(
+        actual, expected,
+        "distributed_view_copy: B != reference tensor"
+    );
 }
 
 /// Extract `nrows` rows of the 192×64 reference starting at `r0` (all 64 cols).

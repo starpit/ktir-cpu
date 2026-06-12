@@ -19,16 +19,26 @@
 
 /// `C(m×n) = A(m×k) · B(k×n)`, all row-major and contiguous. Naive loop —
 /// the cross-platform default (and the parity oracle for the BLAS path).
-#[cfg(not(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis")))]
+#[cfg(not(any(
+    target_os = "macos",
+    feature = "openblas",
+    feature = "mkl",
+    feature = "blis"
+)))]
 pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     naive_sgemm(m, k, n, a, b)
 }
 
 /// `C(m×n) = A(m×k) · B(k×n)` via the linked BLAS `cblas_sgemm` (Accelerate on
 /// macOS, or the selected provider — the cblas ABI is identical across them).
-#[cfg(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis"))]
+#[cfg(any(
+    target_os = "macos",
+    feature = "openblas",
+    feature = "mkl",
+    feature = "blis"
+))]
 pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
-    use cblas_sys::{cblas_sgemm, CBLAS_LAYOUT, CBLAS_TRANSPOSE};
+    use cblas_sys::{CBLAS_LAYOUT, CBLAS_TRANSPOSE, cblas_sgemm};
     let mut c = vec![0.0f32; m * n];
     // SAFETY: a has m*k elements, b has k*n, c has m*n; leading dimensions match
     // the row-major contiguous layout (lda=k, ldb=n, ldc=n). All non-negative.
@@ -78,11 +88,19 @@ mod tests {
         // [[1,2,3],[4,5,6]] · [[7,8],[9,10],[11,12]] = [[58,64],[139,154]]
         let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
-        assert_eq!(sgemm_rowmajor(2, 3, 2, &a, &b), vec![58.0, 64.0, 139.0, 154.0]);
+        assert_eq!(
+            sgemm_rowmajor(2, 3, 2, &a, &b),
+            vec![58.0, 64.0, 139.0, 154.0]
+        );
     }
 
     /// With a BLAS backend active, `cblas_sgemm` must agree with the naive oracle.
-    #[cfg(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis"))]
+    #[cfg(any(
+        target_os = "macos",
+        feature = "openblas",
+        feature = "mkl",
+        feature = "blis"
+    ))]
     #[test]
     fn blas_matches_naive() {
         let m = 7;
@@ -90,6 +108,9 @@ mod tests {
         let n = 3;
         let a: Vec<f32> = (0..m * k).map(|i| (i % 9) as f32 - 4.0).collect();
         let b: Vec<f32> = (0..k * n).map(|i| (i % 7) as f32 - 3.0).collect();
-        assert_eq!(sgemm_rowmajor(m, k, n, &a, &b), naive_sgemm(m, k, n, &a, &b));
+        assert_eq!(
+            sgemm_rowmajor(m, k, n, &a, &b),
+            naive_sgemm(m, k, n, &a, &b)
+        );
     }
 }

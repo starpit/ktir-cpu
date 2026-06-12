@@ -221,10 +221,7 @@ fn find_functions(text: &str) -> Result<Vec<ParsedFn>, String> {
         let start = search + rel;
         let after = start + "func.func".len();
         // @name
-        let at = text[after..]
-            .find('@')
-            .ok_or("func.func missing '@name'")?
-            + after;
+        let at = text[after..].find('@').ok_or("func.func missing '@name'")? + after;
         let name_start = at + 1;
         let name_end = name_start
             + text[name_start..]
@@ -237,16 +234,15 @@ fn find_functions(text: &str) -> Result<Vec<ParsedFn>, String> {
             .find('(')
             .ok_or("function missing arg list")?
             + name_end;
-        let rparen = matching(bytes, lparen, b'(', b')')
-            .ok_or("unbalanced function arg parens")?;
+        let rparen = matching(bytes, lparen, b'(', b')').ok_or("unbalanced function arg parens")?;
         let args = parse_args(&text[lparen + 1..rparen]);
 
         // After `)` comes `-> rettype attributes { grid = ... } { body }`.
         // The body is the LAST top-level brace block before the enclosing
         // `module {` close; intermediate blocks (the attributes block) are
         // skipped. Mirrors `_extract_brace_body`.
-        let (body_open, body_close) = last_top_level_block(bytes, rparen + 1)
-            .ok_or("function missing body")?;
+        let (body_open, body_close) =
+            last_top_level_block(bytes, rparen + 1).ok_or("function missing body")?;
         // The grid attribute lives in the header span up to the body block —
         // which still contains the skipped `attributes { grid = ... }`.
         let grid = parse_grid(&text[rparen..body_open]);
@@ -366,14 +362,13 @@ fn tokenize_ops(body: &str) -> Vec<TokenizedOp> {
     let mut current: Vec<String> = Vec::new();
     let mut current_regions: Vec<String> = Vec::new();
 
-    let flush = |current: &mut Vec<String>,
-                 regions: &mut Vec<String>,
-                 results: &mut Vec<TokenizedOp>| {
-        if !current.is_empty() {
-            results.push((current.join(" "), std::mem::take(regions)));
-            current.clear();
-        }
-    };
+    let flush =
+        |current: &mut Vec<String>, regions: &mut Vec<String>, results: &mut Vec<TokenizedOp>| {
+            if !current.is_empty() {
+                results.push((current.join(" "), std::mem::take(regions)));
+                current.clear();
+            }
+        };
 
     let mut i = 0;
     while i < lines.len() {
@@ -389,10 +384,7 @@ fn tokenize_ops(body: &str) -> Vec<TokenizedOp> {
         }
 
         let accumulated = current.join(" ");
-        if !current.is_empty()
-            && brace_balance(&accumulated) == 0
-            && !stripped.starts_with("->")
-        {
+        if !current.is_empty() && brace_balance(&accumulated) == 0 && !stripped.starts_with("->") {
             let prev_done = is_op_complete(&accumulated) || starts_ssa_assign(stripped);
             let next_cannot_start = stripped == "{";
             if prev_done && !next_cannot_start {
@@ -496,7 +488,9 @@ fn starts_ssa_assign(text: &str) -> bool {
     };
     let lhs = &text[..eq];
     !lhs.is_empty()
-        && lhs.trim_end().ends_with(|c: char| c.is_alphanumeric() || c == '_')
+        && lhs
+            .trim_end()
+            .ends_with(|c: char| c.is_alphanumeric() || c == '_')
         && lhs.split(',').all(|p| p.trim().starts_with('%'))
 }
 
@@ -509,7 +503,12 @@ pub fn is_op_complete(text: &str) -> bool {
     }
     // void terminators as op names (line start, or after `= `)
     let op_head = text.rsplit("= ").next().unwrap_or(text).trim_start();
-    if op_head.starts_with("return") || op_head.split_whitespace().next().is_some_and(|t| t.ends_with(".yield")) {
+    if op_head.starts_with("return")
+        || op_head
+            .split_whitespace()
+            .next()
+            .is_some_and(|t| t.ends_with(".yield"))
+    {
         return true;
     }
     ends_with_type_terminal(text)
@@ -526,7 +525,10 @@ fn ends_with_type_terminal(text: &str) -> bool {
     if last.ends_with('>') || last.ends_with("index") {
         return true;
     }
-    let tok = last.rsplit(|c: char| c.is_whitespace() || c == ':' || c == '>').next().unwrap_or("");
+    let tok = last
+        .rsplit(|c: char| c.is_whitespace() || c == ':' || c == '>')
+        .next()
+        .unwrap_or("");
     let mut chars = tok.chars();
     matches!(chars.next(), Some('i' | 'u' | 'f'))
         && !tok[1..].is_empty()
@@ -636,8 +638,12 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         if let Some(rt) = &result_type
             && let Some((shape, dt)) = parse_tensor_type(rt).or_else(|| parse_memref_type(rt))
         {
-            attributes.entry("shape".to_string()).or_insert(Attr::IntList(shape));
-            attributes.entry("dtype".to_string()).or_insert(Attr::Str(dt));
+            attributes
+                .entry("shape".to_string())
+                .or_insert(Attr::IntList(shape));
+            attributes
+                .entry("dtype".to_string())
+                .or_insert(Attr::Str(dt));
         }
     }
 
@@ -679,9 +685,7 @@ fn first_ssa(s: &str) -> Option<(&str, usize)> {
 /// Parse `%iv = %lb to %ub step %step iter_args(%a = %i, ...)` (region body
 /// already stripped) into `([lb, ub, step, ...inits], {iter_var, iter_args})`.
 /// Port of Python `parse_scf_for`.
-fn parse_scf_for_op(
-    rest: &str,
-) -> Option<(Vec<String>, std::collections::HashMap<String, Attr>)> {
+fn parse_scf_for_op(rest: &str) -> Option<(Vec<String>, std::collections::HashMap<String, Attr>)> {
     let (iter_var, iv_end) = first_ssa(rest)?;
     let after_iv = &rest[iv_end..];
     let after_eq = &after_iv[after_iv.find('=')? + 1..];
@@ -892,11 +896,7 @@ fn parse_int_list(list: &str) -> Option<Vec<i64>> {
         }
         out.push(tok.parse::<i64>().ok()?);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Parse `#ktdp.spyre_memory_space<S[, core = N]>` -> (memory_space, lx_core_id).
@@ -1049,7 +1049,9 @@ fn parse_access_tile_inner(inner: &str) -> Result<(Vec<usize>, String), String> 
     let mut rest = inner;
     loop {
         // Consume a `\d+` run.
-        let digits_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         if digits_end == 0 {
             break;
         }
@@ -1101,7 +1103,11 @@ fn named_attr_value(text: &str, key: &str) -> Option<String> {
     // Walk a `keyword<...>` value, counting bracket depth, skipping `>=`/`->`.
     let kw_lt = rest.find('<')?;
     // The portion before `<` must be a bare keyword token (e.g. `affine_set`).
-    if !rest[..kw_lt].trim().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !rest[..kw_lt]
+        .trim()
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
         return None;
     }
     let bytes = rest.as_bytes();
@@ -1138,7 +1144,11 @@ fn parse_index_binary(text: &str) -> Option<Operation> {
         return None;
     }
     let before_colon = rhs.split(':').next().unwrap_or(rhs).trim();
-    for (sym, op_name) in [('*', "arith.muli"), ('+', "arith.addi"), ('-', "arith.subi")] {
+    for (sym, op_name) in [
+        ('*', "arith.muli"),
+        ('+', "arith.addi"),
+        ('-', "arith.subi"),
+    ] {
         if let Some(pos) = before_colon.find(sym) {
             let a = before_colon[..pos].trim();
             let b = before_colon[pos + 1..].trim();
@@ -1164,10 +1174,7 @@ fn split_assignment(text: &str) -> Option<(&str, &str)> {
     let eq = text.find('=')?;
     let lhs = text[..eq].trim();
     let rhs = &text[eq + 1..];
-    if lhs.starts_with('%')
-        && !lhs.contains(char::is_whitespace)
-        && !rhs.starts_with('=')
-    {
+    if lhs.starts_with('%') && !lhs.contains(char::is_whitespace) && !rhs.starts_with('=') {
         Some((lhs, rhs))
     } else {
         None
@@ -1278,7 +1285,9 @@ fn reduce_shorthand_combiner(after_op: &str) -> Option<String> {
     // A single `dialect.op` token (letters/digits/_/.), e.g. `arith.maximumf`.
     if !inner.is_empty()
         && inner.contains('.')
-        && inner.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
+        && inner
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
     {
         Some(inner.to_string())
     } else {
@@ -1307,7 +1316,9 @@ fn parse_bare_attrs(text: &str) -> std::collections::HashMap<String, Attr> {
                     ks -= 1;
                 }
                 let ke = ks;
-                while ks > 0 && (b[ks - 1].is_ascii_alphanumeric() || matches!(b[ks - 1], b'_' | b'.')) {
+                while ks > 0
+                    && (b[ks - 1].is_ascii_alphanumeric() || matches!(b[ks - 1], b'_' | b'.'))
+                {
                     ks -= 1;
                 }
                 let key = &text[ks..ke];
@@ -1341,14 +1352,19 @@ fn read_attr_value(text: &str, start: usize) -> (&str, usize) {
         return ("", start);
     }
     if b[start] == b'['
-        && let Some(close) = matching(b, start, b'[', b']') {
-            return (&text[start..=close], close + 1);
-        }
+        && let Some(close) = matching(b, start, b'[', b']')
+    {
+        return (&text[start..=close], close + 1);
+    }
     // keyword<...> (affine_map<>, affine_set<>, #ktdp...<>): balance <> while
     // skipping `->` and `>=` so constraint operators don't close early.
     if let Some(lt) = text[start..].find('<') {
         let head = &text[start..start + lt];
-        if head.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '#')) && !head.is_empty() {
+        if head
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '#'))
+            && !head.is_empty()
+        {
             let mut depth = 0i32;
             let vb = text.as_bytes();
             let mut j = start + lt;
@@ -1415,7 +1431,10 @@ fn parse_attr_value(val: &str) -> Option<Attr> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if items.iter().any(|s| s.contains('.') || s.contains('e') || s.contains('E')) {
+        if items
+            .iter()
+            .any(|s| s.contains('.') || s.contains('e') || s.contains('E'))
+        {
             let vals: Option<Vec<f64>> = items.iter().map(|s| s.parse().ok()).collect();
             return vals.map(Attr::FloatList);
         }
@@ -1518,7 +1537,8 @@ fn parse_f64_lit(s: &str) -> Result<f64, String> {
             .map(|i| i as f64)
             .map_err(|_| format!("dense: bad hex element {s:?}"));
     }
-    s.parse::<f64>().map_err(|_| format!("dense: bad element {s:?}"))
+    s.parse::<f64>()
+        .map_err(|_| format!("dense: bad element {s:?}"))
 }
 
 /// Convenience: a parsed `arith.constant` value attr -> a [`Value`] for tests /
@@ -1540,9 +1560,7 @@ mod tests {
     use crate::interpreter::{execute_ops, single_core_context};
     use crate::ir::Value;
 
-    const VECTOR_ADD: &str = include_str!(
-        "../../examples/triton-ktir/vector_add_ktir.mlir"
-    );
+    const VECTOR_ADD: &str = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
 
     // RUST-ONLY (not in the Python suite): regression for the operand-dedup bug.
     // MLIR operands are positional, so a repeated operand (`%y = mulf %x, %x`,
@@ -1558,32 +1576,62 @@ mod tests {
         let module = parse_module(VECTOR_ADD).unwrap();
         let f = module.get_function("add_kernel").unwrap();
         assert_eq!(f.grid, (32, 1, 1));
-        assert_eq!(f.arg_names(), vec!["x_ptr", "y_ptr", "output_ptr", "BLOCK_SIZE"]);
+        assert_eq!(
+            f.arg_names(),
+            vec!["x_ptr", "y_ptr", "output_ptr", "BLOCK_SIZE"]
+        );
 
         // The multi-line construct ops must each tokenize to exactly one op.
         let types: Vec<&str> = f.operations.iter().map(|o| o.op_type.as_str()).collect();
-        assert_eq!(types.iter().filter(|t| **t == "ktdp.construct_memory_view").count(), 3);
-        assert_eq!(types.iter().filter(|t| **t == "ktdp.construct_access_tile").count(), 3);
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| **t == "ktdp.construct_memory_view")
+                .count(),
+            3
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| **t == "ktdp.construct_access_tile")
+                .count(),
+            3
+        );
         assert_eq!(types.iter().filter(|t| **t == "ktdp.load").count(), 2);
         assert_eq!(types.iter().filter(|t| **t == "ktdp.store").count(), 1);
         assert!(types.contains(&"arith.addf"));
         assert_eq!(types.last(), Some(&"return"));
 
         // Operand/type wiring on a representative multi-line op.
-        let view = f.operations.iter().find(|o| o.result.as_deref() == Some("%x_view")).unwrap();
+        let view = f
+            .operations
+            .iter()
+            .find(|o| o.result.as_deref() == Some("%x_view"))
+            .unwrap();
         assert_eq!(view.operands, vec!["%x_ptr"]);
         assert_eq!(view.result_type.as_deref(), Some("memref<4096xf16>"));
 
-        let at = f.operations.iter().find(|o| o.result.as_deref() == Some("%x_tile")).unwrap();
+        let at = f
+            .operations
+            .iter()
+            .find(|o| o.result.as_deref() == Some("%x_tile"))
+            .unwrap();
         assert_eq!(at.operands, vec!["%x_view", "%offset"]);
-        assert_eq!(at.result_type.as_deref(), Some("!ktdp.access_tile<128xindex>"));
+        assert_eq!(
+            at.result_type.as_deref(),
+            Some("!ktdp.access_tile<128xindex>")
+        );
     }
 
     #[test]
     fn infix_index_arith_lowers_to_arith_op() {
         let module = parse_module(VECTOR_ADD).unwrap();
         let f = module.get_function("add_kernel").unwrap();
-        let off = f.operations.iter().find(|o| o.result.as_deref() == Some("%offset")).unwrap();
+        let off = f
+            .operations
+            .iter()
+            .find(|o| o.result.as_deref() == Some("%offset"))
+            .unwrap();
         // `arith.muli %core_id, %BLOCK_SIZE : index`
         assert_eq!(off.op_type, "arith.muli");
         assert_eq!(off.operands, vec!["%core_id", "%BLOCK_SIZE"]);
@@ -1771,7 +1819,10 @@ mod tests {
                     assert!(a.contains_key("strides"), "view missing strides");
                     assert!(a.contains_key("dtype"), "view missing dtype");
                     assert!(a.contains_key("memory_space"), "view missing memory_space");
-                    assert!(a.contains_key("coordinate_set"), "view missing coordinate_set");
+                    assert!(
+                        a.contains_key("coordinate_set"),
+                        "view missing coordinate_set"
+                    );
                 }
                 "ktdp.construct_access_tile" => {
                     let a = &op.attributes;

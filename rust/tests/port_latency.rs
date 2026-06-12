@@ -289,10 +289,7 @@ fn data_size_int_sideband_charges_stick_bytes() {
     // operands [iat, src] are ignored on the int branch.
     let iat = hbm_index_iat(vec![4]);
     let src = Tile::compute(vec![0.0; 4], DType::F16, vec![4]);
-    let operands = [
-        Some(Value::IndirectAccessTile(iat)),
-        Some(Value::Tile(src)),
-    ];
+    let operands = [Some(Value::IndirectAccessTile(iat)), Some(Value::Tile(src))];
     t.record_op(
         0,
         "ktdp.store",
@@ -333,16 +330,25 @@ fn data_size_int_sideband_direct_store_64x64_scatter() {
 #[test]
 fn int_sideband_ignores_operands() {
     let mut bare = LatencyTracker::new(HardwareConfig::default());
-    bare.record_op(0, "ktdp.store", LatencyCategory::Memory, &Some(Value::Index(7)), &[]);
+    bare.record_op(
+        0,
+        "ktdp.store",
+        LatencyCategory::Memory,
+        &Some(Value::Index(7)),
+        &[],
+    );
 
     let mut with_ops = LatencyTracker::new(HardwareConfig::default());
     let iat = hbm_index_iat(vec![4]);
     let src = Tile::compute(vec![0.0; 4], DType::F16, vec![4]);
-    let operands = [
-        Some(Value::IndirectAccessTile(iat)),
-        Some(Value::Tile(src)),
-    ];
-    with_ops.record_op(0, "ktdp.store", LatencyCategory::Memory, &Some(Value::Index(7)), &operands);
+    let operands = [Some(Value::IndirectAccessTile(iat)), Some(Value::Tile(src))];
+    with_ops.record_op(
+        0,
+        "ktdp.store",
+        LatencyCategory::Memory,
+        &Some(Value::Index(7)),
+        &operands,
+    );
 
     assert_eq!(
         bare.counters()[&0].total_bytes,

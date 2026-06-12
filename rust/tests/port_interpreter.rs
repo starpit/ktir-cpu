@@ -1,4 +1,10 @@
-#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items, clippy::needless_range_loop, clippy::type_complexity, clippy::approx_constant)]
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::approx_constant
+)]
 // Copyright 2025 The Torch-Spyre Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
@@ -45,7 +51,7 @@ use ktir_cpu::dialects::Dispatch;
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::env::{ExecutionEnv, GridExecutor};
 use ktir_cpu::interpreter::{
-    execute_function, execute_op, execute_region, single_core_context, Arg,
+    Arg, execute_function, execute_op, execute_region, single_core_context,
 };
 use ktir_cpu::ir::{Attr, Operation, Scalar, Value};
 use ktir_cpu::parser::parse_module;
@@ -85,9 +91,16 @@ module {
 #[test]
 fn execute_function_scalar_arg() {
     let module = parse_module(SCALAR_KTIR).expect("parse");
-    let outputs =
-        execute_function(&module, "scalar_fn", &[("%n", Arg::Scalar(Scalar::I64(42)))]).expect("exec");
-    assert!(!outputs.contains_key("%n"), "scalar arg must not be echoed in outputs");
+    let outputs = execute_function(
+        &module,
+        "scalar_fn",
+        &[("%n", Arg::Scalar(Scalar::I64(42)))],
+    )
+    .expect("exec");
+    assert!(
+        !outputs.contains_key("%n"),
+        "scalar arg must not be echoed in outputs"
+    );
     assert!(outputs.is_empty(), "no tensor args => empty outputs");
 }
 
@@ -108,7 +121,14 @@ module {
         &module,
         "mixed",
         &[
-            ("%buf", Arg::Tensor { data: vec![0.0; 4], shape: vec![4], dtype: DType::F16 }),
+            (
+                "%buf",
+                Arg::Tensor {
+                    data: vec![0.0; 4],
+                    shape: vec![4],
+                    dtype: DType::F16,
+                },
+            ),
             ("%n", Arg::Scalar(Scalar::I64(7))),
         ],
     )
@@ -121,8 +141,14 @@ module {
 #[test]
 fn execute_function_scalar_int_and_float() {
     let module = parse_module(SCALAR_KTIR).expect("parse");
-    execute_function(&module, "scalar_fn", &[("%n", Arg::Scalar(Scalar::I64(0)))]).expect("int scalar");
-    execute_function(&module, "scalar_fn", &[("%n", Arg::Scalar(Scalar::F32(3.14)))]).expect("float scalar");
+    execute_function(&module, "scalar_fn", &[("%n", Arg::Scalar(Scalar::I64(0)))])
+        .expect("int scalar");
+    execute_function(
+        &module,
+        "scalar_fn",
+        &[("%n", Arg::Scalar(Scalar::F32(3.14)))],
+    )
+    .expect("float scalar");
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +164,10 @@ fn execute_region_empty() {
     let mut ctx = single_core_context();
     let r = execute_region(&[], &mut ctx, &env);
     assert!(r.is_ok());
-    assert!(ctx.get_value("%anything").is_err(), "no values should be bound");
+    assert!(
+        ctx.get_value("%anything").is_err(),
+        "no values should be bound"
+    );
 }
 
 /// `execute_region` runs each op and threads its result into the context.
@@ -187,7 +216,10 @@ fn unknown_op_raises() {
 
     let unknown = Operation::new(None, "totally.unknown_op", &[]);
     let err = execute_op(&unknown, &mut ctx, &env).expect_err("unknown op must error");
-    assert!(err.contains("totally.unknown_op"), "error must name the op: {err}");
+    assert!(
+        err.contains("totally.unknown_op"),
+        "error must name the op: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

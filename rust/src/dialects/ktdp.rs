@@ -24,8 +24,16 @@ use crate::memref::{AccessTile, DistributedMemRef, MemRef, MemorySpace, ParentRe
 use crate::ops_memory::distributed_tile_access;
 
 pub fn register(d: &mut Dispatch) {
-    d.register("ktdp.construct_memory_view", LatencyCategory::Zero, construct_memory_view);
-    d.register("ktdp.construct_access_tile", LatencyCategory::Zero, construct_access_tile);
+    d.register(
+        "ktdp.construct_memory_view",
+        LatencyCategory::Zero,
+        construct_memory_view,
+    );
+    d.register(
+        "ktdp.construct_access_tile",
+        LatencyCategory::Zero,
+        construct_access_tile,
+    );
 }
 
 /// `%v = ktdp.construct_memory_view %ptr {shape, strides, memory_space, dtype, ...}`
@@ -33,7 +41,11 @@ pub fn register(d: &mut Dispatch) {
 /// Builds a logical `MemRef`. Mirrors `tile_view`. Slice limitation: shape /
 /// strides must be static (the Python parser also stores dynamic dims as SSA
 /// names resolved at runtime — that resolution lands with grid/scope support).
-fn construct_memory_view(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn construct_memory_view(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("construct_memory_view: missing pointer operand".into());
     }
@@ -49,7 +61,8 @@ fn construct_memory_view(op: &Operation, ctx: &mut CoreContext, _env: &Execution
                 .iter()
                 .map(|t| {
                     if t.starts_with('%') {
-                        scalar_i64(ctx.get_value(t)?, "construct_memory_view size").map(|n| n as usize)
+                        scalar_i64(ctx.get_value(t)?, "construct_memory_view size")
+                            .map(|n| n as usize)
                     } else {
                         t.parse::<usize>()
                             .map_err(|_| format!("construct_memory_view: bad size token {t:?}"))
@@ -90,7 +103,11 @@ fn construct_memory_view(op: &Operation, ctx: &mut CoreContext, _env: &Execution
 /// Single-allocation path: evaluate `base_map` at the indices to get base
 /// coords, fold them through the parent strides into a byte offset, and wrap
 /// the resulting `TileRef` in an `AccessTile`. Mirrors `tile_access`.
-fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+fn construct_access_tile(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
     if op.operands.is_empty() {
         return Err("construct_access_tile: missing parent operand".into());
     }
@@ -103,12 +120,19 @@ fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &Execution
     let parent = match ctx.get_value(&op.operands[0])? {
         Value::MemRef(m) => Parent::Single(m.clone()),
         Value::DistMemRef(d) => Parent::Dist(d.clone()),
-        other => return Err(format!("construct_access_tile: parent is {other:?}, expected MemRef")),
+        other => {
+            return Err(format!(
+                "construct_access_tile: parent is {other:?}, expected MemRef"
+            ));
+        }
     };
 
     let indices: Vec<i64> = op.operands[1..]
         .iter()
-        .map(|name| ctx.get_value(name).and_then(|v| scalar_i64(v, "construct_access_tile index")))
+        .map(|name| {
+            ctx.get_value(name)
+                .and_then(|v| scalar_i64(v, "construct_access_tile index"))
+        })
         .collect::<Result<_, _>>()?;
 
     let access_shape = int_list(op, "shape")?
@@ -156,7 +180,12 @@ fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &Execution
 
 /// Port of `MemoryOps.tile_access`: indices -> base coords (via base_map) ->
 /// byte offset (via parent strides) -> byte-addressed `TileRef`.
-fn tile_access(parent: MemRef, indices: &[i64], access_shape: Vec<usize>, base_map: &AffineMap) -> TileRef {
+fn tile_access(
+    parent: MemRef,
+    indices: &[i64],
+    access_shape: Vec<usize>,
+    base_map: &AffineMap,
+) -> TileRef {
     let base_coords = base_map.eval(indices, &[]);
     let bpe = parent.dtype.bytes_per_elem() as i64;
     let offset_elems: i64 = base_coords
@@ -187,15 +216,24 @@ fn tile_access(parent: MemRef, indices: &[i64], access_shape: Vec<usize>, base_m
 fn int_list<'a>(op: &'a Operation, key: &str) -> Result<&'a Vec<i64>, String> {
     match op.attributes.get(key) {
         Some(Attr::IntList(v)) => Ok(v),
-        Some(other) => Err(format!("{}: attr '{key}' is {other:?}, expected IntList", op.op_type)),
-        None => Err(format!("{}: missing required attribute '{key}'", op.op_type)),
+        Some(other) => Err(format!(
+            "{}: attr '{key}' is {other:?}, expected IntList",
+            op.op_type
+        )),
+        None => Err(format!(
+            "{}: missing required attribute '{key}'",
+            op.op_type
+        )),
     }
 }
 
 fn str_attr<'a>(op: &'a Operation, key: &str) -> Result<&'a str, String> {
     match op.attributes.get(key) {
         Some(Attr::Str(s)) => Ok(s),
-        _ => Err(format!("{}: missing/invalid string attribute '{key}'", op.op_type)),
+        _ => Err(format!(
+            "{}: missing/invalid string attribute '{key}'",
+            op.op_type
+        )),
     }
 }
 
@@ -203,7 +241,10 @@ fn dtype_attr(op: &Operation, key: &str) -> Result<DType, String> {
     match op.attributes.get(key) {
         Some(Attr::Dtype(d)) => Ok(*d),
         Some(Attr::Str(s)) => DType::parse(s),
-        _ => Err(format!("{}: missing/invalid dtype attribute '{key}'", op.op_type)),
+        _ => Err(format!(
+            "{}: missing/invalid dtype attribute '{key}'",
+            op.op_type
+        )),
     }
 }
 
@@ -261,9 +302,13 @@ mod tests {
         ctx.set_value("%i", Value::Index(2));
         ctx.set_value("%j", Value::Index(3));
         // identity base_map over (i, j); offset = (2*32 + 3*1) elems * 2 bytes
-        let at = Operation::new(Some("%t"), "ktdp.construct_access_tile", &["%v", "%i", "%j"])
-            .with_attr("shape", Attr::IntList(vec![1, 1]))
-            .with_attr("base_map", Attr::AffineMap(AffineMap::identity(2)));
+        let at = Operation::new(
+            Some("%t"),
+            "ktdp.construct_access_tile",
+            &["%v", "%i", "%j"],
+        )
+        .with_attr("shape", Attr::IntList(vec![1, 1]))
+        .with_attr("base_map", Attr::AffineMap(AffineMap::identity(2)));
         run(&[build_view(), at], &mut ctx).unwrap();
         match ctx.get_value("%t").unwrap() {
             Value::AccessTile(a) => match &a.parent_ref {

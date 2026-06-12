@@ -45,9 +45,9 @@
 use ktir_cpu::codec::{decode, encode};
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::env::GridExecutor;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
-use ktir_cpu::memory::{HBMSimulator, LXScratchpad, SpyreMemoryHierarchy, STICK_BYTES};
+use ktir_cpu::memory::{HBMSimulator, LXScratchpad, STICK_BYTES, SpyreMemoryHierarchy};
 use ktir_cpu::memref::{MemRef, MemorySpace};
 use ktir_cpu::parser::parse_module;
 use ktir_cpu::tile::Tile;
@@ -286,7 +286,11 @@ fn grid_executor_core_positions() {
     let grid = GridExecutor::new((32, 1, 1));
     assert_eq!(grid.num_cores, 32, "should have 32 cores");
     assert_eq!(grid.linear_to_grid(0), (0, 0, 0), "core 0 position wrong");
-    assert_eq!(grid.linear_to_grid(31), (31, 0, 0), "core 31 position wrong");
+    assert_eq!(
+        grid.linear_to_grid(31),
+        (31, 0, 0),
+        "core 31 position wrong"
+    );
     // get_core/get_core_at_pos analogue: id<->coord round-trip.
     assert_eq!(grid.linear_to_grid(5), (5, 0, 0));
     assert_eq!(grid.grid_to_linear(5, 0, 0), 5);

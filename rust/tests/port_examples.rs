@@ -45,7 +45,7 @@ use std::collections::HashMap;
 
 use ktir_cpu::codec::{f16_bits_to_f32, f32_to_f16_bits};
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg, Output};
+use ktir_cpu::interpreter::{Arg, Output, execute_function};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::parser::parse_module;
 
@@ -128,9 +128,30 @@ fn vector_add_single_core() {
     let out = vec![0.0f32; n];
 
     let args = [
-        ("x_ptr", Arg::Tensor { data: x.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::Tensor { data: y.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::Tensor { data: out, shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::Tensor {
+                data: x.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::Tensor {
+                data: y.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: out,
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
     ];
     let outputs = execute_function(&module, "add_kernel", &args).expect("run add_kernel");
@@ -152,9 +173,30 @@ fn vector_add_various_values() {
     let out = vec![0.0f32; n];
 
     let args = [
-        ("x_ptr", Arg::Tensor { data: x.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::Tensor { data: y.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::Tensor { data: out, shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::Tensor {
+                data: x.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::Tensor {
+                data: y.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: out,
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
     ];
     let outputs = execute_function(&module, "add_kernel", &args).expect("run add_kernel");
@@ -181,9 +223,30 @@ fn run_vector_add_dynamic(n: usize) {
     let out = vec![0.0f32; n];
 
     let args = [
-        ("x_ptr", Arg::Tensor { data: x.clone(), shape: vec![n], dtype: DType::F32 }),
-        ("y_ptr", Arg::Tensor { data: y.clone(), shape: vec![n], dtype: DType::F32 }),
-        ("output_ptr", Arg::Tensor { data: out, shape: vec![n], dtype: DType::F32 }),
+        (
+            "x_ptr",
+            Arg::Tensor {
+                data: x.clone(),
+                shape: vec![n],
+                dtype: DType::F32,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::Tensor {
+                data: y.clone(),
+                shape: vec![n],
+                dtype: DType::F32,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: out,
+                shape: vec![n],
+                dtype: DType::F32,
+            },
+        ),
         ("n_elements", Arg::Scalar(Scalar::I32(n as i32))),
     ];
     let outputs =
@@ -237,10 +300,13 @@ fn reduce_explicit_region_sum() {
     let data = f16_vec(&[1.0, 2.0, 3.0, 4.0]); // shape [1, 4]
     let args = [(
         "arg0",
-        Arg::Tensor { data, shape: vec![1, 4], dtype: DType::F16 },
+        Arg::Tensor {
+            data,
+            shape: vec![1, 4],
+            dtype: DType::F16,
+        },
     )];
-    let outputs =
-        execute_function(&module, "reduce_explicit_region", &args).expect("run reduce");
+    let outputs = execute_function(&module, "reduce_explicit_region", &args).expect("run reduce");
     let result = &get_output(&outputs, "arg0").data;
 
     let expected = vec![10.0f32; 4];
@@ -253,10 +319,13 @@ fn reduce_explicit_region_zeros() {
     let data = vec![0.0f32; 4]; // shape [1, 4]
     let args = [(
         "arg0",
-        Arg::Tensor { data, shape: vec![1, 4], dtype: DType::F16 },
+        Arg::Tensor {
+            data,
+            shape: vec![1, 4],
+            dtype: DType::F16,
+        },
     )];
-    let outputs =
-        execute_function(&module, "reduce_explicit_region", &args).expect("run reduce");
+    let outputs = execute_function(&module, "reduce_explicit_region", &args).expect("run reduce");
     let result = &get_output(&outputs, "arg0").data;
 
     assert_close(result, &[0.0f32; 4], 0.0, 1e-3);
@@ -287,10 +356,38 @@ fn sdpa_2d() {
     let out = vec![0.0f32; n];
 
     let args = [
-        ("q_ptr", Arg::Tensor { data: q.clone(), shape: vec![n_rows, head_dim], dtype: DType::F16 }),
-        ("k_ptr", Arg::Tensor { data: k.clone(), shape: vec![n_rows, head_dim], dtype: DType::F16 }),
-        ("v_ptr", Arg::Tensor { data: v.clone(), shape: vec![n_rows, head_dim], dtype: DType::F16 }),
-        ("output_ptr", Arg::Tensor { data: out, shape: vec![n_rows, head_dim], dtype: DType::F16 }),
+        (
+            "q_ptr",
+            Arg::Tensor {
+                data: q.clone(),
+                shape: vec![n_rows, head_dim],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "k_ptr",
+            Arg::Tensor {
+                data: k.clone(),
+                shape: vec![n_rows, head_dim],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "v_ptr",
+            Arg::Tensor {
+                data: v.clone(),
+                shape: vec![n_rows, head_dim],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: out,
+                shape: vec![n_rows, head_dim],
+                dtype: DType::F16,
+            },
+        ),
     ];
     let outputs = execute_function(&module, "sdpa_kernel_2d", &args).expect("run sdpa");
     let result = &get_output(&outputs, "output_ptr").data;
@@ -352,8 +449,22 @@ fn softmax_wide_lx_overflow() {
     let inp = vec![0.0f32; n];
     let out = vec![0.0f32; n];
     let args = [
-        ("output_ptr", Arg::Tensor { data: out, shape: vec![n_rows, n_cols], dtype: DType::F16 }),
-        ("input_ptr", Arg::Tensor { data: inp, shape: vec![n_rows, n_cols], dtype: DType::F16 }),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: out,
+                shape: vec![n_rows, n_cols],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "input_ptr",
+            Arg::Tensor {
+                data: inp,
+                shape: vec![n_rows, n_cols],
+                dtype: DType::F16,
+            },
+        ),
     ];
     let res = execute_function(&module, "softmax_kernel", &args);
     assert!(res.is_err(), "expected an LX-overflow error");

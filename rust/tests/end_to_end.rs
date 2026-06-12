@@ -4,7 +4,7 @@
 // runs a kernel and produces correct tensor results.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, execute_function_with_latency, Arg, Output};
+use ktir_cpu::interpreter::{Arg, Output, execute_function, execute_function_with_latency};
 use ktir_cpu::latency::HardwareConfig;
 use ktir_cpu::parser::parse_module;
 
@@ -20,9 +20,30 @@ fn vector_add_executes_end_to_end() {
     let out = vec![0.0f32; n];
 
     let args = [
-        ("x_ptr", Arg::Tensor { data: x.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::Tensor { data: y.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::Tensor { data: out, shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::Tensor {
+                data: x.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::Tensor {
+                data: y.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: out,
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
     ];
 
@@ -49,16 +70,40 @@ fn tensor_bytes_input_matches_f32_path() {
     // Pre-encode the inputs to f16 bytes (what a real f16 host runner holds).
     let enc = |v: &[f32]| ktir_cpu::codec::encode(v, DType::F16);
     let args = [
-        ("x_ptr", Arg::TensorBytes { data: enc(&x), shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::TensorBytes { data: enc(&y), shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::TensorBytes {
+                data: enc(&x),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::TensorBytes {
+                data: enc(&y),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::TensorBytes {
+                data: vec![0u8; n * 2],
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
     ];
     let outputs = execute_function(&module, "add_kernel", &args).expect("run add_kernel");
     let Output { data, .. } = outputs.get("output_ptr").expect("output_ptr present");
 
     let expected: Vec<f32> = x.iter().zip(&y).map(|(a, b)| a + b).collect();
-    assert_eq!(*data, expected, "TensorBytes f16 path must match the f32 path");
+    assert_eq!(
+        *data, expected,
+        "TensorBytes f16 path must match the f32 path"
+    );
 }
 
 // RUST-ONLY (not a port of a Python test): the output side of the typed-bytes
@@ -76,9 +121,30 @@ fn output_raw_bytes_thread_without_roundtrip() {
 
     let enc = |v: &[f32]| ktir_cpu::codec::encode(v, DType::F16);
     let args = [
-        ("x_ptr", Arg::TensorBytes { data: enc(&x), shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::TensorBytes { data: enc(&y), shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::TensorBytes {
+                data: enc(&x),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::TensorBytes {
+                data: enc(&y),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::TensorBytes {
+                data: vec![0u8; n * 2],
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
     ];
     let out = execute_function(&module, "add_kernel", &args).expect("run add_kernel");
@@ -90,9 +156,30 @@ fn output_raw_bytes_thread_without_roundtrip() {
 
     // Thread the raw output back as a TensorBytes input — no widen/narrow.
     let args2 = [
-        ("x_ptr", Arg::TensorBytes { data: o.raw.clone(), shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::TensorBytes {
+                data: o.raw.clone(),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::TensorBytes {
+                data: vec![0u8; n * 2],
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::TensorBytes {
+                data: vec![0u8; n * 2],
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
     ];
     let out2 = execute_function(&module, "add_kernel", &args2).expect("run add_kernel again");
@@ -108,9 +195,30 @@ fn vector_add_latency_report_is_populated() {
     let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
     let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
     let args = [
-        ("x_ptr", Arg::Tensor { data: x, shape: vec![n], dtype: DType::F16 }),
-        ("y_ptr", Arg::Tensor { data: y, shape: vec![n], dtype: DType::F16 }),
-        ("output_ptr", Arg::Tensor { data: vec![0.0; n], shape: vec![n], dtype: DType::F16 }),
+        (
+            "x_ptr",
+            Arg::Tensor {
+                data: x,
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::Tensor {
+                data: y,
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::Tensor {
+                data: vec![0.0; n],
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
         ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
     ];
 
@@ -123,11 +231,17 @@ fn vector_add_latency_report_is_populated() {
 
     // The kernel does 2 HBM loads + 1 HBM store per core across 32 cores, plus
     // an addf — so the report must show real memory and compute cost.
-    assert!(report.kernel_cycles() > 0.0, "expected non-zero kernel cycles");
+    assert!(
+        report.kernel_cycles() > 0.0,
+        "expected non-zero kernel cycles"
+    );
     let summary = report.per_core_summary();
     assert_eq!(summary.len(), 32, "one row per core");
     let mem: f64 = summary.iter().map(|c| c.memory_cycles).sum();
     let compute: f64 = summary.iter().map(|c| c.compute_cycles).sum();
     assert!(mem > 0.0, "expected non-zero memory cycles, got {mem}");
-    assert!(compute > 0.0, "expected non-zero compute cycles, got {compute}");
+    assert!(
+        compute > 0.0,
+        "expected non-zero compute cycles, got {compute}"
+    );
 }

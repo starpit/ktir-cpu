@@ -1,4 +1,10 @@
-#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items, clippy::needless_range_loop, clippy::type_complexity, clippy::approx_constant)]
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::approx_constant
+)]
 // Copyright 2025 The Torch-Spyre Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License").

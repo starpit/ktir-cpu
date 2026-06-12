@@ -39,7 +39,7 @@ impl DType {
                 return Err(format!(
                     "dtype {s:?} is a placeholder pending hardware confirmation; \
                      extend DType before adding examples that use it"
-                ))
+                ));
             }
             _ => return Err(format!("unsupported KTIR dtype: {s:?}")),
         })

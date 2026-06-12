@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{execute_function, Arg};
+use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::parser::parse_module;
 
@@ -42,14 +42,38 @@ fn bench_vector_add() {
     let iters = 500;
     let each = time_call(iters, || {
         let args = [
-            ("x_ptr", Arg::Tensor { data: x.clone(), shape: vec![n], dtype: DType::F16 }),
-            ("y_ptr", Arg::Tensor { data: y.clone(), shape: vec![n], dtype: DType::F16 }),
-            ("output_ptr", Arg::Tensor { data: vec![0.0; n], shape: vec![n], dtype: DType::F16 }),
+            (
+                "x_ptr",
+                Arg::Tensor {
+                    data: x.clone(),
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "y_ptr",
+                Arg::Tensor {
+                    data: y.clone(),
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "output_ptr",
+                Arg::Tensor {
+                    data: vec![0.0; n],
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
             ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
         ];
         execute_function(&module, "add_kernel", &args).unwrap();
     });
-    eprintln!("vector_add: {:.1} µs/run (n=4096 f16, grid[32], {iters} iters)", each * 1e6);
+    eprintln!(
+        "vector_add: {:.1} µs/run (n=4096 f16, grid[32], {iters} iters)",
+        each * 1e6
+    );
 }
 
 #[test]
@@ -62,9 +86,30 @@ fn bench_matmul() {
     let iters = 20;
     let each = time_call(iters, || {
         let args = [
-            ("a_ptr", Arg::Tensor { data: a.clone(), shape: vec![m, k], dtype: DType::F16 }),
-            ("b_ptr", Arg::Tensor { data: b.clone(), shape: vec![k, n], dtype: DType::F16 }),
-            ("c_ptr", Arg::Tensor { data: vec![0.0; m * n], shape: vec![m, n], dtype: DType::F16 }),
+            (
+                "a_ptr",
+                Arg::Tensor {
+                    data: a.clone(),
+                    shape: vec![m, k],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "b_ptr",
+                Arg::Tensor {
+                    data: b.clone(),
+                    shape: vec![k, n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "c_ptr",
+                Arg::Tensor {
+                    data: vec![0.0; m * n],
+                    shape: vec![m, n],
+                    dtype: DType::F16,
+                },
+            ),
             ("K", Arg::Scalar(Scalar::I64(k as i64))),
             ("BLOCK_SIZE_M", Arg::Scalar(Scalar::I64(32))),
             ("BLOCK_SIZE_N", Arg::Scalar(Scalar::I64(512))),
@@ -83,12 +128,22 @@ fn bench_matmul() {
 fn bench_layernorm() {
     let module = parse_module(LAYERNORM).expect("parse layernorm");
     let (rows, cols) = (1151usize, 8192usize);
-    let x: Vec<f32> = (0..rows * cols).map(|i| f16(((i % 17) as f32 - 8.0) * 0.01)).collect();
+    let x: Vec<f32> = (0..rows * cols)
+        .map(|i| f16(((i % 17) as f32 - 8.0) * 0.01))
+        .collect();
     let w = vec![1.0f32; rows * cols];
     let b = vec![0.0f32; rows * cols];
     let iters = 20;
-    let big = |data: Vec<f32>| Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 };
-    let vec1 = |data: Vec<f32>| Arg::Tensor { data, shape: vec![rows], dtype: DType::F16 };
+    let big = |data: Vec<f32>| Arg::Tensor {
+        data,
+        shape: vec![rows, cols],
+        dtype: DType::F16,
+    };
+    let vec1 = |data: Vec<f32>| Arg::Tensor {
+        data,
+        shape: vec![rows],
+        dtype: DType::F16,
+    };
     let each = time_call(iters, || {
         let args: Vec<(&str, Arg)> = vec![
             ("X", big(x.clone())),

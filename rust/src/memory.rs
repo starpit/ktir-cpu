@@ -11,9 +11,9 @@
 //! Cross-core sharing uses `Rc<RefCell<>>` to mirror Python reference semantics
 //! — the scheduler is single-threaded/cooperative, so no `Arc`/`Mutex` needed.
 
-use std::cell::RefCell;
 use crate::dtypes::DType;
 use crate::fxhash::FxHashMap;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 /// HBM "stick" (cache block) size in bytes. Mirrors `HBMSimulator.STICK_BYTES`.
@@ -41,15 +41,21 @@ impl HBMSimulator {
             size_bytes: size_gb * 1024 * 1024 * 1024,
             allocations: FxHashMap::default(),
             next_ptr: 0x10000,
-            }
+        }
     }
 
     /// Allocate `size` bytes, advance `next_ptr` to the next stick boundary,
     /// return the stick address (`ptr / STICK_BYTES`). Mirrors `allocate`.
     pub fn allocate(&mut self, size: i64) -> i64 {
-        debug_assert_eq!(self.next_ptr % STICK_BYTES, 0, "next_ptr must be stick-aligned");
+        debug_assert_eq!(
+            self.next_ptr % STICK_BYTES,
+            0,
+            "next_ptr must be stick-aligned"
+        );
         let ptr = self.next_ptr;
-        self.allocations.entry(ptr).or_insert_with(|| vec![0u8; size.max(0) as usize]);
+        self.allocations
+            .entry(ptr)
+            .or_insert_with(|| vec![0u8; size.max(0) as usize]);
         let advanced = ptr + size;
         self.next_ptr = (advanced + STICK_BYTES - 1) & !(STICK_BYTES - 1);
         ptr / STICK_BYTES

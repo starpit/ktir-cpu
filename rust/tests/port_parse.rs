@@ -44,7 +44,11 @@ fn parse_ops(op_text: &str) -> Vec<Operation> {
 /// Convenience: parse a single op and return exactly that op.
 fn parse_op(op_text: &str) -> Operation {
     let ops = parse_ops(op_text);
-    assert_eq!(ops.len(), 1, "expected exactly one op from {op_text:?}, got {ops:?}");
+    assert_eq!(
+        ops.len(),
+        1,
+        "expected exactly one op from {op_text:?}, got {ops:?}"
+    );
     ops.into_iter().next().unwrap()
 }
 
@@ -318,7 +322,8 @@ fn reduce_structure() {
 
 #[test]
 fn fill_structure() {
-    let op = parse_op("%out = linalg.fill ins(%val : f16) outs(%buf : tensor<4xf16>) -> tensor<4xf16>");
+    let op =
+        parse_op("%out = linalg.fill ins(%val : f16) outs(%buf : tensor<4xf16>) -> tensor<4xf16>");
     assert_eq!(op.op_type, "linalg.fill");
     assert_eq!(op.operands.len(), 2);
     assert_operand_names(&op, &["%val", "%buf"]);
@@ -479,8 +484,14 @@ fn construct_memory_view_lx_core_and_strides() {
         "%view = ktdp.construct_memory_view %ptr, sizes: [16, 32], strides: [32, 1] \
          { memory_space = #ktdp.spyre_memory_space<LX, core=3> } : memref<16x32xf32>",
     );
-    assert_eq!(op.attributes.get("shape"), Some(&Attr::IntList(vec![16, 32])));
-    assert_eq!(op.attributes.get("strides"), Some(&Attr::IntList(vec![32, 1])));
+    assert_eq!(
+        op.attributes.get("shape"),
+        Some(&Attr::IntList(vec![16, 32]))
+    );
+    assert_eq!(
+        op.attributes.get("strides"),
+        Some(&Attr::IntList(vec![32, 1]))
+    );
     assert_eq!(op.attributes.get("dtype"), Some(&Attr::Str("f32".into())));
     assert_eq!(
         op.attributes.get("memory_space"),
@@ -532,7 +543,10 @@ fn construct_access_tile_malformed_type_rejected() {
         { access_tile_order = affine_map<(d0) -> (d0)> } \
         : memref<1024xf16> -> !ktdp.access_tile<128>\n    return\n  }\n}";
     let err = parse_module(src).unwrap_err();
-    assert!(err.contains("Malformed access_tile"), "unexpected error: {err}");
+    assert!(
+        err.contains("Malformed access_tile"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

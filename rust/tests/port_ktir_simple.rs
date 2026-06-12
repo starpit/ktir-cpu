@@ -43,7 +43,7 @@ use ktir_cpu::context::CoreContext;
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::env::GridExecutor;
 use ktir_cpu::interpreter::execute_function;
-use ktir_cpu::memory::{HBMSimulator, LXScratchpad, SpyreMemoryHierarchy, STICK_BYTES};
+use ktir_cpu::memory::{HBMSimulator, LXScratchpad, STICK_BYTES, SpyreMemoryHierarchy};
 use ktir_cpu::parser::parse_module;
 
 // ===========================================================================

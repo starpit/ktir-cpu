@@ -281,9 +281,10 @@ fn sym_minmax(a: &Bound, b: &Bound, is_max: bool) -> Bound {
     // Idempotent on identical symbol references: max(s_k, s_k) -> s_k.
     if let (Bound::Symbolic(na), Bound::Symbolic(nb)) = (a, b)
         && let (AffineExpr::Sym(i), AffineExpr::Sym(j)) = (na.as_ref(), nb.as_ref())
-            && i == j {
-                return a.clone();
-            }
+        && i == j
+    {
+        return a.clone();
+    }
     let an = Rc::new(bound_to_node(a));
     let bn = Rc::new(bound_to_node(b));
     let node = if is_max {
@@ -438,8 +439,7 @@ impl SymBoxSet {
             hi.len(),
             "SymBoxSet: lo/hi length mismatch: lo={lo:?} hi={hi:?}"
         );
-        let all_concrete =
-            lo.iter().all(Bound::is_concrete) && hi.iter().all(Bound::is_concrete);
+        let all_concrete = lo.iter().all(Bound::is_concrete) && hi.iter().all(Bound::is_concrete);
         SymBoxSet {
             lo,
             hi,
@@ -631,8 +631,7 @@ impl SymBoxSet {
             let is_eq = c.kind == ConstraintKind::Equal;
             // For an equality `lhs == 0` we already store the LHS in `expr`, so
             // the linearised form is the constraint expression directly.
-            let (dim_coeffs, sym_coeffs, const_) =
-                constraint_to_linear_syms(&c.expr, n, n_syms)?;
+            let (dim_coeffs, sym_coeffs, const_) = constraint_to_linear_syms(&c.expr, n, n_syms)?;
             let nz: Vec<usize> = dim_coeffs
                 .iter()
                 .enumerate()
@@ -651,11 +650,7 @@ impl SymBoxSet {
             let sym_term = build_sym_term(&sym_coeffs, const_);
             if is_eq {
                 // k*d_i + k(syms) == 0  ->  d_i == pin
-                let pin = if k == 1 {
-                    sym_neg(&sym_term)
-                } else {
-                    sym_term
-                };
+                let pin = if k == 1 { sym_neg(&sym_term) } else { sym_term };
                 let pin_hi = sym_add(&pin, &Bound::Concrete(1));
                 los[i] = Some(match &los[i] {
                     None => pin.clone(),
@@ -933,14 +928,8 @@ mod tests {
             num_dims: 2,
             num_syms: 1,
             exprs: vec![
-                AffineExpr::Add(
-                    Rc::new(AffineExpr::Dim(0)),
-                    Rc::new(AffineExpr::Sym(0)),
-                ),
-                AffineExpr::Mul(
-                    Rc::new(AffineExpr::Dim(1)),
-                    Rc::new(AffineExpr::Const(2)),
-                ),
+                AffineExpr::Add(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Sym(0))),
+                AffineExpr::Mul(Rc::new(AffineExpr::Dim(1)), Rc::new(AffineExpr::Const(2))),
             ],
         };
         assert_eq!(m.eval(&[5, 7], &[10]), vec![15, 14]);
@@ -949,10 +938,7 @@ mod tests {
 
     #[test]
     fn euclidean_floordiv_and_mod() {
-        let fd = AffineExpr::FloorDiv(
-            Rc::new(AffineExpr::Dim(0)),
-            Rc::new(AffineExpr::Const(4)),
-        );
+        let fd = AffineExpr::FloorDiv(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Const(4)));
         let m = AffineExpr::Mod(Rc::new(AffineExpr::Dim(0)), Rc::new(AffineExpr::Const(4)));
         // -1 floordiv 4 == -1, -1 mod 4 == 3 (matches MLIR / Python semantics)
         assert_eq!(fd.eval(&[-1], &[]), -1);

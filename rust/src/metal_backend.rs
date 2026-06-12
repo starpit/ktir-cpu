@@ -66,7 +66,10 @@ pub const HIGHEST_IMPLEMENTED: MatmulTier = MatmulTier::Nax;
 pub fn tier_implemented(tier: MatmulTier) -> bool {
     // All three are implemented now: Naive (CPU/BLAS floor), Simdgroup
     // (simdgroup_float8x8, M1–M4), and Nax (matmul2d, M5+).
-    matches!(tier, MatmulTier::Naive | MatmulTier::Simdgroup | MatmulTier::Nax)
+    matches!(
+        tier,
+        MatmulTier::Naive | MatmulTier::Simdgroup | MatmulTier::Nax
+    )
 }
 
 /// The matmul tier a Metal device *supports*, parsed from its name (mirrors
@@ -76,7 +79,11 @@ pub fn tier_implemented(tier: MatmulTier) -> bool {
 ///   * non-Apple / unknown -> Naive
 pub fn device_matmul_tier(device_name: &str) -> MatmulTier {
     if let Some(generation) = apple_m_generation(device_name) {
-        return if generation >= 5 { MatmulTier::Nax } else { MatmulTier::Simdgroup };
+        return if generation >= 5 {
+            MatmulTier::Nax
+        } else {
+            MatmulTier::Simdgroup
+        };
     }
     if device_name.contains("Apple") {
         // An Apple GPU we couldn't pin to an M-number — assume Apple7+ matrix units.
@@ -226,13 +233,25 @@ pub fn emit_kernel(module: &IRModule, func_name: &str) -> Result<MslKernel, Stri
     for b in collect_input_buffers(compute, &defs) {
         if !buffers.iter().any(|x| x.name == b) {
             let bdt = buffer_dtype(&b, f);
-            buffers.push(BufferBinding { name: b, is_output: false, dtype: bdt });
+            buffers.push(BufferBinding {
+                name: b,
+                is_output: false,
+                dtype: bdt,
+            });
         }
     }
-    buffers.push(BufferBinding { name: out_buf, is_output: true, dtype });
+    buffers.push(BufferBinding {
+        name: out_buf,
+        is_output: true,
+        dtype,
+    });
 
     let source = render_kernel(func_name, &buffers, &expr);
-    Ok(MslKernel { source, name: func_name.to_string(), buffers })
+    Ok(MslKernel {
+        source,
+        name: func_name.to_string(),
+        buffers,
+    })
 }
 
 // --- dataflow ------------------------------------------------------------
@@ -362,7 +381,11 @@ fn render_kernel(name: &str, buffers: &[BufferBinding], expr: &str) -> String {
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
     s.push_str(&format!("kernel void {name}(\n"));
     for (i, b) in buffers.iter().enumerate() {
-        let qual = if b.is_output { "device" } else { "device const" };
+        let qual = if b.is_output {
+            "device"
+        } else {
+            "device const"
+        };
         s.push_str(&format!(
             "    {qual} {}* {} [[buffer({i})]],\n",
             msl_type(b.dtype),
@@ -413,7 +436,9 @@ pub fn run_kernel(
     let pipeline = device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
-    let queue = device.newCommandQueue().ok_or("metal: newCommandQueue returned nil")?;
+    let queue = device
+        .newCommandQueue()
+        .ok_or("metal: newCommandQueue returned nil")?;
 
     let res = MTLResourceOptions::StorageModeShared;
     let mut gpu_buffers = Vec::with_capacity(kernel.buffers.len());
@@ -427,7 +452,9 @@ pub fn run_kernel(
                 .newBufferWithLength_options(len, res)
                 .ok_or("metal: output buffer alloc failed")?
         } else {
-            let data = input_iter.next().ok_or("metal: too few inputs for kernel buffers")?;
+            let data = input_iter
+                .next()
+                .ok_or("metal: too few inputs for kernel buffers")?;
             let bytes = crate::codec::encode(data, b.dtype);
             // SAFETY: `bytes` lives until the copy completes inside this call.
             unsafe {
@@ -443,16 +470,28 @@ pub fn run_kernel(
         gpu_buffers.push(buf);
     }
 
-    let cb = queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
-    let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
+    let cb = queue
+        .commandBuffer()
+        .ok_or("metal: commandBuffer returned nil")?;
+    let enc = cb
+        .computeCommandEncoder()
+        .ok_or("metal: computeCommandEncoder returned nil")?;
     enc.setComputePipelineState(&pipeline);
     for (i, buf) in gpu_buffers.iter().enumerate() {
         unsafe { enc.setBuffer_offset_atIndex(Some(buf), 0, i) };
     }
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(out_len).max(1);
     enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize { width: out_len, height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: out_len,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cb.commit();
@@ -461,10 +500,8 @@ pub fn run_kernel(
     // Read the output buffer (last) back and decode to f32.
     let out = gpu_buffers.last().unwrap();
     let nbytes = out_len * out_dtype.bytes_per_elem();
-    let raw = unsafe {
-        std::slice::from_raw_parts(out.contents().as_ptr() as *const u8, nbytes)
-    }
-    .to_vec();
+    let raw = unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const u8, nbytes) }
+        .to_vec();
     Ok(crate::codec::decode(&raw, out_len, out_dtype))
 }
 
@@ -475,9 +512,7 @@ pub fn run_kernel(
 /// `Ok(())` if the source compiles on the system device, else the compiler error.
 pub fn compile_metal4(source: &str) -> Result<(), String> {
     use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLMathMode,
-    };
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLMathMode};
 
     let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
     let opts = objc2_metal::MTLCompileOptions::new();
@@ -613,7 +648,9 @@ pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     let pipeline = device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
-    let queue = device.newCommandQueue().ok_or("metal: newCommandQueue returned nil")?;
+    let queue = device
+        .newCommandQueue()
+        .ok_or("metal: newCommandQueue returned nil")?;
 
     let res = MTLResourceOptions::StorageModeShared;
     let mk_in = |data: &[f32]| -> Result<_, String> {
@@ -635,8 +672,12 @@ pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
         .newBufferWithLength_options(out_len * 4, res)
         .ok_or("metal: output buffer alloc failed")?;
 
-    let cb = queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
-    let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
+    let cb = queue
+        .commandBuffer()
+        .ok_or("metal: commandBuffer returned nil")?;
+    let enc = cb
+        .computeCommandEncoder()
+        .ok_or("metal: computeCommandEncoder returned nil")?;
     enc.setComputePipelineState(&pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
@@ -645,16 +686,23 @@ pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     }
     // One simdgroup (32 threads), one threadgroup.
     enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize { width: 32, height: 1, depth: 1 },
-        MTLSize { width: 32, height: 1, depth: 1 },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cb.commit();
     cb.waitUntilCompleted();
 
-    let raw = unsafe {
-        std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len)
-    };
+    let raw =
+        unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
     Ok(raw.to_vec())
 }
 
@@ -1073,7 +1121,11 @@ impl UnifiedBuffer {
             )
         }
         .ok_or("UnifiedBuffer: newBufferWithBytesNoCopy returned nil")?;
-        Ok(Self { mtl, alloc: AlignedAlloc { ptr, layout }, len })
+        Ok(Self {
+            mtl,
+            alloc: AlignedAlloc { ptr, layout },
+            len,
+        })
     }
 
     /// Build a unified buffer initialized from `data` (one copy in; thereafter
@@ -1112,8 +1164,9 @@ struct Scratch {
 #[cfg(metal)]
 pub struct NaxGemm {
     device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
-    pipeline:
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+    pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
     queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     scratch: std::cell::RefCell<Scratch>,
     /// Output block this kernel computes per threadgroup, and its thread count.
@@ -1164,7 +1217,9 @@ impl NaxGemm {
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
-        let queue = device.newCommandQueue().ok_or("metal: newCommandQueue returned nil")?;
+        let queue = device
+            .newCommandQueue()
+            .ok_or("metal: newCommandQueue returned nil")?;
         Ok(Self {
             device,
             pipeline,
@@ -1179,7 +1234,14 @@ impl NaxGemm {
     /// `C(m×n) = A(m×k) · B(k×n)`, all row-major. A/B/C are f32 on the host;
     /// the kernel computes in f16 (the NAX engine's input precision), so the
     /// result agrees with an f32 oracle only to f16 tolerance.
-    pub fn run(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
+    pub fn run(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+    ) -> Result<Vec<f32>, String> {
         self.run_epi(m, k, n, a, b, None, Epilogue::NONE)
     }
 
@@ -1258,8 +1320,13 @@ impl NaxGemm {
         let dims = [m as u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
 
-        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
-        let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or("metal: commandBuffer returned nil")?;
+        let enc = cb
+            .computeCommandEncoder()
+            .ok_or("metal: computeCommandEncoder returned nil")?;
         enc.setComputePipelineState(&self.pipeline);
         // Small uniforms via setBytes — no per-call buffer allocation.
         unsafe {
@@ -1282,8 +1349,16 @@ impl NaxGemm {
         let m_blocks = m.div_ceil(self.block_m);
         let n_blocks = n.div_ceil(self.block_n);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
-            MTLSize { width: self.threads, height: 1, depth: 1 },
+            MTLSize {
+                width: n_blocks,
+                height: m_blocks,
+                depth: 1,
+            },
+            MTLSize {
+                width: self.threads,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1311,8 +1386,7 @@ impl NaxGemm {
         epi: Epilogue,
     ) -> Result<(), String> {
         use objc2_metal::{
-            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-            MTLSize,
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
         };
         use std::ffi::c_void;
         use std::ptr::NonNull;
@@ -1322,7 +1396,10 @@ impl NaxGemm {
 
         let dims = [m as u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
-        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer nil")?;
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or("metal: commandBuffer nil")?;
         let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
         enc.setComputePipelineState(&self.pipeline);
         let e_mtl = e.unwrap_or(b); // dummy when binop==0 (never dereferenced)
@@ -1348,7 +1425,11 @@ impl NaxGemm {
                 height: m.div_ceil(self.block_m),
                 depth: 1,
             },
-            MTLSize { width: self.threads, height: 1, depth: 1 },
+            MTLSize {
+                width: self.threads,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1372,7 +1453,12 @@ impl NaxGemm {
     /// whole chain instead of per matmul — the batching that makes GPU matmul win
     /// on the small LX-sized tiles. `a` is the host input (k0 = a.len()/m0);
     /// returns the final result `outₙ₋₁`.
-    pub fn run_chain(&self, m0: usize, a: &[f32], steps: &[ChainStep<'_>]) -> Result<Vec<f32>, String> {
+    pub fn run_chain(
+        &self,
+        m0: usize,
+        a: &[f32],
+        steps: &[ChainStep<'_>],
+    ) -> Result<Vec<f32>, String> {
         use objc2_metal::{
             MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
             MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
@@ -1400,7 +1486,11 @@ impl NaxGemm {
         // every step — no per-step allocation. Two ping-pong result buffers hold
         // the running product; A, B, and E are refilled in place.
         let max_b = steps.iter().map(|s| s.b.len()).max().unwrap_or(1);
-        let max_e = steps.iter().map(|s| s.e.map_or(1, <[f32]>::len)).max().unwrap_or(1);
+        let max_e = steps
+            .iter()
+            .map(|s| s.e.map_or(1, <[f32]>::len))
+            .max()
+            .unwrap_or(1);
         let max_out = steps.iter().map(|s| rows * s.n).max().unwrap_or(1);
         let a_buf = alloc(a.len() * 4)?;
         fill(&a_buf, a);
@@ -1408,7 +1498,10 @@ impl NaxGemm {
         let b_buf = alloc(max_b * 4)?;
         let e_buf = alloc(max_e * 4)?;
 
-        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or("metal: commandBuffer returned nil")?;
         let mut final_len = 0usize;
         for (i, s) in steps.iter().enumerate() {
             assert_eq!(s.b.len(), s.k * s.n, "chain step B must be k×n");
@@ -1423,7 +1516,9 @@ impl NaxGemm {
             let dims = [rows as u32, s.n as u32, s.k as u32];
             let codes = [s.epi.binop, s.epi.act];
 
-            let enc = cb.computeCommandEncoder().ok_or("metal: chain encoder nil")?;
+            let enc = cb
+                .computeCommandEncoder()
+                .ok_or("metal: chain encoder nil")?;
             enc.setComputePipelineState(&self.pipeline);
             // Small uniforms go through setBytes (no buffer allocation).
             unsafe {
@@ -1443,8 +1538,16 @@ impl NaxGemm {
                 );
             }
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: s.n.div_ceil(self.block_n), height: rows.div_ceil(self.block_m), depth: 1 },
-                MTLSize { width: self.threads, height: 1, depth: 1 },
+                MTLSize {
+                    width: s.n.div_ceil(self.block_n),
+                    height: rows.div_ceil(self.block_m),
+                    depth: 1,
+                },
+                MTLSize {
+                    width: self.threads,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             final_len = out_len;
@@ -1453,8 +1556,9 @@ impl NaxGemm {
         cb.commit();
         cb.waitUntilCompleted();
         let last = &ping[(steps.len() - 1) % 2];
-        let raw =
-            unsafe { std::slice::from_raw_parts(last.contents().as_ptr() as *const f32, final_len) };
+        let raw = unsafe {
+            std::slice::from_raw_parts(last.contents().as_ptr() as *const f32, final_len)
+        };
         Ok(raw.to_vec())
     }
 
@@ -1528,7 +1632,10 @@ impl NaxGemm {
         let dims = [m as u32, n as u32, k as u32];
         let codes = [0u32, 0u32];
 
-        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or("metal: commandBuffer returned nil")?;
         let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
         enc.setComputePipelineState(&self.pipeline);
         unsafe {
@@ -1554,7 +1661,11 @@ impl NaxGemm {
                 height: m.div_ceil(self.block_m),
                 depth: batch,
             },
-            MTLSize { width: self.threads, height: 1, depth: 1 },
+            MTLSize {
+                width: self.threads,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1602,7 +1713,10 @@ impl NaxGemm {
         let a_buf = mk_in(a)?;
         let b_buf = mk_in(b)?;
         let e_buf = mk_in(&[0.0f32])?;
-        let c_buf = self.device.newBufferWithLength_options((m * n * 4).max(1), res).ok_or("alloc")?;
+        let c_buf = self
+            .device
+            .newBufferWithLength_options((m * n * 4).max(1), res)
+            .ok_or("alloc")?;
         let small = |v: &[u32]| -> Result<_, String> {
             let bytes = bytemuck_u32(v);
             unsafe {
@@ -1633,8 +1747,16 @@ impl NaxGemm {
                 enc.setBuffer_offset_atIndex(Some(&codes_buf), 0, 5);
             }
             enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize { width: n_blocks, height: m_blocks, depth: 1 },
-                MTLSize { width: self.threads, height: 1, depth: 1 },
+                MTLSize {
+                    width: n_blocks,
+                    height: m_blocks,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: self.threads,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
         }
@@ -1648,7 +1770,13 @@ impl NaxGemm {
 /// Convenience: compile + run a general NAX GEMM once. For repeated calls or
 /// benchmarks build a [`NaxGemm`] and reuse it (compiles the kernel once).
 #[cfg(metal)]
-pub fn run_nax_matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
+pub fn run_nax_matmul(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+) -> Result<Vec<f32>, String> {
     NaxGemm::new()?.run(m, k, n, a, b)
 }
 
@@ -1657,7 +1785,9 @@ pub fn run_nax_matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Res
 #[cfg(metal)]
 pub fn device_name() -> String {
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
-    MTLCreateSystemDefaultDevice().map(|d| d.name().to_string()).unwrap_or_default()
+    MTLCreateSystemDefaultDevice()
+        .map(|d| d.name().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(metal)]
@@ -1768,8 +1898,9 @@ kernel void mpp_probe(
     fn nax_matmul_tile_matches_oracle() {
         // A[m,k] = (m + k) % 3, B[k,n] = (k + 2*n) % 4  — products ≤ 6, sums
         // over K=16 ≤ 96: all exact in f16 and f32, and distinct per (m,n).
-        let a: Vec<f32> =
-            (0..NAX_TILE_M * NAX_TILE_K).map(|i| ((i / 16 + i % 16) % 3) as f32).collect();
+        let a: Vec<f32> = (0..NAX_TILE_M * NAX_TILE_K)
+            .map(|i| ((i / 16 + i % 16) % 3) as f32)
+            .collect();
         let b: Vec<f32> = (0..NAX_TILE_K * NAX_TILE_N)
             .map(|i| ((i / 32 + 2 * (i % 32)) % 4) as f32)
             .collect();
@@ -1792,18 +1923,30 @@ kernel void mpp_probe(
         }
         let col_probe = run_nax_matmul_tile(
             &ai,
-            &(0..NAX_TILE_K * NAX_TILE_N).map(|i| (i % NAX_TILE_N) as f32).collect::<Vec<_>>(),
+            &(0..NAX_TILE_K * NAX_TILE_N)
+                .map(|i| (i % NAX_TILE_N) as f32)
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         let row_probe = run_nax_matmul_tile(
             &ai,
-            &(0..NAX_TILE_K * NAX_TILE_N).map(|i| (i / NAX_TILE_N) as f32).collect::<Vec<_>>(),
+            &(0..NAX_TILE_K * NAX_TILE_N)
+                .map(|i| (i / NAX_TILE_N) as f32)
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         for m in 0..NAX_TILE_M {
             for n in 0..NAX_TILE_N {
-                assert_eq!(col_probe[m * NAX_TILE_N + n], n as f32, "column map at ({m},{n})");
-                assert_eq!(row_probe[m * NAX_TILE_N + n], m as f32, "row map at ({m},{n})");
+                assert_eq!(
+                    col_probe[m * NAX_TILE_N + n],
+                    n as f32,
+                    "column map at ({m},{n})"
+                );
+                assert_eq!(
+                    row_probe[m * NAX_TILE_N + n],
+                    m as f32,
+                    "row map at ({m},{n})"
+                );
             }
         }
         eprintln!("NAX matmul2d tile matches the oracle exactly (+ row/col layout) ✓");
@@ -1827,11 +1970,11 @@ kernel void mpp_probe(
         let shapes = [
             (16usize, 16usize, 32usize),
             (1, 1, 1),
-            (17, 33, 5),    // ragged M, N, K all
-            (48, 16, 64),   // multi-tile, clean
-            (50, 20, 70),   // multi-tile, ragged
-            (7, 100, 3),    // wide N
-            (100, 7, 3),    // tall M
+            (17, 33, 5),  // ragged M, N, K all
+            (48, 16, 64), // multi-tile, clean
+            (50, 20, 70), // multi-tile, ragged
+            (7, 100, 3),  // wide N
+            (100, 7, 3),  // tall M
         ];
         for (m, k, n) in shapes {
             // Small ints exact in f16: a in 0..3, b in 0..4. Sum over K stays
@@ -1842,7 +1985,10 @@ kernel void mpp_probe(
             let want = crate::blas::naive_sgemm(m, k, n, &a, &b);
             assert_eq!(got, want, "NAX GEMM mismatch at shape ({m},{k},{n})");
         }
-        eprintln!("general NAX GEMM matches the oracle across {} shapes ✓", shapes.len());
+        eprintln!(
+            "general NAX GEMM matches the oracle across {} shapes ✓",
+            shapes.len()
+        );
     }
 
     /// A batched matmul chain (one command buffer, one sync) computes the same
@@ -1861,16 +2007,36 @@ kernel void mpp_probe(
         // stays within f16 tolerance (signed inputs would cancel near zero and
         // blow up the *relative* error without any bug).
         let mk = |rows: usize, cols: usize, s: usize| -> Vec<f32> {
-            (0..rows * cols).map(|i| ((i + s) % 7) as f32 * 0.03 + 0.01).collect()
+            (0..rows * cols)
+                .map(|i| ((i + s) % 7) as f32 * 0.03 + 0.01)
+                .collect()
         };
         let x = mk(m, k0, 0);
         let (w1, w2, w3) = (mk(k0, k1, 1), mk(k1, k2, 2), mk(k2, k3, 3));
         let bias = mk(m, k3, 9);
 
         let steps = [
-            ChainStep { k: k0, n: k1, b: &w1, epi: Epilogue::NONE, e: None },
-            ChainStep { k: k1, n: k2, b: &w2, epi: Epilogue::NONE, e: None },
-            ChainStep { k: k2, n: k3, b: &w3, epi: Epilogue { binop: 1, act: 1 }, e: Some(&bias) },
+            ChainStep {
+                k: k0,
+                n: k1,
+                b: &w1,
+                epi: Epilogue::NONE,
+                e: None,
+            },
+            ChainStep {
+                k: k1,
+                n: k2,
+                b: &w2,
+                epi: Epilogue::NONE,
+                e: None,
+            },
+            ChainStep {
+                k: k2,
+                n: k3,
+                b: &w3,
+                epi: Epilogue { binop: 1, act: 1 },
+                e: Some(&bias),
+            },
         ];
         let got = ctx.run_chain(m, &x, &steps).unwrap();
 
@@ -1878,12 +2044,19 @@ kernel void mpp_probe(
         let c1 = crate::blas::naive_sgemm(m, k0, k1, &x, &w1);
         let c2 = crate::blas::naive_sgemm(m, k1, k2, &c1, &w2);
         let c3 = crate::blas::naive_sgemm(m, k2, k3, &c2, &w3);
-        let want: Vec<f32> = c3.iter().zip(&bias).map(|(&c, &b)| (c + b).max(0.0)).collect();
+        let want: Vec<f32> = c3
+            .iter()
+            .zip(&bias)
+            .map(|(&c, &b)| (c + b).max(0.0))
+            .collect();
         let mut max_rel = 0.0f32;
         for (g, w) in got.iter().zip(&want) {
             max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
         }
-        assert!(max_rel < 0.1, "chain result max rel err {max_rel} too large");
+        assert!(
+            max_rel < 0.1,
+            "chain result max rel err {max_rel} too large"
+        );
 
         // Timing: the 3-matmul chain (one sync) vs three separate run() calls.
         let iters = 100;
@@ -1896,7 +2069,9 @@ kernel void mpp_probe(
         for _ in 0..iters {
             let a = ctx.run(m, k0, k1, &x, &w1).unwrap();
             let b = ctx.run(m, k1, k2, &a, &w2).unwrap();
-            let _ = ctx.run_fused(m, k2, k3, &b, &w3, &bias, Epilogue { binop: 1, act: 1 }).unwrap();
+            let _ = ctx
+                .run_fused(m, k2, k3, &b, &w3, &bias, Epilogue { binop: 1, act: 1 })
+                .unwrap();
         }
         let separate = t1.elapsed().as_secs_f64() / iters as f64;
         eprintln!(
@@ -1921,7 +2096,9 @@ kernel void mpp_probe(
         };
         // 16 cores each multiply their 512 rows by the SAME 1024×1024 weights.
         let (count, m, k, n) = (16usize, 512usize, 1024usize, 1024usize);
-        let a: Vec<f32> = (0..count * m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
+        let a: Vec<f32> = (0..count * m * k)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.02)
+            .collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect();
 
         let got = ctx.run_combined(count, m, k, n, &a, &b).unwrap();
@@ -1946,7 +2123,11 @@ kernel void mpp_probe(
         for _ in 0..it {
             for s in 0..count {
                 std::hint::black_box(crate::blas::sgemm_rowmajor(
-                    m, k, n, &a[s * m * k..(s + 1) * m * k], &b,
+                    m,
+                    k,
+                    n,
+                    &a[s * m * k..(s + 1) * m * k],
+                    &b,
                 ));
             }
         }
@@ -1975,7 +2156,8 @@ kernel void mpp_probe(
         let ua = ctx.unified_from(&a).unwrap();
         let ub = ctx.unified_from(&b).unwrap();
         let mut uc = ctx.unified(m * n).unwrap();
-        ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE).unwrap();
+        ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)
+            .unwrap();
 
         // Correctness vs the copy-based path (same kernel, identical result).
         let want = ctx.run(m, k, n, &a, &b).unwrap();
@@ -1990,7 +2172,8 @@ kernel void mpp_probe(
         let it = 50;
         let t0 = std::time::Instant::now();
         for _ in 0..it {
-            ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE).unwrap();
+            ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)
+                .unwrap();
         }
         let zc = t0.elapsed().as_secs_f64() / it as f64;
         let t1 = std::time::Instant::now();
@@ -2017,14 +2200,20 @@ kernel void mpp_probe(
             Err(e) => panic!("{e}"),
         };
         let (batch, m, k, n) = (64usize, 256usize, 256usize, 256usize);
-        let a: Vec<f32> = (0..batch * m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
-        let b: Vec<f32> = (0..batch * k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.05).collect();
+        let a: Vec<f32> = (0..batch * m * k)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let b: Vec<f32> = (0..batch * k * n)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.05)
+            .collect();
 
         let got = ctx.run_batched(batch, m, k, n, &a, &b).unwrap();
         let mut max_rel = 0.0f32;
         for s in 0..batch {
             let want = crate::blas::naive_sgemm(
-                m, k, n,
+                m,
+                k,
+                n,
                 &a[s * m * k..(s + 1) * m * k],
                 &b[s * k * n..(s + 1) * k * n],
             );
@@ -2046,7 +2235,12 @@ kernel void mpp_probe(
             Err(e) => panic!("simdgroup compile failed: {e}"),
         };
         // Plain matmul across shapes (small ints exact in f32).
-        for (m, k, n) in [(8usize, 8usize, 8usize), (17, 33, 5), (50, 20, 70), (100, 7, 3)] {
+        for (m, k, n) in [
+            (8usize, 8usize, 8usize),
+            (17, 33, 5),
+            (50, 20, 70),
+            (100, 7, 3),
+        ] {
             let a: Vec<f32> = (0..m * k).map(|i| (i % 3) as f32).collect();
             let b: Vec<f32> = (0..k * n).map(|i| (i % 4) as f32).collect();
             let got = ctx.run(m, k, n, &a, &b).unwrap();
@@ -2058,11 +2252,16 @@ kernel void mpp_probe(
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) * 0.5).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
         let e: Vec<f32> = (0..m * n).map(|i| (i % 11) as f32 * 0.1 - 0.5).collect();
-        let got = ctx.run_fused(m, k, n, &a, &b, &e, Epilogue { binop: 1, act: 1 }).unwrap();
+        let got = ctx
+            .run_fused(m, k, n, &a, &b, &e, Epilogue { binop: 1, act: 1 })
+            .unwrap();
         let mm = crate::blas::naive_sgemm(m, k, n, &a, &b);
         for i in 0..m * n {
             let want = (mm[i] + e[i]).max(0.0);
-            assert!((got[i] - want).abs() < 1e-3, "simdgroup fused mismatch at {i}");
+            assert!(
+                (got[i] - want).abs() < 1e-3,
+                "simdgroup fused mismatch at {i}"
+            );
         }
         eprintln!("simdgroup_float8x8 GEMM (+fused epilogue) matches the oracle ✓");
     }
@@ -2099,9 +2298,15 @@ kernel void mpp_probe(
                 let want = f(mm[i], e[i]);
                 max_rel = max_rel.max((got[i] - want).abs() / want.abs().max(1.0));
             }
-            assert!(max_rel < 0.05, "fused {epi:?}: max rel err {max_rel} > f16 tol");
+            assert!(
+                max_rel < 0.05,
+                "fused {epi:?}: max rel err {max_rel} > f16 tol"
+            );
         }
-        eprintln!("fused matmul→elementwise epilogue matches oracle across {} ops ✓", cases.len());
+        eprintln!(
+            "fused matmul→elementwise epilogue matches oracle across {} ops ✓",
+            cases.len()
+        );
     }
 
     /// Random (non-f16-exact) data: the NAX GEMM agrees with the f32 oracle to
@@ -2126,7 +2331,10 @@ kernel void mpp_probe(
             max_rel = max_rel.max((g - w).abs() / denom);
         }
         // f16 has 8 mantissa bits; K=48 accumulation in f32 keeps error modest.
-        assert!(max_rel < 0.05, "max relative error {max_rel} exceeds f16 tolerance");
+        assert!(
+            max_rel < 0.05,
+            "max relative error {max_rel} exceeds f16 tolerance"
+        );
         eprintln!("NAX GEMM vs f32 oracle: max relative error {max_rel:.4} (f16) ✓");
     }
 
@@ -2186,7 +2394,11 @@ kernel void mpp_probe(
                 f();
             }
             let secs = t0.elapsed().as_secs_f64() / iters as f64;
-            eprintln!("{label:>12}: {:7.2} ms   {:7.1} GFLOP/s", secs * 1e3, flops / secs / 1e9);
+            eprintln!(
+                "{label:>12}: {:7.2} ms   {:7.1} GFLOP/s",
+                secs * 1e3,
+                flops / secs / 1e9
+            );
         };
 
         // GPU-only kernel time (excludes alloc/copy/readback): 50 dispatches on
@@ -2195,21 +2407,35 @@ kernel void mpp_probe(
         let gpu_each = gpu_total / 50.0;
         eprintln!(
             "{:>12}: {:7.2} ms   {:7.1} GFLOP/s   (GPU kernel only)",
-            "NAX-gpu", gpu_each * 1e3, flops / gpu_each / 1e9
+            "NAX-gpu",
+            gpu_each * 1e3,
+            flops / gpu_each / 1e9
         );
 
         let (a1, b1) = (a.clone(), b.clone());
-        bench("NAX-wall", 20, Box::new(move || {
-            ctx.run(m, k, n, &a1, &b1).unwrap();
-        }));
+        bench(
+            "NAX-wall",
+            20,
+            Box::new(move || {
+                ctx.run(m, k, n, &a1, &b1).unwrap();
+            }),
+        );
         let (a2, b2) = (a.clone(), b.clone());
-        bench("BLAS/accel", 20, Box::new(move || {
-            std::hint::black_box(crate::blas::sgemm_rowmajor(m, k, n, &a2, &b2));
-        }));
+        bench(
+            "BLAS/accel",
+            20,
+            Box::new(move || {
+                std::hint::black_box(crate::blas::sgemm_rowmajor(m, k, n, &a2, &b2));
+            }),
+        );
         let (a3, b3) = (a.clone(), b.clone());
-        bench("naive", 1, Box::new(move || {
-            std::hint::black_box(crate::blas::naive_sgemm(m, k, n, &a3, &b3));
-        }));
+        bench(
+            "naive",
+            1,
+            Box::new(move || {
+                std::hint::black_box(crate::blas::naive_sgemm(m, k, n, &a3, &b3));
+            }),
+        );
     }
 
     #[test]
@@ -2236,7 +2462,7 @@ kernel void mpp_probe(
     #[test]
     fn gpu_matches_oracle_vector_add() {
         use crate::dtypes::DType;
-        use crate::interpreter::{execute_function, Arg};
+        use crate::interpreter::{Arg, execute_function};
         use crate::ir::Scalar;
 
         let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
@@ -2259,9 +2485,30 @@ kernel void mpp_probe(
 
         // Oracle: the same kernel through the CPU interpreter.
         let args = [
-            ("x_ptr", Arg::Tensor { data: x, shape: vec![n], dtype: DType::F16 }),
-            ("y_ptr", Arg::Tensor { data: y, shape: vec![n], dtype: DType::F16 }),
-            ("output_ptr", Arg::Tensor { data: vec![0.0; n], shape: vec![n], dtype: DType::F16 }),
+            (
+                "x_ptr",
+                Arg::Tensor {
+                    data: x,
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "y_ptr",
+                Arg::Tensor {
+                    data: y,
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                "output_ptr",
+                Arg::Tensor {
+                    data: vec![0.0; n],
+                    shape: vec![n],
+                    dtype: DType::F16,
+                },
+            ),
             ("BLOCK_SIZE", Arg::Scalar(Scalar::I64(128))),
         ];
         let oracle = execute_function(&module, "add_kernel", &args).unwrap();
@@ -2327,10 +2574,19 @@ kernel void mpp_probe(
         assert_eq!(choose_matmul_backend("Apple M5", 512, 512, 512), Accelerate); // 8 blocks < 32
         assert_eq!(choose_matmul_backend("Apple M5", 256, 256, 256), Accelerate);
         // Pre-M5: the simdgroup GPU path never beats AMX in wall-clock -> Accelerate.
-        assert_eq!(choose_matmul_backend("Apple M4", 2048, 2048, 2048), Accelerate);
-        assert_eq!(choose_matmul_backend("Apple M1", 4096, 4096, 4096), Accelerate);
+        assert_eq!(
+            choose_matmul_backend("Apple M4", 2048, 2048, 2048),
+            Accelerate
+        );
+        assert_eq!(
+            choose_matmul_backend("Apple M1", 4096, 4096, 4096),
+            Accelerate
+        );
         // Non-Apple GPUs -> Accelerate.
-        assert_eq!(choose_matmul_backend("Intel UHD Graphics 630", 4096, 4096, 4096), Accelerate);
+        assert_eq!(
+            choose_matmul_backend("Intel UHD Graphics 630", 4096, 4096, 4096),
+            Accelerate
+        );
     }
 
     #[test]
@@ -2342,8 +2598,14 @@ kernel void mpp_probe(
         };
         let name = device.name().to_string();
         let cap = device_matmul_tier(&name);
-        eprintln!("device {name:?}: capability tier = {cap:?}, using = {:?}", effective_matmul_tier(&name));
+        eprintln!(
+            "device {name:?}: capability tier = {cap:?}, using = {:?}",
+            effective_matmul_tier(&name)
+        );
         // This machine is an Apple GPU, so it must be at least the simdgroup tier.
-        assert!(cap >= MatmulTier::Simdgroup, "expected an Apple GPU, got {name:?}");
+        assert!(
+            cap >= MatmulTier::Simdgroup,
+            "expected an Apple GPU, got {name:?}"
+        );
     }
 }

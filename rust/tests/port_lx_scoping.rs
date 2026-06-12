@@ -42,7 +42,7 @@
 //!   `Value::Index` markers — identity/visibility is what the tests check.
 
 use std::cell::RefCell;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use ktir_cpu::context::CoreContext;
@@ -125,7 +125,10 @@ fn test_outer_scope_does_not_see_inner_values() {
     let mut ctx = make_context(2);
     ctx.push_scope();
     ctx.set_value("%body_local", Value::Index(99));
-    assert!(matches!(ctx.get_value("%body_local").unwrap(), Value::Index(99)));
+    assert!(matches!(
+        ctx.get_value("%body_local").unwrap(),
+        Value::Index(99)
+    ));
     ctx.pop_scope();
     // Python: KeyError. Rust: get_value returns Err for an undefined name.
     assert!(ctx.get_value("%body_local").is_err());
@@ -156,9 +159,18 @@ fn test_nested_scopes() {
     ctx.set_value("%inner_val", Value::Index(2)); // "i"
 
     // All visible from innermost.
-    assert!(matches!(ctx.get_value("%func_val").unwrap(), Value::Index(0)));
-    assert!(matches!(ctx.get_value("%outer_val").unwrap(), Value::Index(1)));
-    assert!(matches!(ctx.get_value("%inner_val").unwrap(), Value::Index(2)));
+    assert!(matches!(
+        ctx.get_value("%func_val").unwrap(),
+        Value::Index(0)
+    ));
+    assert!(matches!(
+        ctx.get_value("%outer_val").unwrap(),
+        Value::Index(1)
+    ));
+    assert!(matches!(
+        ctx.get_value("%inner_val").unwrap(),
+        Value::Index(2)
+    ));
 
     ctx.pop_scope(); // exit inner for
     assert!(ctx.has_value("%outer_val"));
@@ -215,12 +227,14 @@ fn test_pop_scope_does_not_free_outer_lx() {
     let mut ctx = make_context(2);
     let outer_tile = make_tile(&[4, 64]); // 512 bytes
     ctx.set_value("%outer", Value::Tile(outer_tile.clone()));
-    ctx.track_lx("%outer", outer_tile.size_bytes() as i64).unwrap();
+    ctx.track_lx("%outer", outer_tile.size_bytes() as i64)
+        .unwrap();
 
     ctx.push_scope();
     let inner_tile = make_tile(&[32, 1024]); // 65536 bytes
     ctx.set_value("%inner", Value::Tile(inner_tile.clone()));
-    ctx.track_lx("%inner", inner_tile.size_bytes() as i64).unwrap();
+    ctx.track_lx("%inner", inner_tile.size_bytes() as i64)
+        .unwrap();
     assert_eq!(used(&ctx), 512 + 65536);
 
     ctx.pop_scope();
@@ -284,12 +298,14 @@ fn test_iter_arg_tiles_persist_body_local_freed() {
         // Body-local: tensor<4x256xf16> = 2048 bytes.
         let body_tile = make_tile(&[4, 256]);
         ctx.set_value("%body_tile", Value::Tile(body_tile.clone()));
-        ctx.track_lx("%body_tile", body_tile.size_bytes() as i64).unwrap();
+        ctx.track_lx("%body_tile", body_tile.size_bytes() as i64)
+            .unwrap();
 
         // New iter_arg value (created in body, will be yielded): 8 bytes.
         let new_acc = make_tile(&[4, 1]);
         ctx.set_value("%new_acc", Value::Tile(new_acc.clone()));
-        ctx.track_lx("%new_acc", new_acc.size_bytes() as i64).unwrap();
+        ctx.track_lx("%new_acc", new_acc.size_bytes() as i64)
+            .unwrap();
 
         assert_eq!(used(&ctx), 8 + 2048 + 8); // old acc + body + new acc
 
@@ -397,7 +413,10 @@ fn test_legitimate_overflow_still_raises() {
     for i in 0..100 {
         write_to_lx_f16(&mut ctx, 1024); // 2 KB each
         let tile = make_tile(&[1024]);
-        if ctx.track_lx(&format!("%t{i}"), tile.size_bytes() as i64).is_err() {
+        if ctx
+            .track_lx(&format!("%t{i}"), tile.size_bytes() as i64)
+            .is_err()
+        {
             overflowed = true; // Python: MemoryError("LX scratchpad overflow")
             break;
         }

@@ -86,8 +86,7 @@ fn to_np_dtype_aliases_are_identical() {
 #[test]
 fn unknown_dtype_raises() {
     for bad in ["bf16", "i8", "unknown", ""] {
-        let err = DType::parse(bad)
-            .expect_err(&format!("{bad:?} should be rejected"));
+        let err = DType::parse(bad).expect_err(&format!("{bad:?} should be rejected"));
         assert!(
             err.to_lowercase().contains("unsupported"),
             "{bad:?} error should be an 'unsupported' error, got: {err}"
@@ -104,8 +103,8 @@ fn unknown_dtype_raises() {
 #[test]
 fn placeholder_dtype_raises() {
     for placeholder in ["fp8", "mxfp8"] {
-        let err = DType::parse(placeholder)
-            .expect_err(&format!("{placeholder:?} should be rejected"));
+        let err =
+            DType::parse(placeholder).expect_err(&format!("{placeholder:?} should be rejected"));
         assert!(
             err.to_lowercase().contains("placeholder"),
             "{placeholder:?} should be a 'placeholder' (NotImplementedError-equivalent) \

@@ -45,8 +45,8 @@
 //!   and never binds an outer SSA scalar as a variable, so that guard does not
 //!   exist in the crate. Both cases are `#[ignore]`d with that reason.
 
-use std::rc::Rc;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ktir_cpu::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind};
 use ktir_cpu::codec;
@@ -80,7 +80,11 @@ fn box_set(sizes: &[i64]) -> AffineSet {
             kind: ConstraintKind::GreaterEq,
         });
     }
-    AffineSet { num_dims: sizes.len(), num_syms: 0, constraints }
+    AffineSet {
+        num_dims: sizes.len(),
+        num_syms: 0,
+        constraints,
+    }
 }
 
 /// Affine map `(d0,..) -> (perm[0], perm[1], ..)` over `perm.len()` dims.
@@ -121,7 +125,10 @@ fn seed_hbm(ctx: &mut CoreContext, data: &[f32], dtype: DType, shape: &[usize]) 
 /// Read `n` elements of `dtype` back from an HBM `MemRef`.
 fn read_hbm(ctx: &CoreContext, mr: &MemRef, n: usize, dtype: DType) -> Vec<f32> {
     let nbytes = n * dtype.bytes_per_elem();
-    let raw = ctx.hbm.borrow().read_bytes(mr.base_ptr * STICK_BYTES, nbytes);
+    let raw = ctx
+        .hbm
+        .borrow()
+        .read_bytes(mr.base_ptr * STICK_BYTES, nbytes);
     codec::decode(&raw, n, dtype)
 }
 
@@ -139,7 +146,9 @@ fn make_iat(
         .iter()
         .map(|(kind, payload)| match *kind {
             "indirect" => DimSubscript::Indirect { view: *payload },
-            "direct" => DimSubscript::Direct { var_index: *payload },
+            "direct" => DimSubscript::Direct {
+                var_index: *payload,
+            },
             other => panic!("unknown dim kind {other}"),
         })
         .collect();
