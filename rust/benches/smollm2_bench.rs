@@ -15,11 +15,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn main() {
+    // MODEL selects which compiled-model dir under ~/.cache/cudaforge/ktir/ to
+    // run (default the fp16 SmolLM2-135M decode model). The runner is
+    // shape-agnostic, so a prefill model dir drops in the same way once one is
+    // compiled.
+    let model = std::env::var("MODEL").unwrap_or_else(|_| "smollm2-135m".to_string());
     let Some(dir) = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".cache/cudaforge/ktir/smollm2-135m"))
+        .map(|h| PathBuf::from(h).join(".cache/cudaforge/ktir").join(&model))
         .filter(|d| d.join("manifest.json").is_file())
     else {
-        eprintln!("SmolLM2 bundle absent — skipping");
+        eprintln!("model {model} absent under ~/.cache/cudaforge/ktir — skipping");
         return;
     };
     let manifest: serde_json::Value =
@@ -130,7 +135,7 @@ fn main() {
         }
         let ms = t0.elapsed().as_secs_f64() / iters as f64 * 1e3;
         println!(
-            "smollm2-135m e2e (Rust): {ms:.1} ms/pass  ({} nodes, {iters} passes)",
+            "{model} e2e (Rust): {ms:.1} ms/pass  ({} nodes, {iters} passes)",
             nodes.len()
         );
     }
