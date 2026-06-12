@@ -809,8 +809,8 @@ pub fn load_data(
     // Fast path: contiguous tile, no coord filtering.
     if coords.is_none() && is_contiguous(&tile_ref.shape, &tile_ref.strides) {
         let n: usize = tile_ref.shape.iter().product();
-        let raw = read_raw(ctx, space, tile_ref.base_ptr, n * bpe);
-        let data = decode(&raw, dtype, n);
+        // Decode straight from the backing buffer — no intermediate byte Vec.
+        let data = read_decoded(ctx, space, tile_ref.base_ptr, n, dtype);
         write_to_lx(ctx, &data, dtype);
         let unique_sticks = stick_bytes.map(|sb| {
             let end = tile_ref.base_ptr + (n * bpe) as i64;
@@ -919,8 +919,20 @@ fn read_raw(ctx: &CoreContext, space: MemorySpace, byte_addr: i64, len: usize) -
         MemorySpace::Hbm => ctx.hbm.borrow().read_bytes(byte_addr, len),
         MemorySpace::Lx { core_id } => {
             let lx = ctx.get_lx(core_id.map(|c| c as usize));
-            
+
             lx.borrow().read_bytes(byte_addr, len)
+        }
+    }
+}
+
+/// Read `n` elements of `dtype` and decode to f32 directly from the backing
+/// store — no intermediate byte `Vec`. Used by the contiguous load fast path.
+fn read_decoded(ctx: &CoreContext, space: MemorySpace, byte_addr: i64, n: usize, dtype: DType) -> Vec<f32> {
+    match space {
+        MemorySpace::Hbm => ctx.hbm.borrow().read_decoded(byte_addr, n, dtype),
+        MemorySpace::Lx { core_id } => {
+            let lx = ctx.get_lx(core_id.map(|c| c as usize));
+            lx.borrow().read_decoded(byte_addr, n, dtype)
         }
     }
 }

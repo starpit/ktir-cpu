@@ -12,6 +12,7 @@
 //! — the scheduler is single-threaded/cooperative, so no `Arc`/`Mutex` needed.
 
 use std::cell::RefCell;
+use crate::dtypes::DType;
 use crate::fxhash::FxHashMap;
 use std::rc::Rc;
 
@@ -60,6 +61,14 @@ impl HBMSimulator {
         read_bytes(&self.allocations, byte_addr, len)
     }
 
+    /// Read `n` elements of `dtype` and decode to f32 in one pass, straight from
+    /// the backing buffer — no intermediate byte `Vec`/memmove. `codec::decode`
+    /// zero-pads when the read runs past the allocation. The contiguous-load fast
+    /// path (the common case) uses this.
+    pub fn read_decoded(&self, byte_addr: i64, n: usize, dtype: DType) -> Vec<f32> {
+        read_decoded(&self.allocations, byte_addr, n, dtype)
+    }
+
     /// Write raw bytes at absolute `byte_addr`, growing/creating the allocation.
     pub fn write_bytes(&mut self, byte_addr: i64, data: &[u8]) {
         write_bytes(&mut self.allocations, byte_addr, data);
@@ -89,6 +98,12 @@ impl LXScratchpad {
 
     pub fn read_bytes(&self, ptr: i64, len: usize) -> Vec<u8> {
         read_bytes(&self.allocations, ptr, len)
+    }
+
+    /// Decode `n` elements of `dtype` directly from the backing buffer (no
+    /// intermediate byte `Vec`). See [`HBMSimulator::read_decoded`].
+    pub fn read_decoded(&self, ptr: i64, n: usize, dtype: DType) -> Vec<f32> {
+        read_decoded(&self.allocations, ptr, n, dtype)
     }
 
     pub fn write_bytes(&mut self, ptr: i64, data: &[u8]) {
@@ -151,6 +166,21 @@ fn read_bytes(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, len: usize) -> Vec<u8>
         out[..n].copy_from_slice(&buf[off..off + n]);
     }
     out // zero-padded past allocation end (matches Python)
+}
+
+/// Read + decode in one pass: `codec::decode` reads the backing bytes directly
+/// (zero-padding a short tail itself), so the contiguous load fast path skips
+/// the intermediate byte `Vec` and its memmove.
+fn read_decoded(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, n: usize, dtype: DType) -> Vec<f32> {
+    match find_allocation(allocs, ptr) {
+        Some((base, _)) => {
+            let buf = &allocs[&base];
+            let off = (ptr - base) as usize;
+            let end = (off + n * dtype.bytes_per_elem()).min(buf.len());
+            crate::codec::decode(&buf[off..end], n, dtype)
+        }
+        None => crate::codec::decode(&[], n, dtype),
+    }
 }
 
 fn write_bytes(allocs: &mut FxHashMap<i64, Vec<u8>>, ptr: i64, data: &[u8]) {
