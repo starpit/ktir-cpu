@@ -54,3 +54,8 @@ objc2-foundation = "0.3"
 [lib]
 name = "ktir_cpu"
 path = "src/lib.rs"
+
+# Test-only: the SmolLM2 bundle runner (e2e_smollm2.rs) parses the bundle's
+# manifest.json. Does not affect the dependency-free default library build.
+[dev-dependencies]
+serde_json = "1"
