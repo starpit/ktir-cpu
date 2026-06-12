@@ -39,10 +39,26 @@ fn construct_memory_view(op: &Operation, ctx: &mut CoreContext, _env: &Execution
     }
     let base_ptr = scalar_i64(ctx.get_value(&op.operands[0])?, "construct_memory_view ptr")?;
 
-    let shape = int_list(op, "shape")?
-        .iter()
-        .map(|&n| n as usize)
-        .collect::<Vec<_>>();
+    // Static `shape` (IntList) or dynamic `sizes_dyn` (StrList of `%ssa`/literal
+    // tokens) resolved from scope now. Mirrors the runtime SSA-size resolution
+    // in `ktdp__construct_memory_view`.
+    let shape: Vec<usize> = match op.attributes.get("shape") {
+        Some(Attr::IntList(v)) => v.iter().map(|&n| n as usize).collect(),
+        _ => match op.attributes.get("sizes_dyn") {
+            Some(Attr::StrList(tokens)) => tokens
+                .iter()
+                .map(|t| {
+                    if t.starts_with('%') {
+                        scalar_i64(ctx.get_value(t)?, "construct_memory_view size").map(|n| n as usize)
+                    } else {
+                        t.parse::<usize>()
+                            .map_err(|_| format!("construct_memory_view: bad size token {t:?}"))
+                    }
+                })
+                .collect::<Result<_, String>>()?,
+            _ => return Err("construct_memory_view: missing required attribute 'shape'".into()),
+        },
+    };
     let strides = int_list(op, "strides")?.clone();
 
     let space_str = str_attr(op, "memory_space")?;

@@ -2,10 +2,12 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
 //
-//! `func` dialect — the function terminator. `return` carries operands but has
-//! no SSA result; in this slice it's a value-less no-op so straight-line
-//! functions execute cleanly. (Capturing the returned values into the
-//! interpreter's function-result handling lands with the grid/interpreter slice.)
+//! `func` dialect — the function terminator. KTIR functions write outputs to
+//! HBM, so `return` is usually void; but it may carry operands. The handler
+//! surfaces them (single -> that value, multiple -> `Value::Tuple`, none ->
+//! `None`). The op has no SSA result name, so the value isn't bound into scope —
+//! it's observable only by a direct handler/`execute_op` call (matching how the
+//! Python `func.return` returns its operand values).
 
 use super::{Dispatch, LatencyCategory};
 use crate::context::CoreContext;
@@ -17,6 +19,15 @@ pub fn register(d: &mut Dispatch) {
     d.register("func.return", LatencyCategory::Zero, ret);
 }
 
-fn ret(_op: &Operation, _ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
-    Ok(None)
+fn ret(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+    let mut vals: Vec<Value> = op
+        .operands
+        .iter()
+        .map(|name| ctx.get_value(name).cloned())
+        .collect::<Result<_, _>>()?;
+    Ok(match vals.len() {
+        0 => None,
+        1 => Some(vals.pop().unwrap()),
+        _ => Some(Value::Tuple(vals)),
+    })
 }

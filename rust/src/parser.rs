@@ -504,11 +504,22 @@ fn parse_construct_memory_view_attrs(
     result_type: Option<&str>,
     attrs: &mut std::collections::HashMap<String, Attr>,
 ) -> Result<(), String> {
-    // sizes: [...] — only stored when every element is a literal int.
-    if let Some(list) = bracket_segment(text, "sizes")
-        && let Some(ints) = parse_int_list(&list) {
+    // sizes: [...] — static (all literal ints) -> `shape` IntList. Dynamic
+    // (any `%ssa` or `?`) -> `sizes_dyn` StrList of raw tokens, resolved at
+    // execution time by the handler (the Python "lazily resolve SSA sizes"
+    // contract).
+    if let Some(list) = bracket_segment(text, "sizes") {
+        if let Some(ints) = parse_int_list(&list) {
             attrs.insert("shape".to_string(), Attr::IntList(ints));
+        } else {
+            let tokens: Vec<String> = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            attrs.insert("sizes_dyn".to_string(), Attr::StrList(tokens));
         }
+    }
 
     // strides: [...] — default [1] (matching the Python default).
     let strides = bracket_segment(text, "strides")

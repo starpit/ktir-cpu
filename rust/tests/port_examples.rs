@@ -201,19 +201,16 @@ fn run_vector_add_dynamic(n: usize) {
 // the construct_memory_view handler errors at runtime. Skipped until SSA-size
 // resolution lands.
 #[test]
-#[ignore = "GAP: parser does not lazily resolve SSA/dynamic memref sizes -> construct_memory_view 'missing shape'"]
 fn vector_add_dynamic_256() {
     run_vector_add_dynamic(256);
 }
 
 #[test]
-#[ignore = "GAP: parser does not lazily resolve SSA/dynamic memref sizes -> construct_memory_view 'missing shape'"]
 fn vector_add_dynamic_512() {
     run_vector_add_dynamic(512);
 }
 
 #[test]
-#[ignore = "GAP: parser does not lazily resolve SSA/dynamic memref sizes -> construct_memory_view 'missing shape'"]
 fn vector_add_dynamic_1024() {
     run_vector_add_dynamic(1024);
 }
