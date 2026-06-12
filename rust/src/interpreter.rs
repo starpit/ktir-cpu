@@ -52,6 +52,35 @@ pub fn execute_op(
             .record_op(ctx.core_id, &op.op_type, category, &produced, &operands);
     }
 
+    // Multi-result op (`%a, %b = ...`): bind each name to one tuple element.
+    // Mirrors Python `if isinstance(op.result, list) and isinstance(result, tuple)`.
+    if let Some(crate::ir::Attr::StrList(names)) = op.attributes.get("result_names")
+        && names.len() > 1
+    {
+        let Some(Value::Tuple(vals)) = &produced else {
+            return Err(format!(
+                "op '{}' has {} result names but did not produce a tuple",
+                op.op_type,
+                names.len()
+            ));
+        };
+        if vals.len() != names.len() {
+            return Err(format!(
+                "op '{}': {} result names but produced {} values",
+                op.op_type,
+                names.len(),
+                vals.len()
+            ));
+        }
+        for (name, val) in names.iter().zip(vals) {
+            if let Value::Tile(t) = val {
+                ctx.track_lx(name, t.size_bytes() as i64)?;
+            }
+            ctx.set_value(name, val.clone());
+        }
+        return Ok(produced);
+    }
+
     if let Some(name) = &op.result {
         match produced {
             Some(val) => {

@@ -404,11 +404,13 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         return Ok(Some(op));
     }
 
-    // optional `%result = `
-    let (result, rest) = match split_assignment(text) {
-        Some((r, rest)) => (Some(r.to_string()), rest),
-        None => (None, text),
+    // optional `%result = ` or multi-result `%a, %b = ` (e.g. the 2-D form of
+    // `ktdp.get_compute_tile_id`, or an scf.for with several iter_args).
+    let (result_names, rest) = match split_assignment_multi(text) {
+        Some((names, rest)) => (names, rest),
+        None => (Vec::new(), text),
     };
+    let result = result_names.first().cloned();
     let rest = rest.trim();
 
     // The op name is the leading `dialect.op` identifier; it ends at the first
@@ -432,6 +434,24 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
     let after_op = rest[op_type.len()..].trim();
 
     let result_type = extract_result_type(after_op);
+
+    // scf.for needs structured operands `[lb, ub, step, ...inits]` and the
+    // `iter_var` / `iter_args` attributes (the generic %-scan would mis-order
+    // them and never bind the induction variable). Mirrors Python parse_scf_for.
+    if op_type == "scf.for" {
+        let (operands, mut attributes) = parse_scf_for_op(after_op)
+            .ok_or("scf.for: could not parse `%iv = %lb to %ub step %step`")?;
+        set_multi_result(&mut attributes, &result_names);
+        return Ok(Some(Operation {
+            result,
+            op_type,
+            operands,
+            attributes,
+            result_type,
+            regions: Vec::new(),
+        }));
+    }
+
     let operands = extract_operands(after_op, result.as_deref());
 
     let mut attributes = std::collections::HashMap::new();
@@ -479,6 +499,8 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         }
     }
 
+    set_multi_result(&mut attributes, &result_names);
+
     Ok(Some(Operation {
         result,
         op_type,
@@ -487,6 +509,91 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         result_type,
         regions: Vec::new(),
     }))
+}
+
+/// For a multi-result op (`%a, %b = ...`), record every result name and the
+/// count so the interpreter can bind each, and the handler (e.g.
+/// `ktdp.get_compute_tile_id`) can return the right number of values.
+fn set_multi_result(attrs: &mut std::collections::HashMap<String, Attr>, names: &[String]) {
+    if names.len() > 1 {
+        attrs.insert("result_names".to_string(), Attr::StrList(names.to_vec()));
+        attrs.insert("num_results".to_string(), Attr::Int(names.len() as i64));
+    }
+}
+
+/// First `%name` in `s`, with its end offset.
+fn first_ssa(s: &str) -> Option<(&str, usize)> {
+    let start = s.find('%')?;
+    let bytes = s.as_bytes();
+    let mut end = start + 1;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'$' | b'.'))
+    {
+        end += 1;
+    }
+    Some((&s[start..end], end))
+}
+
+/// Parse `%iv = %lb to %ub step %step iter_args(%a = %i, ...)` (region body
+/// already stripped) into `([lb, ub, step, ...inits], {iter_var, iter_args})`.
+/// Port of Python `parse_scf_for`.
+fn parse_scf_for_op(
+    rest: &str,
+) -> Option<(Vec<String>, std::collections::HashMap<String, Attr>)> {
+    let (iter_var, iv_end) = first_ssa(rest)?;
+    let after_iv = &rest[iv_end..];
+    let after_eq = &after_iv[after_iv.find('=')? + 1..];
+    let (lb, _) = first_ssa(after_eq)?;
+    let after_to = &after_eq[after_eq.find(" to ")? + 4..];
+    let (ub, _) = first_ssa(after_to)?;
+    let after_step = &after_to[after_to.find(" step ")? + 6..];
+    let (step, _) = first_ssa(after_step)?;
+
+    let mut operands = vec![lb.to_string(), ub.to_string(), step.to_string()];
+    let mut iter_args: Vec<String> = Vec::new();
+    if let Some(open) = rest.find("iter_args(") {
+        let inner = &rest[open + "iter_args(".len()..];
+        if let Some(close) = inner.find(')') {
+            // pairs `%name = %init`, comma-separated.
+            for pair in inner[..close].split(',') {
+                if let Some((name, _)) = first_ssa(pair) {
+                    let after = &pair[pair.find('=').unwrap_or(0) + 1..];
+                    if let Some((init, _)) = first_ssa(after) {
+                        iter_args.push(name.to_string());
+                        operands.push(init.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut attrs = std::collections::HashMap::new();
+    attrs.insert("iter_var".to_string(), Attr::Str(iter_var.to_string()));
+    if !iter_args.is_empty() {
+        attrs.insert("iter_args".to_string(), Attr::StrList(iter_args));
+    }
+    Some((operands, attrs))
+}
+
+/// Split `%a, %b, ... = rest` (or single `%a = rest`) into the result names and
+/// the RHS, only when the LHS is `%`-names separated by commas (so we don't trip
+/// on `==` or attribute `=`). Generalizes [`split_assignment`] to multi-result.
+fn split_assignment_multi(text: &str) -> Option<(Vec<String>, &str)> {
+    let eq = text.find('=')?;
+    let lhs = text[..eq].trim();
+    let rhs = &text[eq + 1..];
+    if rhs.starts_with('=') || !lhs.starts_with('%') {
+        return None;
+    }
+    let mut names = Vec::new();
+    for part in lhs.split(',') {
+        let p = part.trim();
+        // Each part must be exactly one SSA name (no spaces / extra tokens).
+        if !p.starts_with('%') || p.contains(char::is_whitespace) {
+            return None;
+        }
+        names.push(p.to_string());
+    }
+    Some((names, rhs))
 }
 
 // --- phase 4: ktdp construct-op attribute parsing -----------------------

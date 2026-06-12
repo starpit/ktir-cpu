@@ -437,19 +437,45 @@ fn test_work_splitting_elementwise() {
 
 // --- Test 2: work-splitting matmul ---
 
+/// Port of Python `test_work_splitting_matmul`. The 2-D grid matmul now runs
+/// end-to-end (multi-result `%pid_m, %pid_n = ktdp.get_compute_tile_id` and
+/// `scf.for` parsing both implemented), so `compute_cycles ∝ 1/grid_x` as the
+/// per-core M tile halves each time grid_x doubles (FLOPs = 2·M·N·K, M halves).
 #[test]
-#[ignore = "GAP: 2-D grid matmul needs both pid_m and pid_n from a multi-result \
-            ktdp.get_compute_tile_id (%pid_m, %pid_n = ...). The Rust parser keeps \
-            only the first result name of the comma-separated multi-result form, so \
-            %pid_n is unbound and the kernel fails with 'undefined SSA value' \
-            (confirmed against examples/latency/matmul_small.mlir itself). The same \
-            limitation is documented in port_grid_scheduler.rs. Until 2-D \
-            get_compute_tile_id binding lands, the matmul work-splitting case \
-            (compute_cycles proportional to 1/grid_x as BLOCK_SIZE_M halves) cannot \
-            be exercised end-to-end."]
 fn test_work_splitting_matmul() {
-    // Placeholder for the parametrized grid_x in {2, 4, 8} cases.
-    unimplemented!("2-D get_compute_tile_id result binding not supported");
+    let run = |gx: usize, block_m: usize| -> LatencyReport {
+        let module = parse_module(&matmul_kernel_mlir(gx, 2, block_m))
+            .unwrap_or_else(|e| panic!("parse matmul gx={gx}: {e}"));
+        let cfg = HardwareConfig { num_cores: gx * 2, ..HardwareConfig::default() };
+        let a = vec![0.05f32; 16 * 64];
+        let b = vec![0.05f32; 64 * 64];
+        let c = vec![0.0f32; 16 * 64];
+        let args: Vec<(&str, Arg)> = vec![
+            ("a_ptr", Arg::Tensor { data: a, shape: vec![16, 64], dtype: DType::F16 }),
+            ("b_ptr", Arg::Tensor { data: b, shape: vec![64, 64], dtype: DType::F16 }),
+            ("c_ptr", Arg::Tensor { data: c, shape: vec![16, 64], dtype: DType::F16 }),
+            ("K", Arg::Scalar(Scalar::I64(64))),
+        ];
+        let (_out, report) =
+            execute_function_with_latency(&module, "matmul_kernel_small", &args, cfg)
+                .unwrap_or_else(|e| panic!("run matmul gx={gx}: {e}"));
+        report
+    };
+
+    let base = run(2, 8); // baseline: grid_x=2, BLOCK_SIZE_M=8
+    let base_compute = base.per_core_summary()[0].compute_cycles;
+    for gx in [2usize, 4, 8] {
+        let block_m = 8 * 2 / gx; // 8 → 4 → 2 as grid_x doubles
+        let scaled = run(gx, block_m);
+        assert_eq!(scaled.counters.len(), gx * 2, "core count for grid_x={gx}");
+        // compute_cycles(grid_x) = baseline / (grid_x / 2).
+        let expected = base_compute / (gx as f64 / 2.0);
+        let got = scaled.per_core_summary()[0].compute_cycles;
+        assert!(
+            approx(got, expected, 1e-6),
+            "grid_x={gx}: compute_cycles {got} != expected {expected}"
+        );
+    }
 }
 
 // --- Test 3: work-splitting transcendental ---

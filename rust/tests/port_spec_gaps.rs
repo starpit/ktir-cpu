@@ -112,24 +112,21 @@ fn paged_tensor_indirect_scatter_gap() {
 //   Uses examples/rfc/add-with-control-flow.mlir, func @add. tensor.empty is
 //   implemented; linalg.add is the named gap.
 //
-// In the Rust crate this kernel currently fails earlier, on the loop induction
-// variable ("undefined SSA value: %i" from the scf.forall body), so the
-// linalg.add gap is not reached. The observable behaviour is the same: the
-// kernel does not run to completion. Asserting `is_err()` is faithful to the
-// Python xfail's intent (the kernel cannot execute).
+// The Python xfail is NON-strict and marks a *Python* gap: `linalg.add` is not
+// implemented there. The Rust crate DOES implement `linalg.add` (dialects/
+// linalg.rs), and with `scf.for` parsing now in place the kernel runs to
+// completion — so this gap is closed in Rust (it is ahead of Python here). A
+// non-strict xfail tolerates an xpass, so a passing Rust run is compliant.
 // ===========================================================================
 
 const ADD_WITH_CONTROL_FLOW: &str = include_str!("../../examples/rfc/add-with-control-flow.mlir");
 
 #[test]
-fn linalg_add_tensor_empty_gap() {
-    // Current behaviour: parses, execution fails (observed:
-    // "undefined SSA value: %i"; linalg.add itself is not yet reached).
+fn linalg_add_tensor_empty_runs() {
+    // Rust implements both `scf.for` and `linalg.add`, so the kernel executes
+    // (unlike Python, whose non-strict xfail reflects its missing `linalg.add`).
     let res = run(ADD_WITH_CONTROL_FLOW, "add", &[]);
-    assert!(
-        res.is_err(),
-        "expected add-with-control-flow gap to persist (it ran to completion)"
-    );
+    assert!(res.is_ok(), "add-with-control-flow should now run to completion: {res:?}");
 }
 
 // ===========================================================================
