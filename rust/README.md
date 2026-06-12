@@ -62,4 +62,23 @@ cargo test
 cargo clippy --all-targets
 ```
 
-22 tests, clippy-clean.
+## BLAS acceleration (optional)
+
+`linalg` matmul/dot run on a naive Rust loop by default — portable, deterministic,
+and the parity oracle. For large matmuls, route them through a BLAS library via
+the `blas` umbrella feature plus one **provider** (the `cblas_sgemm` call is
+identical across all of them; only the linked library differs):
+
+```sh
+cargo test --features accelerate        # macOS (Apple Accelerate, AMX)
+cargo test --features openblas          # any: builds OpenBLAS from source
+cargo test --features openblas-system   # Linux: links system libopenblas-dev
+cargo test --features mkl               # x86_64: Intel MKL
+cargo test --features blis              # portable BLIS (good on AMD)
+```
+
+On Linux, prefer **`openblas-system`** (`apt install libopenblas-dev`) — it links
+the distro library instead of compiling OpenBLAS from source. `mkl` is the usual
+x86 performance choice. Because NumPy is itself BLAS-backed, a BLAS provider tends
+to *tighten* matmul parity with the reference rather than loosen it; the
+`blas_matches_naive` test gates that the chosen backend agrees with the oracle.

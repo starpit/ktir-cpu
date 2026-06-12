@@ -11,18 +11,33 @@ description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
 #   ndarray -> Tile storage (the tile.rs dtype fork); half -> f16; regex -> parser.
 [features]
 default = []
-# Route linalg matmul/dot through Apple's Accelerate BLAS (cblas_sgemm, AMX).
-# macOS only; deterministic and — since NumPy is also BLAS-backed — tends to
-# *improve* matmul parity with the reference rather than degrade it. Enable with
-#   cargo build --features accelerate
-# The naive Rust matmul remains the cross-platform default and parity oracle.
-accelerate = ["dep:blas-src", "dep:cblas-sys"]
+
+# `blas` is the umbrella capability: it routes linalg matmul/dot through
+# `cblas_sgemm`. The call is backend-agnostic — every BLAS library exposes the
+# same cblas ABI — so a PROVIDER feature below must also be enabled to pick which
+# library gets linked. Enabling `blas` alone fails to link (no provider). The
+# naive Rust matmul remains the cross-platform default and the parity oracle.
+blas = ["dep:cblas-sys", "dep:blas-src"]
+
+# Providers — pick exactly one. Each implies `blas` and selects the library:
+#   accelerate : macOS only, Apple's Accelerate (AMX-backed). cargo …--features accelerate
+#   openblas   : portable; builds OpenBLAS from source (needs a C/Fortran toolchain).
+#                For a system libopenblas-dev instead, use `openblas-system`.
+#   openblas-system : links the system OpenBLAS (apt install libopenblas-dev).
+#   mkl        : x86_64, Intel MKL (downloaded by intel-mkl-src).
+#   blis       : portable BLIS (good on AMD).
+accelerate      = ["blas", "blas-src/accelerate"]
+openblas        = ["blas", "blas-src/openblas"]
+openblas-system = ["blas", "blas-src/openblas", "openblas-src/system"]
+mkl             = ["blas", "blas-src/intel-mkl"]
+blis            = ["blas", "blas-src/blis"]
 
 [dependencies]
-# Optional, only pulled in under --features accelerate. blas-src provides the
-# Accelerate backend (links the system framework); cblas-sys provides the
-# cblas_sgemm declaration.
-blas-src = { version = "0.10", optional = true, features = ["accelerate"] }
+# All optional — only pulled in by a provider feature. blas-src links the chosen
+# library; cblas-sys provides the cblas_sgemm declaration. `openblas-src` is a
+# direct optional dep purely so `openblas-system` can flip its `system` feature.
+blas-src = { version = "0.10", optional = true, default-features = false }
+openblas-src = { version = "0.10", optional = true, default-features = false }
 cblas-sys = { version = "0.1", optional = true }
 
 [lib]

@@ -18,13 +18,14 @@
 //! backend-agnostic — it just calls `sgemm_rowmajor`.
 
 /// `C(m×n) = A(m×k) · B(k×n)`, all row-major and contiguous.
-#[cfg(not(feature = "accelerate"))]
+#[cfg(not(feature = "blas"))]
 pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     naive_sgemm(m, k, n, a, b)
 }
 
-/// `C(m×n) = A(m×k) · B(k×n)` via Accelerate's `cblas_sgemm`.
-#[cfg(feature = "accelerate")]
+/// `C(m×n) = A(m×k) · B(k×n)` via the linked BLAS `cblas_sgemm` (Accelerate /
+/// OpenBLAS / MKL / BLIS — the cblas ABI is identical across all of them).
+#[cfg(feature = "blas")]
 pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     use cblas_sys::{cblas_sgemm, CBLAS_LAYOUT, CBLAS_TRANSPOSE};
     let mut c = vec![0.0f32; m * n];
@@ -79,10 +80,10 @@ mod tests {
         assert_eq!(sgemm_rowmajor(2, 3, 2, &a, &b), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
-    /// With the accelerate backend on, it must agree with the naive oracle.
-    #[cfg(feature = "accelerate")]
+    /// With any BLAS backend on, `cblas_sgemm` must agree with the naive oracle.
+    #[cfg(feature = "blas")]
     #[test]
-    fn accelerate_matches_naive() {
+    fn blas_matches_naive() {
         let m = 7;
         let k = 5;
         let n = 3;
