@@ -88,6 +88,7 @@ pub fn register(d: &mut Dispatch) {
     d.register("arith.index_cast", LatencyCategory::Zero, index_cast);
     d.register("arith.index_castui", LatencyCategory::Zero, index_cast);
     d.register("arith.convertf", LatencyCategory::Zero, convertf);
+    d.register("arith.bitcast", LatencyCategory::Zero, bitcast);
 }
 
 // ===========================================================================
@@ -489,6 +490,50 @@ fn sitofp(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<
         }
         Value::Index(i) => Ok(Some(Value::Scalar(Scalar::F32(i as f32)))),
         other => Err(format!("arith.sitofp: bad operand {other:?}")),
+    }
+}
+
+/// `%r = arith.bitcast %x : <src> to <dst>` — reinterpret the bits, no value
+/// change. Scalar 32-bit pairs only (`i32`<->`f32`), which covers the ±inf/NaN
+/// bit-pattern idiom (`0xFF800000 : i32` -> `-inf : f32`). Tile bitcasts need
+/// the dtype-faithful storage fork (see tile.rs) and are rejected for now.
+fn bitcast(op: &Operation, ctx: &mut CoreContext, _env: &ExecutionEnv) -> Result<Option<Value>, String> {
+    // result_type is "<src> to <dst>"; take the destination spelling.
+    let dst = op
+        .result_type
+        .as_deref()
+        .and_then(|s| s.rsplit(" to ").next())
+        .map(str::trim)
+        .ok_or("arith.bitcast: missing 'to <type>' result type")?;
+    let dst = DType::parse(dst)?;
+    let v = unary_operand(op, ctx, "arith.bitcast")?;
+    match v {
+        Value::Tile(_) => Err(
+            "arith.bitcast: tile bitcasts require dtype-faithful storage (tile.rs fork); \
+             not yet supported"
+                .into(),
+        ),
+        scalar => {
+            // Extract the 32-bit source pattern (int as-is, float via to_bits).
+            let bits: u32 = match &scalar {
+                Value::Scalar(Scalar::F32(f)) => f.to_bits(),
+                Value::Scalar(s) => s
+                    .as_i64()
+                    .ok_or("arith.bitcast: non-numeric scalar")? as i32 as u32,
+                Value::Index(i) => *i as i32 as u32,
+                other => return Err(format!("arith.bitcast: bad operand {other:?}")),
+            };
+            let out = match dst {
+                DType::F32 => Value::Scalar(Scalar::F32(f32::from_bits(bits))),
+                DType::I32 => Value::Scalar(Scalar::I64(bits as i32 as i64)),
+                other => {
+                    return Err(format!(
+                        "arith.bitcast: unsupported scalar target {other} (32-bit i32/f32 only)"
+                    ))
+                }
+            };
+            Ok(Some(out))
+        }
     }
 }
 

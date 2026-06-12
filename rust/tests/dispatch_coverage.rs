@@ -21,9 +21,10 @@ fn collect_op_types<'a>(ops: &'a [Operation], out: &mut Vec<&'a str>) {
 /// is a regression. When one of these lands, the corresponding file flips to
 /// fully-dispatchable and the test nudges us (via `fully dispatches now`) to
 /// shrink this list.
-const KNOWN_GAP_OPS: &[&str] = &[
-    "arith.bitcast", // needs dtype-faithful Tile storage (the tile.rs fork)
-];
+// Empty: every op the corpus uses now has a handler (or is a scheduler-driven
+// comm op). Tile-level `arith.bitcast` still needs the dtype-faithful storage
+// fork, but the corpus only uses the scalar form, which is implemented.
+const KNOWN_GAP_OPS: &[&str] = &[];
 
 fn missing_handlers(src: &str, label: &str) -> Vec<String> {
     let module = parse_module(src).unwrap_or_else(|e| panic!("{label}: parse failed: {e}"));
