@@ -34,6 +34,33 @@ fn vector_add_executes_end_to_end() {
     assert_eq!(*data, expected, "elementwise x + y mismatch");
 }
 
+// RUST-ONLY (not a port of a Python test): the typed-bytes input path
+// (`Arg::TensorBytes`) feeds pre-encoded f16 straight to HBM and must produce
+// the identical result to the f32 `Arg::Tensor` path (which narrows on the way
+// in) — proving the f32 round-trip is avoidable with no behavior change.
+#[test]
+fn tensor_bytes_input_matches_f32_path() {
+    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let module = parse_module(src).expect("parse vector_add");
+    let n = 4096usize;
+    let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+    let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+
+    // Pre-encode the inputs to f16 bytes (what a real f16 host runner holds).
+    let enc = |v: &[f32]| ktir_cpu::codec::encode(v, DType::F16);
+    let args = [
+        ("x_ptr", Arg::TensorBytes { data: enc(&x), shape: vec![n], dtype: DType::F16 }),
+        ("y_ptr", Arg::TensorBytes { data: enc(&y), shape: vec![n], dtype: DType::F16 }),
+        ("output_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
+    ];
+    let outputs = execute_function(&module, "add_kernel", &args).expect("run add_kernel");
+    let Output { data, .. } = outputs.get("output_ptr").expect("output_ptr present");
+
+    let expected: Vec<f32> = x.iter().zip(&y).map(|(a, b)| a + b).collect();
+    assert_eq!(*data, expected, "TensorBytes f16 path must match the f32 path");
+}
+
 #[test]
 fn vector_add_latency_report_is_populated() {
     let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");

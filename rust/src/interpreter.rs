@@ -244,7 +244,14 @@ pub fn single_core_context() -> CoreContext {
 /// directly). Mirrors the `np.ndarray` vs scalar split in `execute_function`.
 #[derive(Clone, Debug)]
 pub enum Arg {
+    /// f32 host data, narrowed to `dtype` on the way into HBM. The dtype-agnostic
+    /// oracle path — convenient, but for an all-f16 model it pays an f32→f16
+    /// narrow per input (and f16→f32 widen per output) and 2× host memory.
     Tensor { data: Vec<f32>, shape: Vec<usize>, dtype: DType },
+    /// Pre-encoded typed bytes (already in `dtype` layout, e.g. f16), copied
+    /// straight into HBM with no conversion — mirrors Spyre's typed host→AIU DMA.
+    /// Use this to avoid the f32 round-trip for typed (f16/…) host buffers.
+    TensorBytes { data: Vec<u8>, shape: Vec<usize>, dtype: DType },
     Scalar(Scalar),
 }
 
@@ -338,18 +345,34 @@ fn marshal_inputs(
 ) -> (Vec<(String, Value)>, Vec<TensorMeta>) {
     let mut input_ptrs: Vec<(String, Value)> = Vec::new();
     let mut tensor_meta: Vec<TensorMeta> = Vec::new();
+    // Allocate an HBM stick, write `bytes`, and record the read-back metadata.
+    fn place(
+        mem: &SpyreMemoryHierarchy,
+        input_ptrs: &mut Vec<(String, Value)>,
+        tensor_meta: &mut Vec<TensorMeta>,
+        name: &str,
+        bytes: Vec<u8>,
+        shape: &[usize],
+        dtype: DType,
+    ) {
+        let stick = {
+            let mut hbm = mem.hbm.borrow_mut();
+            let stick = hbm.allocate(bytes.len() as i64);
+            hbm.write_bytes(stick * STICK_BYTES, &bytes);
+            stick
+        };
+        input_ptrs.push((name.to_string(), Value::Index(stick)));
+        tensor_meta.push((name.to_string(), stick, shape.iter().product(), shape.to_vec(), dtype));
+    }
     for (name, arg) in args {
         match arg {
+            // f32 host data: narrow to `dtype` on the way in.
             Arg::Tensor { data, shape, dtype } => {
-                let bytes = codec::encode(data, *dtype);
-                let stick = {
-                    let mut hbm = mem.hbm.borrow_mut();
-                    let stick = hbm.allocate(bytes.len() as i64);
-                    hbm.write_bytes(stick * STICK_BYTES, &bytes);
-                    stick
-                };
-                input_ptrs.push((name.to_string(), Value::Index(stick)));
-                tensor_meta.push((name.to_string(), stick, shape.iter().product(), shape.clone(), *dtype));
+                place(mem, &mut input_ptrs, &mut tensor_meta, name, codec::encode(data, *dtype), shape, *dtype)
+            }
+            // Pre-encoded typed bytes: straight to HBM, no conversion.
+            Arg::TensorBytes { data, shape, dtype } => {
+                place(mem, &mut input_ptrs, &mut tensor_meta, name, data.clone(), shape, *dtype)
             }
             Arg::Scalar(s) => input_ptrs.push((name.to_string(), Value::Scalar(*s))),
         }
