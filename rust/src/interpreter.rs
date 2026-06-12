@@ -258,9 +258,15 @@ pub enum Arg {
 /// A tensor read back from HBM after execution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Output {
+    /// Values widened to f32 — the dtype-agnostic oracle view.
     pub data: Vec<f32>,
     pub shape: Vec<usize>,
     pub dtype: DType,
+    /// The raw `dtype`-encoded HBM bytes (e.g. f16), undecoded. Lets a typed
+    /// host runner thread an f16 output straight into the next node's
+    /// [`Arg::TensorBytes`] input with no f16→f32→f16 round-trip. `data` is
+    /// `decode(raw)`; the two are equivalent.
+    pub raw: Vec<u8>,
 }
 
 /// Execute a function with tensor + scalar arguments and return every tensor
@@ -518,7 +524,8 @@ fn read_back(
     for (name, stick, n, shape, dtype) in tensor_meta {
         let nbytes = n * dtype.bytes_per_elem();
         let bytes = mem.hbm.borrow().read_bytes(stick * STICK_BYTES, nbytes);
-        outputs.insert(name, Output { data: codec::decode(&bytes, n, dtype), shape, dtype });
+        let data = codec::decode(&bytes, n, dtype);
+        outputs.insert(name, Output { data, shape, dtype, raw: bytes });
     }
     Ok(outputs)
 }

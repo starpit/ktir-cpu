@@ -61,6 +61,45 @@ fn tensor_bytes_input_matches_f32_path() {
     assert_eq!(*data, expected, "TensorBytes f16 path must match the f32 path");
 }
 
+// RUST-ONLY (not a port of a Python test): the output side of the typed-bytes
+// feature — `Output.raw` is the undecoded f16 HBM bytes, and `data == decode(raw)`.
+// A typed host runner can thread `output.raw` straight into the next node's
+// `Arg::TensorBytes` with no f16→f32→f16 round-trip. Demonstrated by feeding one
+// kernel's raw output back as another's input.
+#[test]
+fn output_raw_bytes_thread_without_roundtrip() {
+    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let module = parse_module(src).expect("parse vector_add");
+    let n = 4096usize;
+    let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+    let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+
+    let enc = |v: &[f32]| ktir_cpu::codec::encode(v, DType::F16);
+    let args = [
+        ("x_ptr", Arg::TensorBytes { data: enc(&x), shape: vec![n], dtype: DType::F16 }),
+        ("y_ptr", Arg::TensorBytes { data: enc(&y), shape: vec![n], dtype: DType::F16 }),
+        ("output_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
+    ];
+    let out = execute_function(&module, "add_kernel", &args).expect("run add_kernel");
+    let o = out.get("output_ptr").expect("output_ptr present");
+
+    // raw is the f16-encoded HBM bytes; data is its decode; sizes line up.
+    assert_eq!(o.raw.len(), n * 2, "f16 raw bytes are 2 per element");
+    assert_eq!(o.raw, enc(&o.data), "raw must equal encode(data)");
+
+    // Thread the raw output back as a TensorBytes input — no widen/narrow.
+    let args2 = [
+        ("x_ptr", Arg::TensorBytes { data: o.raw.clone(), shape: vec![n], dtype: DType::F16 }),
+        ("y_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        ("output_ptr", Arg::TensorBytes { data: vec![0u8; n * 2], shape: vec![n], dtype: DType::F16 }),
+        ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
+    ];
+    let out2 = execute_function(&module, "add_kernel", &args2).expect("run add_kernel again");
+    // x + 0 == x == previous (x + y).
+    assert_eq!(out2.get("output_ptr").unwrap().data, o.data);
+}
+
 #[test]
 fn vector_add_latency_report_is_populated() {
     let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
