@@ -54,9 +54,11 @@ pub fn parse_module(text: &str) -> Result<IRModule, String> {
 
 // --- phase 1: structure --------------------------------------------------
 
-/// Strip `// ...` line comments. Mirrors `_preprocess_text`.
+/// Strip `// ...` line comments, preserving line structure (newline count).
+/// Mirrors `_preprocess_text`. Uses `split('\n')` rather than `lines()` so a
+/// trailing newline is kept — the line count is invariant under stripping.
 pub fn strip_comments(text: &str) -> String {
-    text.lines()
+    text.split('\n')
         .map(|line| match line.find("//") {
             Some(i) => &line[..i],
             None => line,

@@ -70,20 +70,32 @@ fn subx(a: AffineExpr, b: AffineExpr) -> AffineExpr {
 // ===========================================================================
 
 #[test]
-#[ignore = "GAP: tokeniser (_tokenise) is a private impl detail in the Rust crate; no public analogue"]
-fn tokenise_simple_map_inner() {}
+fn tokenise_simple_map_inner() {
+    assert_eq!(
+        ktir_cpu::parser_ast::tokenise("(d0, d1) -> (d0, d1)"),
+        ["(", "d0", ",", "d1", ")", "->", "(", "d0", ",", "d1", ")"]
+    );
+}
 
 #[test]
-#[ignore = "GAP: tokeniser (_tokenise) is a private impl detail in the Rust crate; no public analogue"]
-fn tokenise_constraint_tokens() {}
+fn tokenise_constraint_tokens() {
+    let tokens = ktir_cpu::parser_ast::tokenise("(d0 >= 0, -d0 + 63 >= 0)");
+    assert!(tokens.iter().any(|t| t == ">="));
+    assert!(tokens.iter().any(|t| t == "0"));
+}
 
 #[test]
-#[ignore = "GAP: tokeniser (_tokenise) is a private impl detail in the Rust crate; no public analogue"]
-fn tokenise_arrow_token() {}
+fn tokenise_arrow_token() {
+    assert!(ktir_cpu::parser_ast::tokenise("(d0) -> (d0)").iter().any(|t| t == "->"));
+}
 
 #[test]
-#[ignore = "GAP: tokeniser (_tokenise) is a private impl detail in the Rust crate; no public analogue"]
-fn tokenise_whitespace_ignored() {}
+fn tokenise_whitespace_ignored() {
+    assert_eq!(
+        ktir_cpu::parser_ast::tokenise("(d0)->(d0)"),
+        ktir_cpu::parser_ast::tokenise("( d0 ) -> ( d0 )")
+    );
+}
 
 // ===========================================================================
 // Expression parsing — TestParseExpr (parse_expr / eval_expr)
@@ -540,12 +552,18 @@ fn enumerate_symbolic_symbol_larger_than_shape() {
 // ===========================================================================
 
 #[test]
-#[ignore = "GAP: tokeniser (_tokenise) is a private impl detail in the Rust crate; no public analogue"]
-fn tokenise_eq_operator() {}
+fn tokenise_eq_operator() {
+    assert!(ktir_cpu::parser_ast::tokenise("(g == 0)").iter().any(|t| t == "=="));
+}
 
 #[test]
-#[ignore = "GAP: tokeniser (_tokenise) is a private impl detail in the Rust crate; no public analogue"]
-fn tokenise_eq_before_geq() {}
+fn tokenise_eq_before_geq() {
+    // `==` must be one token, not two `=`; and `>=` distinct.
+    let tokens = ktir_cpu::parser_ast::tokenise("(d0 == 1, d1 >= 0)");
+    assert!(tokens.iter().any(|t| t == "=="));
+    assert!(tokens.iter().any(|t| t == ">="));
+    assert!(!tokens.iter().any(|t| t == "="));
+}
 
 #[test]
 fn parse_eq_simple() {

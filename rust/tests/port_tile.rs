@@ -362,17 +362,20 @@ fn non_contiguous_store_stride_larger_than_extent() {
 // ===========================================================================
 
 #[test]
-#[ignore = "GAP: MemoryOps._is_contiguous is a private crate helper (ops_memory::is_contiguous, \
-            #[cfg(test)] only) with no public surface. The contiguous/strided distinction it gates \
-            is verified observably by strided_load_no_coords / non_contiguous_stride_larger_than_extent \
-            (slow gather path) and load_after_tile_access / tile_access_3d_load (fast contiguous span)."]
-fn is_contiguous_predicate() {}
+fn is_contiguous_predicate() {
+    use ktir_cpu::ops_memory::is_contiguous;
+    assert!(is_contiguous(&[3, 4], &[4, 1]));
+    assert!(is_contiguous(&[5], &[1]));
+    assert!(!is_contiguous(&[3, 4], &[8, 1])); // row stride too large (sub-tile)
+    assert!(!is_contiguous(&[3, 4], &[4, 2])); // col stride > 1
+}
 
 #[test]
-#[ignore = "GAP: _is_contiguous 3D predicate — same private-helper limitation as is_contiguous_predicate; \
-            covered observably by tile_access_3d_load (row-major [12,4,1] fast path) and \
-            non_contiguous_stride_larger_than_extent."]
-fn is_contiguous_3d_predicate() {}
+fn is_contiguous_3d_predicate() {
+    use ktir_cpu::ops_memory::is_contiguous;
+    assert!(is_contiguous(&[2, 3, 4], &[12, 4, 1])); // row-major 3-D
+    assert!(!is_contiguous(&[2, 3, 4], &[24, 4, 1])); // outer stride too large
+}
 
 // ===========================================================================
 // TestTileOps — affine attributes preserved after parsing the example MLIR.

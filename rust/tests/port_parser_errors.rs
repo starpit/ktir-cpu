@@ -301,28 +301,45 @@ garbage-passthrough behaviour is covered by parse_module_garbage_op_line_skipped
 fn parse_operation_text_bare_helper() {}
 
 #[test]
-#[ignore = "GAP: no public _is_op_complete. Python's type-terminal / \
-void-terminator / no-false-match-on-SSA-names suite tests an internal boundary \
-predicate directly. Its observable effects (blank-line flush, SSA-assignment \
-flush) are covered by blank_line_flushes_op and ssa_assignment_flushes_previous_op."]
-fn is_op_complete_predicate() {}
+fn is_op_complete_predicate() {
+    use ktir_cpu::parser::is_op_complete;
+    // Type terminals: scalar / index / tensor types are complete.
+    assert!(is_op_complete("%x = arith.addf %a, %b : f32"));
+    assert!(is_op_complete("%x = arith.addi %a, %b : index"));
+    assert!(is_op_complete("%x = arith.addi %a, %b : i32"));
+    assert!(is_op_complete("%t = ktdp.load %a : tensor<128xf16>"));
+    // Void terminators are complete.
+    assert!(is_op_complete("return"));
+    assert!(is_op_complete("scf.yield %a"));
+    // No type terminal yet -> not complete (relies on a later flush).
+    assert!(!is_op_complete("linalg.reduce ins(%x) dimensions = [1]"));
+}
 
 #[test]
-#[ignore = "GAP: no public _preprocess_text returning a stripped string. \
-Python's test_preprocess_strips_inline_comments / \
-_full_line_comment_becomes_blank assert on the returned string shape \
-(line-count preservation, '//' removal). The Rust strip_comments helper is \
-private; comment stripping is observed end-to-end via parse_module_comments_only \
-and parse_module_unicode_in_comments."]
-fn preprocess_text_string_shape() {}
+fn preprocess_text_string_shape() {
+    use ktir_cpu::parser::strip_comments;
+    let text = "  %x = arith.addf %a, %b : f32  // add\n  return\n";
+    let result = strip_comments(text);
+    assert!(!result.contains("//"));
+    assert!(result.contains("%x = arith.addf"));
+    assert!(result.contains("return"));
+    // Line structure preserved (newline count invariant).
+    assert_eq!(result.matches('\n').count(), text.matches('\n').count());
+    // A full-line comment becomes blank but the line remains.
+    let r2 = strip_comments("    // this is a comment\n");
+    assert!(!r2.contains("//"));
+    assert_eq!(r2.matches('\n').count(), 1);
+}
 
 #[test]
-#[ignore = "GAP: arith.constant with a general `{ ... }` attribute block is not \
-supported by the Rust structural slice (it tries to parse `{` as the int \
-literal and returns Err). Python's \
-test_percent_in_comment_not_misclassified_as_region / \
-_inside_attribute_block use `%x = arith.constant { value = 42 : i32 } : index` \
-to assert ZERO regions for an attribute block; that op form does not parse in \
-Rust. The positive region-detection case is covered by \
-region_with_percent_in_comment_still_detected."]
-fn arith_constant_attribute_block_region_detection() {}
+fn arith_constant_attribute_block_region_detection() {
+    // `arith.constant { value = 42 : i32 }` — the `{ }` is an attribute block,
+    // NOT a region (no `%` SSA refs inside): the op parses with ZERO regions.
+    let src = "module {\n  func.func @f() {\n    \
+               %x = arith.constant { value = 42 : i32 } : index\n    return\n  }\n}";
+    let module = parse_module(src).expect("attribute-block constant parses");
+    let f = module.get_function("f").unwrap();
+    let c = f.operations.iter().find(|o| o.op_type == "arith.constant").expect("constant op");
+    assert!(c.regions.is_empty(), "attribute block must not be a region");
+    assert_eq!(c.attributes.get("value"), Some(&ktir_cpu::ir::Attr::Int(42)));
+}
