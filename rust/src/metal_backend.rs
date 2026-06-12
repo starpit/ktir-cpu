@@ -1017,6 +1017,86 @@ inline float simd_epilogue(float v, float ev, uint binop, uint act) {
 #[cfg(metal)]
 type MtlBuf = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>;
 
+/// Page-aligned host allocation, freed on drop. Backs a [`UnifiedBuffer`].
+#[cfg(metal)]
+struct AlignedAlloc {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+#[cfg(metal)]
+impl Drop for AlignedAlloc {
+    fn drop(&mut self) {
+        // SAFETY: ptr/layout came from the matching alloc in UnifiedBuffer::new.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+    }
+}
+
+/// A **zero-copy** unified-memory tensor: page-aligned host memory wrapped as a
+/// Metal buffer via `newBufferWithBytesNoCopy`. The CPU accesses it as `&[f32]`
+/// and the GPU as an `MTLBuffer` — they share the *same bytes*, so a matmul over
+/// `UnifiedBuffer`s has no host↔device fill or readback (the ~600 µs of copies
+/// the host-`Vec` path pays). This is the right primitive for Apple's unified
+/// memory; tile storage backed by these makes the whole compute path copy-free.
+///
+/// Field order matters: `mtl` is released before `alloc` frees the memory.
+#[cfg(metal)]
+pub struct UnifiedBuffer {
+    mtl: MtlBuf,
+    alloc: AlignedAlloc,
+    len: usize,
+}
+
+#[cfg(metal)]
+impl UnifiedBuffer {
+    /// Allocate `len` f32s of page-aligned, GPU-shared, zero-initialized memory.
+    pub fn new(
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        len: usize,
+    ) -> Result<Self, String> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        const PAGE: usize = 16 * 1024; // Apple Silicon page size
+        let bytes = (len * 4).max(4).next_multiple_of(PAGE);
+        let layout = std::alloc::Layout::from_size_align(bytes, PAGE).map_err(|e| e.to_string())?;
+        // SAFETY: non-zero layout; zeroed so unused tail is defined.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err("UnifiedBuffer: alloc failed".into());
+        }
+        // SAFETY: ptr is page-aligned and `bytes` long; deallocator None means we
+        // (AlignedAlloc) own the memory and free it after the buffer is released.
+        let mtl = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(
+                std::ptr::NonNull::new(ptr as *mut std::ffi::c_void).unwrap(),
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        }
+        .ok_or("UnifiedBuffer: newBufferWithBytesNoCopy returned nil")?;
+        Ok(Self { mtl, alloc: AlignedAlloc { ptr, layout }, len })
+    }
+
+    /// Build a unified buffer initialized from `data` (one copy in; thereafter
+    /// the GPU reads it in place with no further copies).
+    pub fn from_slice(
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        data: &[f32],
+    ) -> Result<Self, String> {
+        let mut b = Self::new(device, data.len())?;
+        b.as_mut_slice().copy_from_slice(data);
+        Ok(b)
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        // SAFETY: alloc holds len f32s of live, aligned, initialized memory.
+        unsafe { std::slice::from_raw_parts(self.alloc.ptr as *const f32, self.len) }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
+        // SAFETY: as above; &mut self gives exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.alloc.ptr as *mut f32, self.len) }
+    }
+}
+
 /// Persistent per-context scratch buffers, grown on demand and reused across
 /// `run` calls so repeated matmuls pay no per-call allocation. Shared-storage
 /// (unified memory), so the host fills/reads them via `contents()` directly.
@@ -1212,6 +1292,77 @@ impl NaxGemm {
         let raw =
             unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
         Ok(raw.to_vec())
+    }
+
+    /// Zero-copy matmul: `C = act(A·B BINOP E)` where A, B, C (and optional E)
+    /// are [`UnifiedBuffer`]s already resident in shared memory. Encodes their
+    /// buffers directly — no host↔device fill or readback. `c` must be sized
+    /// `m·n`. This is the copy-free path unified memory makes possible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_unified(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &UnifiedBuffer,
+        b: &UnifiedBuffer,
+        c: &mut UnifiedBuffer,
+        e: Option<&UnifiedBuffer>,
+        epi: Epilogue,
+    ) -> Result<(), String> {
+        use objc2_metal::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+            MTLSize,
+        };
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+        assert_eq!(a.len, m * k, "A must be m×k");
+        assert_eq!(b.len, k * n, "B must be k×n");
+        assert_eq!(c.len, m * n, "C must be m×n");
+
+        let dims = [m as u32, n as u32, k as u32];
+        let codes = [epi.binop, epi.act];
+        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer nil")?;
+        let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
+        enc.setComputePipelineState(&self.pipeline);
+        let e_mtl = e.unwrap_or(b); // dummy when binop==0 (never dereferenced)
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&a.mtl), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&b.mtl), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&c.mtl), 0, 2);
+            enc.setBytes_length_atIndex(
+                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&dims),
+                3,
+            );
+            enc.setBuffer_offset_atIndex(Some(&e_mtl.mtl), 0, 4);
+            enc.setBytes_length_atIndex(
+                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&codes),
+                5,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: n.div_ceil(self.block_n),
+                height: m.div_ceil(self.block_m),
+                depth: 1,
+            },
+            MTLSize { width: self.threads, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        Ok(())
+    }
+
+    /// Allocate a [`UnifiedBuffer`] on this context's device.
+    pub fn unified(&self, len: usize) -> Result<UnifiedBuffer, String> {
+        UnifiedBuffer::new(&self.device, len)
+    }
+    /// A [`UnifiedBuffer`] initialized from host data.
+    pub fn unified_from(&self, data: &[f32]) -> Result<UnifiedBuffer, String> {
+        UnifiedBuffer::from_slice(&self.device, data)
     }
 
     /// Run a chain of left-associated matmuls in ONE command buffer with a single
@@ -1805,6 +1956,53 @@ kernel void mpp_probe(
             combined * 1e6,
             amx_loop * 1e6,
             amx_loop / combined
+        );
+    }
+
+    /// Zero-copy unified-memory matmul: correct, and free of the host↔device
+    /// fill/readback the copy-based `run` pays (CPU and GPU share the bytes).
+    #[test]
+    fn unified_matmul_zero_copy_matches_and_is_faster() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => return,
+            Err(e) => panic!("{e}"),
+        };
+        let (m, k, n) = (4096usize, 1024usize, 1024usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect();
+
+        let ua = ctx.unified_from(&a).unwrap();
+        let ub = ctx.unified_from(&b).unwrap();
+        let mut uc = ctx.unified(m * n).unwrap();
+        ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE).unwrap();
+
+        // Correctness vs the copy-based path (same kernel, identical result).
+        let want = ctx.run(m, k, n, &a, &b).unwrap();
+        let mut max_abs = 0.0f32;
+        for (g, w) in uc.as_slice().iter().zip(&want) {
+            max_abs = max_abs.max((g - w).abs());
+        }
+        assert!(max_abs < 1e-3, "unified vs copy-path differ by {max_abs}");
+
+        // Speed: zero-copy (operands already resident) vs run() which fills A,B
+        // and reads C back every call.
+        let it = 50;
+        let t0 = std::time::Instant::now();
+        for _ in 0..it {
+            ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE).unwrap();
+        }
+        let zc = t0.elapsed().as_secs_f64() / it as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..it {
+            std::hint::black_box(ctx.run(m, k, n, &a, &b).unwrap());
+        }
+        let copied = t1.elapsed().as_secs_f64() / it as f64;
+        eprintln!(
+            "unified {m}×{k}×{n}: zero-copy {:.0} µs vs copy-path {:.0} µs  ({:.2}× faster, copies removed)",
+            zc * 1e6,
+            copied * 1e6,
+            copied / zc
         );
     }
 
