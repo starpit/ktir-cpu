@@ -63,6 +63,18 @@ impl Dispatch {
         d
     }
 
+    /// Process-wide shared dispatch table, built once. The registry is immutable
+    /// after construction (op-name -> fn pointer, plus the parallel latency map),
+    /// so there is no reason to rebuild it per call — `execute_function` does so
+    /// once per node, ~271K times in a real-model run, which the profile flagged.
+    /// Function pointers are `Send + Sync`, so the `&'static` table is safe to
+    /// share across the grid's SPMD threads.
+    pub fn shared() -> &'static Dispatch {
+        use std::sync::OnceLock;
+        static SHARED: OnceLock<Dispatch> = OnceLock::new();
+        SHARED.get_or_init(Dispatch::new)
+    }
+
     /// Called by dialect modules. Mirrors the `@register(name, latency_category)` decorator.
     pub fn register(&mut self, op_name: &'static str, cat: LatencyCategory, f: HandlerFn) {
         self.handlers.insert(op_name, f);

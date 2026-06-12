@@ -285,7 +285,7 @@ pub fn execute_function(
 
     let mem = SpyreMemoryHierarchy::new(num_cores.max(1));
     let grid = GridExecutor::new(func.grid);
-    let dispatch = Dispatch::new();
+    let dispatch = Dispatch::shared();
 
     let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
 
@@ -296,7 +296,7 @@ pub fn execute_function(
         &mem,
         &func.operations,
         &input_ptrs,
-        &dispatch,
+        dispatch,
         None,
     )?;
 
@@ -321,7 +321,7 @@ pub fn execute_function_with_latency(
 
     let mem = SpyreMemoryHierarchy::new(num_cores.max(1));
     let grid = GridExecutor::new(func.grid);
-    let dispatch = Dispatch::new();
+    let dispatch = Dispatch::shared();
     let tracker = RefCell::new(crate::latency::LatencyTracker::new(config));
 
     let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
@@ -331,7 +331,7 @@ pub fn execute_function_with_latency(
         &mem,
         &func.operations,
         &input_ptrs,
-        &dispatch,
+        dispatch,
         Some(&tracker),
     )?;
 
@@ -423,8 +423,8 @@ pub fn execute_function_gpu(
 
     let mem = SpyreMemoryHierarchy::new(num_cores);
     let grid = GridExecutor::new(func.grid);
-    let dispatch = Dispatch::new();
-    let env = ExecutionEnv::new(&dispatch, &grid);
+    let dispatch = Dispatch::shared();
+    let env = ExecutionEnv::new(dispatch, &grid);
     let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
 
     let mut ctxs: Vec<CoreContext> = (0..num_cores)
