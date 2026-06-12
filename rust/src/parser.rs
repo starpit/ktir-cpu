@@ -792,7 +792,13 @@ fn parse_memory_space(text: &str) -> (String, Option<i64>) {
 /// static shape; the dtype stops at the first `,`/`>`/whitespace (so an encoding
 /// attribute like `tensor<4x4xf32, #enc>` yields `f32`). E.g.
 /// `tensor<1x4xf16>` -> `([1, 4], "f16")`, `tensor<2xindex>` -> `([2], "index")`.
-fn parse_tensor_type(ty: &str) -> Option<(Vec<i64>, String)> {
+/// Parse a `tensor<...>` type into `(shape, dtype)`, or `None` if not a tensor
+/// type. Port of Python `parser_utils.parse_tensor_type`: anchors at the start
+/// (so trailing context after `>` is ignored, e.g. `tensor<4xf32> loc(...)`) and
+/// takes the dtype as the leading element type, stopping at `,` (so an encoding
+/// attribute like `tensor<4x4xf32, #enc>` yields `f32`). Public so the port
+/// tests can exercise it directly, as the Python suite does.
+pub fn parse_tensor_type(ty: &str) -> Option<(Vec<i64>, String)> {
     // Drop whitespace so `tensor< 2 x f32 >` tokenizes like `tensor<2xf32>`.
     let compact: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
     let mut s = compact.strip_prefix("tensor<")?;

@@ -31,36 +31,16 @@
 //!   Python case is `#[ignore = "GAP: ..."]` with the divergence documented,
 //!   rather than weakening the assertion to match the buggy Rust output.
 
-use ktir_cpu::ir::Attr;
-use ktir_cpu::parser::parse_module;
-
 /// Parse `tensor.empty() : <type_str>` inside a one-function module and return
 /// the parsed `(shape, dtype)` the structural parser derived from the result
 /// type — `None` when the helper rejected the type (no `shape`/`dtype` attrs).
 ///
-/// This is the observable proxy for `parse_tensor_type(type_str)`.
+/// Calls the public `parser::parse_tensor_type` helper directly, exactly as the
+/// Python suite calls `parser_utils.parse_tensor_type` — not through a parsed
+/// module, so trailing-context / encoding-attribute handling is the helper's,
+/// matching Python.
 fn parse_tensor_type(type_str: &str) -> Option<(Vec<i64>, String)> {
-    let src = format!(
-        "module {{\n  func.func @f() {{\n    %t = tensor.empty() : {type_str}\n    return\n  }}\n}}"
-    );
-    let module =
-        parse_module(&src).unwrap_or_else(|e| panic!("parse failed for {type_str:?}: {e}"));
-    let f = module.get_function("f").expect("function f");
-    let op = f
-        .operations
-        .iter()
-        .find(|o| o.op_type == "tensor.empty")
-        .expect("tensor.empty op present");
-
-    match (op.attributes.get("shape"), op.attributes.get("dtype")) {
-        (Some(Attr::IntList(shape)), Some(Attr::Str(dtype))) => {
-            Some((shape.clone(), dtype.clone()))
-        }
-        // Neither set -> the helper returned `None`.
-        (None, None) => None,
-        // Anything else is an internal contract violation, not a Python case.
-        (s, d) => panic!("unexpected attr shapes for {type_str:?}: shape={s:?} dtype={d:?}"),
-    }
+    ktir_cpu::parser::parse_tensor_type(type_str)
 }
 
 /// Assert `parse_tensor_type` produced the expected `(shape, dtype)`.
@@ -181,7 +161,6 @@ fn parse_tensor_type_dynamic_dims_dropped() {
 // The second form (`dense<0> : tensor<8xi1>`) additionally trips the naive
 // `strip_suffix('>')` + `split('x')`, producing a garbage dtype `"i1>"`.
 // Asserting the buggy strings would weaken the test, so this is ignored.
-#[ignore = "exotic: tensor encoding with a nested `dense<..> : tensor<..>` confuses result-type extraction (last-colon split); not emitted by lowered KTIR"]
 #[test]
 fn parse_tensor_type_encoding_attribute() {
     assert_parsed("tensor<4x4xf32, #my_enc>", &[4, 4], "f32");
