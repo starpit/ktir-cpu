@@ -22,7 +22,6 @@ fn collect_op_types<'a>(ops: &'a [Operation], out: &mut Vec<&'a str>) {
 /// fully-dispatchable and the test nudges us (via `fully dispatches now`) to
 /// shrink this list.
 const KNOWN_GAP_OPS: &[&str] = &[
-    "ktdp.reduce",   // cross-core comm op — needs the CommOp state machine
     "arith.bitcast", // needs dtype-faithful Tile storage (the tile.rs fork)
 ];
 
@@ -34,7 +33,10 @@ fn missing_handlers(src: &str, label: &str) -> Vec<String> {
         let mut types = Vec::new();
         collect_op_types(&func.operations, &mut types);
         for t in types {
-            if dispatch.handler(t).is_none() && !missing.iter().any(|m| m == t) {
+            // An op is executable if it has a normal handler OR is a comm op
+            // (driven by the scheduler, not the dispatch table).
+            let covered = dispatch.handler(t).is_some() || ktir_cpu::comm_sched::is_comm_op(t);
+            if !covered && !missing.iter().any(|m| m == t) {
                 missing.push(t.to_string());
             }
         }

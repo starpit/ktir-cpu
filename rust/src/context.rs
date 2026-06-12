@@ -31,6 +31,10 @@ pub struct CoreContext {
     lx_bytes: HashMap<String, i64>,
     /// Bump-allocator watermarks; `len == scope_stack.len() - 1`.
     lx_next_ptr_stack: Vec<i64>,
+    /// Pending cross-core sends `(dst_core, tile)`, drained by the comm
+    /// scheduler after each step. The Rust analogue of Python's scheduler-wired
+    /// `send_fn` (set by `attach_scheduler`).
+    outbox: Vec<(usize, crate::tile::Tile)>,
 }
 
 impl CoreContext {
@@ -50,7 +54,19 @@ impl CoreContext {
             scope_stack: vec![HashMap::new()],
             lx_bytes: HashMap::new(),
             lx_next_ptr_stack: Vec::new(),
+            outbox: Vec::new(),
         }
+    }
+
+    /// Queue `tile` for delivery to `dst_core`. Mirrors `send_to`; the comm
+    /// scheduler drains the outbox after each step and routes the message.
+    pub fn send_to(&mut self, dst_core: usize, tile: crate::tile::Tile) {
+        self.outbox.push((dst_core, tile));
+    }
+
+    /// Take and clear all pending sends (called by the comm scheduler).
+    pub fn drain_outbox(&mut self) -> Vec<(usize, crate::tile::Tile)> {
+        std::mem::take(&mut self.outbox)
     }
 
     /// Grid coordinate for a dimension (0=x, 1=y, 2=z). Mirrors `get_grid_id`.

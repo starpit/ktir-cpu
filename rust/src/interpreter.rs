@@ -115,9 +115,9 @@ pub struct Output {
 
 /// Execute a function with tensor + scalar arguments and return every tensor
 /// argument read back from HBM. Port of `KTIRInterpreter.execute_function`
-/// (without latency tracking yet, and with the comm-free multi-core driver —
-/// each core runs the body independently against shared HBM; the comm
-/// scheduler lands in a later slice).
+/// (latency tracking is an optional add-on, see `latency.rs`). Cores are driven
+/// by the comm scheduler (`comm_sched`), so cross-core collectives work; cores
+/// with no comm op just run their body to completion against shared HBM.
 pub fn execute_function(
     module: &IRModule,
     func_name: &str,
@@ -130,7 +130,6 @@ pub fn execute_function(
     let mem = SpyreMemoryHierarchy::new(num_cores.max(1));
     let grid = GridExecutor::new(func.grid);
     let dispatch = Dispatch::new();
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
 
     // Allocate tensor inputs in HBM (stick index bound as the pointer); scalars
     // bind directly. Record tensor metadata for read-back.
@@ -159,22 +158,15 @@ pub fn execute_function(
         }
     }
 
-    // Drive each core independently (no cross-core comm in this slice).
-    for core_id in 0..num_cores.max(1) {
-        let grid_pos = grid.linear_to_grid(core_id);
-        let mut ctx = CoreContext::new(
-            core_id,
-            grid_pos,
-            Rc::clone(&mem.hbm),
-            mem.get_lx(core_id),
-            mem.lx_scratchpads.clone(),
-        );
-        for (name, val) in &input_ptrs {
-            ctx.set_value(name, val.clone());
-        }
-        execute_ops(&func.operations, &mut ctx, &env)
-            .map_err(|e| format!("core {core_id}: {e}"))?;
-    }
+    // Drive all cores via the comm scheduler (cores with no comm op simply run
+    // to completion; ring/collective ops suspend and resume through it).
+    crate::comm_sched::execute_with_communication(
+        &grid,
+        &mem,
+        &func.operations,
+        &input_ptrs,
+        &dispatch,
+    )?;
 
     // Read tensor args back from HBM.
     let mut outputs = HashMap::new();

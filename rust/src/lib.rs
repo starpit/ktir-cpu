@@ -14,6 +14,7 @@
 pub mod affine;
 pub mod codec;
 pub mod comm;
+pub mod comm_sched;
 pub mod context;
 pub mod dialects;
 pub mod dtypes;
