@@ -118,13 +118,17 @@ impl MatmulBackend {
     }
 }
 
-/// Minimum 128×256 output blocks before routing to NAX. With GPU-resident
-/// operands and reused buffers (no per-call alloc/copy/readback), the dispatch
-/// overhead is gone, so even a single-block LX-sized tile is worth the NAX path.
-pub const NAX_MIN_BLOCKS: usize = 1;
-/// Minimum K depth before routing to NAX. Tiny K isn't worth a GPU op; LX tiles
-/// (K up to a few hundred) are.
-pub const NAX_MIN_K: usize = 64;
+/// Minimum 128×256 output blocks before routing a matmul to the GPU. Measured
+/// wall-clock crossover on the M5 is ~1024³ (= 32 blocks): NAX *compute* matches
+/// or beats AMX from ~512³ (2739 vs 1498 GFLOP/s), but every GPU dispatch pays a
+/// ~300 µs command-buffer submission round-trip that a single AMX call doesn't,
+/// so only GEMMs large enough to dwarf that latency win. Below the crossover —
+/// including every LX-sized tile (≤418³) a real KTIR program produces —
+/// Accelerate is faster, so the gate routes there. (Batching many matmuls into
+/// one submission, via [`NaxGemm::run_chain`], is how small GEMMs would win.)
+pub const NAX_MIN_BLOCKS: usize = 32;
+/// Minimum K depth before routing to the GPU. Same calibration.
+pub const NAX_MIN_K: usize = 256;
 
 /// Choose the matmul backend for `C(m×k·k×n)` on the named device.
 ///
@@ -142,12 +146,15 @@ pub const NAX_MIN_K: usize = 64;
 /// copy/readback that pushes the crossover higher (fusion keeps data resident
 /// and lowers it back down).
 pub fn choose_matmul_backend(device_name: &str, m: usize, k: usize, n: usize) -> MatmulBackend {
-    // Tiny GEMMs aren't worth a GPU dispatch on any device.
+    // Only the NAX tensor engine on M5+, and only for GEMMs large enough to
+    // beat the GPU submission latency, goes to the GPU. The pre-M5
+    // `simdgroup_float8x8` path has lower compute throughput than AMX AND pays
+    // the same submission latency, so it never wins wall-clock — M1–M4 (and any
+    // smaller GEMM) use Accelerate, which is genuinely the fastest matmul there.
     let blocks = m.div_ceil(128) * n.div_ceil(256);
     let big_enough = blocks >= NAX_MIN_BLOCKS && k >= NAX_MIN_K;
     match effective_matmul_tier(device_name) {
         MatmulTier::Nax if big_enough => MatmulBackend::Nax,
-        MatmulTier::Simdgroup if big_enough => MatmulBackend::Simdgroup,
         _ => MatmulBackend::Accelerate,
     }
 }
@@ -665,6 +672,17 @@ fn bytemuck_u32(data: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
+/// One step of a batched matmul chain ([`NaxGemm::run_chain`]): multiply the
+/// running result by `b` (k×n) and apply `epi` (with operand `e`, if any).
+#[cfg(metal)]
+pub struct ChainStep<'a> {
+    pub k: usize,
+    pub n: usize,
+    pub b: &'a [f32],
+    pub epi: Epilogue,
+    pub e: Option<&'a [f32]>,
+}
+
 /// A fused matmul epilogue: `out = act(c BINOP e)`, where `e` is a per-element
 /// operand (bias/residual/scale). The codes match the MSL `nax_epilogue` switch.
 /// Lets the emulator fold a `matmul` and a following elementwise op (add, mul,
@@ -1149,31 +1167,26 @@ impl NaxGemm {
 
         let dims = [m as u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
-        // SAFETY: small POD arrays that live for the duration of this call.
-        let small_buf = |bytes: &[u8]| -> Result<_, String> {
-            unsafe {
-                self.device
-                    .newBufferWithBytes_length_options(
-                        NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
-                        bytes.len(),
-                        res,
-                    )
-                    .ok_or_else(|| "metal: small buffer alloc failed".to_string())
-            }
-        };
-        let dims_buf = small_buf(bytemuck_u32(&dims))?;
-        let codes_buf = small_buf(bytemuck_u32(&codes))?;
 
         let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
         let enc = cb.computeCommandEncoder().ok_or("metal: computeCommandEncoder returned nil")?;
         enc.setComputePipelineState(&self.pipeline);
+        // Small uniforms via setBytes — no per-call buffer allocation.
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&a_buf), 0, 0);
             enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&c_buf), 0, 2);
-            enc.setBuffer_offset_atIndex(Some(&dims_buf), 0, 3);
+            enc.setBytes_length_atIndex(
+                NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&dims),
+                3,
+            );
             enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
-            enc.setBuffer_offset_atIndex(Some(&codes_buf), 0, 5);
+            enc.setBytes_length_atIndex(
+                NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(&codes),
+                5,
+            );
         }
         // One threadgroup per output block (kernel-specific block + thread count).
         let m_blocks = m.div_ceil(self.block_m);
@@ -1188,6 +1201,99 @@ impl NaxGemm {
 
         let raw =
             unsafe { std::slice::from_raw_parts(c_buf.contents().as_ptr() as *const f32, out_len) };
+        Ok(raw.to_vec())
+    }
+
+    /// Run a chain of left-associated matmuls in ONE command buffer with a single
+    /// GPU sync: `out₀ = a · steps[0].b`, then `outᵢ = outᵢ₋₁ · steps[i].b`, each
+    /// with its fused epilogue. Intermediates stay in GPU buffers (never read back
+    /// to the host), so the ~250 µs dispatch/sync latency is paid once for the
+    /// whole chain instead of per matmul — the batching that makes GPU matmul win
+    /// on the small LX-sized tiles. `a` is the host input (k0 = a.len()/m0);
+    /// returns the final result `outₙ₋₁`.
+    pub fn run_chain(&self, m0: usize, a: &[f32], steps: &[ChainStep<'_>]) -> Result<Vec<f32>, String> {
+        use objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
+        };
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+        assert!(!steps.is_empty(), "chain needs at least one step");
+
+        let res = MTLResourceOptions::StorageModeShared;
+        let rows = m0; // left-multiply: row count is fixed across the chain
+        let alloc = |bytes: usize| -> Result<MtlBuf, String> {
+            self.device
+                .newBufferWithLength_options(bytes.max(4), res)
+                .ok_or_else(|| "metal: chain alloc failed".to_string())
+        };
+        let fill = |buf: &MtlBuf, data: &[f32]| unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buf.contents().as_ptr() as *mut f32,
+                data.len(),
+            );
+        };
+
+        // Allocate the pool ONCE (sized to the chain's maxima) and reuse it for
+        // every step — no per-step allocation. Two ping-pong result buffers hold
+        // the running product; A, B, and E are refilled in place.
+        let max_b = steps.iter().map(|s| s.b.len()).max().unwrap_or(1);
+        let max_e = steps.iter().map(|s| s.e.map_or(1, <[f32]>::len)).max().unwrap_or(1);
+        let max_out = steps.iter().map(|s| rows * s.n).max().unwrap_or(1);
+        let a_buf = alloc(a.len() * 4)?;
+        fill(&a_buf, a);
+        let ping = [alloc(max_out * 4)?, alloc(max_out * 4)?];
+        let b_buf = alloc(max_b * 4)?;
+        let e_buf = alloc(max_e * 4)?;
+
+        let cb = self.queue.commandBuffer().ok_or("metal: commandBuffer returned nil")?;
+        let mut final_len = 0usize;
+        for (i, s) in steps.iter().enumerate() {
+            assert_eq!(s.b.len(), s.k * s.n, "chain step B must be k×n");
+            let out_len = rows * s.n;
+            let prev = if i == 0 { &a_buf } else { &ping[(i - 1) % 2] };
+            let out = &ping[i % 2];
+            fill(&b_buf, s.b);
+            if let Some(e) = s.e {
+                assert_eq!(e.len(), out_len, "chain step E must be m×n");
+                fill(&e_buf, e);
+            }
+            let dims = [rows as u32, s.n as u32, s.k as u32];
+            let codes = [s.epi.binop, s.epi.act];
+
+            let enc = cb.computeCommandEncoder().ok_or("metal: chain encoder nil")?;
+            enc.setComputePipelineState(&self.pipeline);
+            // Small uniforms go through setBytes (no buffer allocation).
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(prev), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&b_buf), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(out), 0, 2);
+                enc.setBytes_length_atIndex(
+                    NonNull::new(dims.as_ptr() as *mut c_void).unwrap(),
+                    std::mem::size_of_val(&dims),
+                    3,
+                );
+                enc.setBuffer_offset_atIndex(Some(&e_buf), 0, 4);
+                enc.setBytes_length_atIndex(
+                    NonNull::new(codes.as_ptr() as *mut c_void).unwrap(),
+                    std::mem::size_of_val(&codes),
+                    5,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: s.n.div_ceil(self.block_n), height: rows.div_ceil(self.block_m), depth: 1 },
+                MTLSize { width: self.threads, height: 1, depth: 1 },
+            );
+            enc.endEncoding();
+            final_len = out_len;
+        }
+
+        cb.commit();
+        cb.waitUntilCompleted();
+        let last = &ping[(steps.len() - 1) % 2];
+        let raw =
+            unsafe { std::slice::from_raw_parts(last.contents().as_ptr() as *const f32, final_len) };
         Ok(raw.to_vec())
     }
 
@@ -1470,6 +1576,68 @@ kernel void mpp_probe(
             assert_eq!(got, want, "NAX GEMM mismatch at shape ({m},{k},{n})");
         }
         eprintln!("general NAX GEMM matches the oracle across {} shapes ✓", shapes.len());
+    }
+
+    /// A batched matmul chain (one command buffer, one sync) computes the same
+    /// result as the matmuls run separately, and amortizes the per-dispatch
+    /// latency: a chain of N small matmuls should be far faster than N calls.
+    #[test]
+    fn matmul_chain_matches_and_amortizes() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => return,
+            Err(e) => panic!("{e}"),
+        };
+        // x (m×k0) · W1 (k0×k1) · W2 (k1×k2) · W3 (k2×k3), with a bias+relu epilogue.
+        let (m, k0, k1, k2, k3) = (128usize, 128, 128, 128, 128);
+        // Positive inputs: chained bf16 matmuls don't cancel, so the f32 oracle
+        // stays within bf16 tolerance (signed inputs would cancel near zero and
+        // blow up the *relative* error without any bug).
+        let mk = |rows: usize, cols: usize, s: usize| -> Vec<f32> {
+            (0..rows * cols).map(|i| ((i + s) % 7) as f32 * 0.03 + 0.01).collect()
+        };
+        let x = mk(m, k0, 0);
+        let (w1, w2, w3) = (mk(k0, k1, 1), mk(k1, k2, 2), mk(k2, k3, 3));
+        let bias = mk(m, k3, 9);
+
+        let steps = [
+            ChainStep { k: k0, n: k1, b: &w1, epi: Epilogue::NONE, e: None },
+            ChainStep { k: k1, n: k2, b: &w2, epi: Epilogue::NONE, e: None },
+            ChainStep { k: k2, n: k3, b: &w3, epi: Epilogue { binop: 1, act: 1 }, e: Some(&bias) },
+        ];
+        let got = ctx.run_chain(m, &x, &steps).unwrap();
+
+        // Oracle: same chain on the CPU (bf16 tolerance, since NAX is bf16).
+        let c1 = crate::blas::naive_sgemm(m, k0, k1, &x, &w1);
+        let c2 = crate::blas::naive_sgemm(m, k1, k2, &c1, &w2);
+        let c3 = crate::blas::naive_sgemm(m, k2, k3, &c2, &w3);
+        let want: Vec<f32> = c3.iter().zip(&bias).map(|(&c, &b)| (c + b).max(0.0)).collect();
+        let mut max_rel = 0.0f32;
+        for (g, w) in got.iter().zip(&want) {
+            max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
+        }
+        assert!(max_rel < 0.1, "chain result max rel err {max_rel} too large");
+
+        // Timing: the 3-matmul chain (one sync) vs three separate run() calls.
+        let iters = 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            ctx.run_chain(m, &x, &steps).unwrap();
+        }
+        let chained = t0.elapsed().as_secs_f64() / iters as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            let a = ctx.run(m, k0, k1, &x, &w1).unwrap();
+            let b = ctx.run(m, k1, k2, &a, &w2).unwrap();
+            let _ = ctx.run_fused(m, k2, k3, &b, &w3, &bias, Epilogue { binop: 1, act: 1 }).unwrap();
+        }
+        let separate = t1.elapsed().as_secs_f64() / iters as f64;
+        eprintln!(
+            "matmul chain: batched {:.1} µs vs separate {:.1} µs  ({:.2}× faster, one sync vs three)",
+            chained * 1e6,
+            separate * 1e6,
+            separate / chained
+        );
     }
 
     /// The pre-M5 `simdgroup_float8x8` GEMM is correct across shapes (incl.
@@ -1756,17 +1924,17 @@ kernel void mpp_probe(
 
     #[test]
     fn matmul_backend_gating() {
-        use MatmulBackend::{Accelerate, Nax, Simdgroup};
-        // M5 routes real GEMMs to the NAX tensor engine.
-        assert_eq!(choose_matmul_backend("Apple M5", 1024, 1024, 1024), Nax);
-        assert_eq!(choose_matmul_backend("Apple M5", 256, 256, 256), Nax);
-        // M1–M4 route real GEMMs to the simdgroup GPU path.
-        assert_eq!(choose_matmul_backend("Apple M4", 1024, 1024, 1024), Simdgroup);
-        assert_eq!(choose_matmul_backend("Apple M1", 256, 256, 256), Simdgroup);
-        // Tiny K isn't worth a GPU dispatch -> Accelerate, even on the M5.
-        assert_eq!(choose_matmul_backend("Apple M5", 256, 32, 256), Accelerate);
-        assert_eq!(choose_matmul_backend("Apple M4", 256, 32, 256), Accelerate);
-        // Non-Apple GPUs have no GPU matmul path -> Accelerate.
+        use MatmulBackend::{Accelerate, Nax};
+        // M5 sends large GEMMs (>= measured ~1024³ crossover) to the NAX engine.
+        assert_eq!(choose_matmul_backend("Apple M5", 1024, 1024, 1024), Nax); // 32 blocks
+        assert_eq!(choose_matmul_backend("Apple M5", 2048, 2048, 2048), Nax);
+        // Smaller / LX-sized matmuls -> Accelerate (AMX), faster there.
+        assert_eq!(choose_matmul_backend("Apple M5", 512, 512, 512), Accelerate); // 8 blocks < 32
+        assert_eq!(choose_matmul_backend("Apple M5", 256, 256, 256), Accelerate);
+        // Pre-M5: the simdgroup GPU path never beats AMX in wall-clock -> Accelerate.
+        assert_eq!(choose_matmul_backend("Apple M4", 2048, 2048, 2048), Accelerate);
+        assert_eq!(choose_matmul_backend("Apple M1", 4096, 4096, 4096), Accelerate);
+        // Non-Apple GPUs -> Accelerate.
         assert_eq!(choose_matmul_backend("Intel UHD Graphics 630", 4096, 4096, 4096), Accelerate);
     }
 
