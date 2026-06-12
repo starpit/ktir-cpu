@@ -12,4 +12,6 @@ pub mod dialects;
 pub mod dtypes;
 pub mod interpreter;
 pub mod ir;
+pub mod memory;
+pub mod memref;
 pub mod tile;

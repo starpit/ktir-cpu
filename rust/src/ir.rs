@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
+use crate::affine::{AffineMap, AffineSet};
 use crate::dtypes::DType;
+use crate::memref::{AccessTile, DistributedMemRef, MemRef, TileRef};
 use crate::tile::Tile;
 
 /// A scalar SSA value (e.g. `arith.constant`, a loop induction variable).
@@ -53,10 +55,11 @@ pub enum Value {
     Tile(Tile),
     Index(i64),
     Tuple(Vec<Value>),
-    // Future (memref.rs / tile.rs):
-    // MemRef(MemRef), DistMemRef(DistributedMemRef),
-    // TileRef(TileRef), DistTileRef(DistributedTileRef),
-    // AccessTile(AccessTile), IndirectAccessTile(IndirectAccessTile),
+    MemRef(MemRef),
+    DistMemRef(DistributedMemRef),
+    TileRef(TileRef),
+    AccessTile(AccessTile),
+    // Future: DistTileRef(DistributedTileRef), IndirectAccessTile(IndirectAccessTile)
 }
 
 /// A parsed operation attribute. Replaces the `Any` values in Python's
@@ -69,7 +72,8 @@ pub enum Attr {
     Str(String),
     Bool(bool),
     Dtype(DType),
-    // Future: AffineMap(AffineMap), AffineSet(AffineSet)
+    AffineMap(AffineMap),
+    AffineSet(AffineSet),
 }
 
 /// A single IR operation. 1:1 with the Python `Operation` dataclass.

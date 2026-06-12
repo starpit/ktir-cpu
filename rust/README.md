@@ -1,9 +1,9 @@
 # ktir-cpu (Rust port)
 
-A Rust port of the Python `ktir_cpu` validation interpreter (RFC 0682). This is
-**slice 1**: a compiling vertical cut that establishes the foundation types and
-proves the architecture end-to-end. Module names mirror the Python package so
-the two can be diffed against each other as the port grows.
+A Rust port of the Python `ktir_cpu` validation interpreter (RFC 0682). A
+compiling vertical cut that establishes the foundation types and proves the
+architecture end-to-end. Module names mirror the Python package so the two can
+be diffed against each other as the port grows.
 
 ## What's here
 
@@ -12,24 +12,33 @@ the two can be diffed against each other as the port grows.
 | `dtypes` | `dtypes.py` | `DType` enum + alias parsing — done |
 | `affine` | `affine.py` | `AffineExpr`/`AffineMap`/`BoxSet`/`AffineSet` eval + containment |
 | `ir` | `ir_types.py` (op half) | `Value`, `Scalar`, `Attr`, `Operation`, `IRFunction`, `IRModule` |
+| `memref` | `ir_types.py` (memref half) | `MemRef`, `TileRef`, distributed variants, `MemorySpace`/`CoordinateSet`/`ParentRef` enums, `AccessTile` |
+| `memory` | `memory.py` | `STICK_BYTES` (HBM stick granularity) |
 | `tile` | `Tile` | minimal flat-`Vec<f32>` storage (see dtype fork note) |
 | `dialects` | `dialects/registry.py` | explicit-table `Dispatch` |
 | `dialects::arith` | `dialects/arith_ops.py` | `constant`, `addf`, `mulf`, `addi` |
+| `dialects::ktdp` | `dialects/ktdp_ops.py` | `construct_memory_view`, `construct_access_tile` (single-allocation path) |
 | `interpreter` | `interpreter.py` + `grid.py` scope | `Scope` + straight-line `execute_ops` |
 
 `Value` is the keystone — the tagged union replacing Python's `Any` across every
-SSA binding and handler return.
+SSA binding and handler return. `MemorySpace` as an enum makes the Python
+`__post_init__` "lx_core_id only valid for LX" check structurally impossible to
+violate.
 
 ## Not yet ported (next slices)
 
-- `memref.rs` / remaining `tile.rs` — `MemRef`, `TileRef`, distributed variants,
-  the `CoordinateSet` / `ParentRef` enums.
-- `parser/` — the regex MLIR tokenizer (`parser.py` + `parser_ast.py`).
-- `memory.rs`, `grid.rs`, `latency.rs`.
+- `parser/` — the regex MLIR tokenizer (`parser.py` + `parser_ast.py`), so real
+  `examples/*.mlir` can feed the interpreter instead of hand-built `Operation`s.
+- The distributed memory path: `construct_distributed_memory_view`,
+  `distributed_tile_access`, and `ktdp.load`/`store` (need a real
+  `HBMSimulator` in `memory.rs`).
+- `grid.rs`, `latency.rs`.
 - The comm-op suspension model: regions returning `StepResult::{Done,Yield,
   AwaitRecv}` (replaces Python's generator that `yield`s `RecvRequest`).
 - The dtype-storage fork in `tile.rs` (flat `Vec<f32>` → `ndarray::ArrayD`,
   plus the single-`f32` vs `TileData`-enum decision). See the header note there.
+- Symbolic `access_tile_set` resolution (rejected for now, matching the Python
+  `NotImplementedError`).
 
 ## Building
 
@@ -43,4 +52,4 @@ cargo test
 cargo clippy --all-targets
 ```
 
-11 tests, clippy-clean.
+19 tests, clippy-clean.
