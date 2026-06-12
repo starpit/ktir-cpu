@@ -64,33 +64,24 @@ cargo clippy --all-targets
 
 ## BLAS acceleration (optional)
 
-`linalg` matmul/dot run on a naive Rust loop by default — portable, deterministic,
-dependency-free, and the parity oracle. For large matmuls, turn on the `blas`
-feature; the backend is **auto-selected per platform** (the `cblas_sgemm` call is
-identical across all of them — only the linked library differs):
+`linalg` matmul/dot run through BLAS where it's free, and a naive Rust loop
+otherwise (the `cblas_sgemm` call is identical across BLAS libraries — only the
+linked library differs):
+
+- **macOS:** Apple **Accelerate** (AMX) is used **by default, no feature flag** —
+  it ships with the OS, so linking it costs nothing. `cargo test` just uses it.
+- **Linux / other:** naive loop by default; name a provider for hardware BLAS:
 
 ```sh
-# macOS — auto-uses Apple Accelerate (ships with the OS; no install, no build):
-cargo test --features blas
-
-# Linux — `blas` alone has no library to link, so also name a provider:
 cargo test --features openblas-system   # links system OpenBLAS (apt install libopenblas-dev)  [recommended]
 cargo test --features mkl               # Intel MKL (x86_64)
 cargo test --features blis              # portable BLIS (good on AMD)
 cargo test --features openblas          # builds OpenBLAS from source (needs gcc/gfortran)
 ```
 
-So on a Mac, **`--features blas` is all you need** — Accelerate is a system
-framework, so auto-selecting it costs nothing. Linux has no universally-present
-BLAS, so the backend stays an explicit choice (`openblas-system` is the light
-option; `mkl` the usual x86 perf pick).
+Linux has no universally-present BLAS, so the backend stays an explicit choice
+there (`openblas-system` is the light option; `mkl` the usual x86 perf pick).
 
-Because NumPy is itself BLAS-backed, a BLAS provider tends to *tighten* matmul
-parity with the reference rather than loosen it; the `blas_matches_naive` test
-gates that the chosen backend agrees with the naive oracle.
-
-> Want it fully zero-flag on macOS (no `--features` at all)? Make `blas-src`/
-> `cblas-sys` non-optional under `[target.'cfg(target_os="macos")'.dependencies]`
-> and gate `blas.rs` on `cfg(any(feature = "blas", target_os = "macos"))`. The
-> trade-off: the default macOS build then always links Accelerate (so the naive
-> oracle is no longer the macOS default), which is why it's opt-in here.
+Because NumPy is itself BLAS-backed, BLAS tends to *tighten* matmul parity with
+the reference rather than loosen it; the `blas_matches_naive` test gates that the
+active backend agrees with the naive oracle (it runs by default on macOS).

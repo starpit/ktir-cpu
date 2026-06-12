@@ -2,30 +2,31 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
 //
-//! Row-major single-precision GEMM, with an optional Accelerate (BLAS) backend.
+//! Row-major single-precision GEMM, with an optional BLAS backend.
 //!
 //! `sgemm_rowmajor(m, k, n, a, b)` computes `C = A·B` for row-major `A` (m×k)
 //! and `B` (k×n), returning a flat row-major `C` (m×n).
 //!
-//! - **default build:** a portable naive triple loop. This is the parity oracle
-//!   the rest of the suite checks against.
-//! - **`--features accelerate`:** dispatches to Apple's `cblas_sgemm` (AMX-backed
-//!   on Apple Silicon). Deterministic, and since NumPy's matmul is itself
-//!   BLAS-backed, this tends to *tighten* parity with the reference rather than
-//!   loosen it. macOS only.
+//! - **macOS:** dispatches to Apple's `cblas_sgemm` (Accelerate, AMX-backed) by
+//!   default — Accelerate ships with the OS, so it's on with no feature flag.
+//! - **Linux / other:** a portable naive triple loop by default; enable a
+//!   provider feature (`openblas-system` / `mkl` / `blis` / `openblas`) to route
+//!   through that library's `cblas_sgemm` instead.
 //!
-//! Both paths take the same flat-`Vec<f32>` tile storage, so `linalg` matmul is
-//! backend-agnostic — it just calls `sgemm_rowmajor`.
+//! BLAS is deterministic and — since NumPy's matmul is itself BLAS-backed —
+//! tends to *tighten* parity with the reference. Both paths take the same
+//! flat-`Vec<f32>` tile storage, so `linalg` matmul just calls `sgemm_rowmajor`.
 
-/// `C(m×n) = A(m×k) · B(k×n)`, all row-major and contiguous.
-#[cfg(not(feature = "blas"))]
+/// `C(m×n) = A(m×k) · B(k×n)`, all row-major and contiguous. Naive loop —
+/// the cross-platform default (and the parity oracle for the BLAS path).
+#[cfg(not(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis")))]
 pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     naive_sgemm(m, k, n, a, b)
 }
 
-/// `C(m×n) = A(m×k) · B(k×n)` via the linked BLAS `cblas_sgemm` (Accelerate /
-/// OpenBLAS / MKL / BLIS — the cblas ABI is identical across all of them).
-#[cfg(feature = "blas")]
+/// `C(m×n) = A(m×k) · B(k×n)` via the linked BLAS `cblas_sgemm` (Accelerate on
+/// macOS, or the selected provider — the cblas ABI is identical across them).
+#[cfg(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis"))]
 pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     use cblas_sys::{cblas_sgemm, CBLAS_LAYOUT, CBLAS_TRANSPOSE};
     let mut c = vec![0.0f32; m * n];
@@ -80,8 +81,8 @@ mod tests {
         assert_eq!(sgemm_rowmajor(2, 3, 2, &a, &b), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
-    /// With any BLAS backend on, `cblas_sgemm` must agree with the naive oracle.
-    #[cfg(feature = "blas")]
+    /// With a BLAS backend active, `cblas_sgemm` must agree with the naive oracle.
+    #[cfg(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis"))]
     #[test]
     fn blas_matches_naive() {
         let m = 7;

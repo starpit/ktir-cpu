@@ -11,10 +11,10 @@
 //! comm seam lives in `comm` (only the top-level driver suspends). Dialect
 //! implementations and the memory load/store data path build against these.
 
-// Links the selected BLAS backend (Accelerate / OpenBLAS / MKL / BLIS) when a
-// provider feature is on. `blas-src` must be referenced once at the crate root
-// for its linker directives to take effect. See blas.rs.
-#[cfg(feature = "blas")]
+// Links the BLAS backend — Accelerate on macOS (default), or the provider chosen
+// by feature elsewhere. `blas-src` must be referenced once at the crate root for
+// its linker directives to take effect. See blas.rs.
+#[cfg(any(target_os = "macos", feature = "openblas", feature = "mkl", feature = "blis"))]
 extern crate blas_src;
 
 pub mod affine;

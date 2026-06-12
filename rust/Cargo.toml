@@ -12,46 +12,31 @@ description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
 [features]
 default = []
 
-# `blas` is the umbrella capability: it routes linalg matmul/dot through the
-# linked `cblas_sgemm` (the call is backend-agnostic — every BLAS library exposes
-# the same cblas ABI). The BACKEND is auto-selected per platform via the
-# target-specific `blas-src` deps below:
-#   * macOS  -> Apple Accelerate, which ships with the OS (no install, no build).
-#              So `--features blas` "just works" on a Mac.
-#   * Linux / others -> there is no universally-present BLAS, so `blas` alone
-#              fails to link; also enable a provider feature to pick the library.
-# The naive Rust matmul remains the no-feature default and the parity oracle.
-blas = ["dep:cblas-sys", "dep:blas-src"]
-
-# Explicit backend overrides (also imply `blas`). On Linux pick one of these;
-# on macOS the `blas` auto-default (Accelerate) is almost always what you want.
-#   openblas-system : link system OpenBLAS  (apt install libopenblas-dev)  [Linux]
+# BLAS matmul for NON-macOS platforms — pick one. (macOS uses Apple Accelerate
+# automatically, with no feature flag; see the target deps below.) Linux has no
+# universally-present BLAS, so the backend is an explicit choice here.
+#   openblas-system : link system OpenBLAS (apt install libopenblas-dev)  [recommended on Linux]
 #   openblas        : build OpenBLAS from source (needs a C/Fortran toolchain)
 #   mkl             : Intel MKL (x86_64; downloaded by intel-mkl-src)
 #   blis            : portable BLIS (good on AMD)
-#   accelerate      : force Accelerate explicitly (redundant on macOS)
-accelerate      = ["blas", "blas-src/accelerate"]
-openblas        = ["blas", "blas-src/openblas"]
-openblas-system = ["blas", "blas-src/openblas", "openblas-src/system"]
-mkl             = ["blas", "blas-src/intel-mkl"]
-blis            = ["blas", "blas-src/blis"]
+openblas        = ["dep:cblas-sys", "dep:blas-src", "blas-src/openblas"]
+openblas-system = ["openblas", "dep:openblas-src", "openblas-src/system"]
+mkl             = ["dep:cblas-sys", "dep:blas-src", "blas-src/intel-mkl"]
+blis            = ["dep:cblas-sys", "dep:blas-src", "blas-src/blis"]
 
 [dependencies]
-# Only pulled in by a `blas`/provider feature. cblas-sys provides the cblas_sgemm
-# declaration; blas-src links the chosen library; openblas-src is a direct
-# optional dep so `openblas-system` can flip its `system` feature.
+# Optional on non-macOS (pulled in by a provider feature); see the macOS target
+# section for the always-on Accelerate wiring.
 cblas-sys = { version = "0.1", optional = true }
 blas-src = { version = "0.10", optional = true, default-features = false }
 openblas-src = { version = "0.10", optional = true, default-features = false }
 
-# macOS: auto-select Accelerate for the `blas` feature. Accelerate is a system
-# framework — linking it has no install/build cost — so `--features blas` resolves
-# to it here without the caller naming a provider.
-[target.'cfg(target_os = "macos")'.dependencies.blas-src]
-version = "0.10"
-optional = true
-default-features = false
-features = ["accelerate"]
+# macOS: Apple Accelerate ships with the OS, so link it unconditionally and use
+# it by default — zero feature flags. (Required here; optional above so non-macOS
+# builds only pull a BLAS library when a provider feature asks for one.)
+[target.'cfg(target_os = "macos")'.dependencies]
+blas-src = { version = "0.10", default-features = false, features = ["accelerate"] }
+cblas-sys = "0.1"
 
 [lib]
 name = "ktir_cpu"
