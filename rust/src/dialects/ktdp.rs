@@ -131,7 +131,7 @@ fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &Execution
     // partition routing now via distributed_tile_access (mirrors ktdp__construct_access_tile).
     let parent_ref = match parent {
         Parent::Single(m) => {
-            ParentRef::Tile(tile_access(&m, &indices, access_shape.clone(), &base_map))
+            ParentRef::Tile(tile_access(m, &indices, access_shape.clone(), &base_map))
         }
         Parent::Dist(d) => {
             let dist = distributed_tile_access(
@@ -156,7 +156,7 @@ fn construct_access_tile(op: &Operation, ctx: &mut CoreContext, _env: &Execution
 
 /// Port of `MemoryOps.tile_access`: indices -> base coords (via base_map) ->
 /// byte offset (via parent strides) -> byte-addressed `TileRef`.
-fn tile_access(parent: &MemRef, indices: &[i64], access_shape: Vec<usize>, base_map: &AffineMap) -> TileRef {
+fn tile_access(parent: MemRef, indices: &[i64], access_shape: Vec<usize>, base_map: &AffineMap) -> TileRef {
     let base_coords = base_map.eval(indices, &[]);
     let bpe = parent.dtype.bytes_per_elem() as i64;
     let offset_elems: i64 = base_coords
@@ -166,12 +166,17 @@ fn tile_access(parent: &MemRef, indices: &[i64], access_shape: Vec<usize>, base_
         .sum();
     let byte_pos = parent.byte_address() + offset_elems * bpe;
 
+    // Take parent's fields, then MOVE it into the box — no second clone of the
+    // MemRef (and its affine `coordinate_set`), which `construct_access_tile`
+    // already paid once. Halves the per-access affine clone/drop churn.
+    let strides = parent.strides.clone();
+    let dtype = parent.dtype;
     TileRef {
         base_ptr: byte_pos,
         shape: access_shape,
-        strides: parent.strides.clone(),
-        dtype: parent.dtype,
-        memref: Box::new(parent.clone()),
+        strides,
+        dtype,
+        memref: Box::new(parent),
         coordinate_set: None,
         partition_origin: None,
     }
