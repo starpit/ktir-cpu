@@ -55,7 +55,7 @@ pub fn parse_module(text: &str) -> Result<IRModule, String> {
 // --- phase 1: structure --------------------------------------------------
 
 /// Strip `// ...` line comments. Mirrors `_preprocess_text`.
-fn strip_comments(text: &str) -> String {
+pub fn strip_comments(text: &str) -> String {
     text.lines()
         .map(|line| match line.find("//") {
             Some(i) => &line[..i],
@@ -358,7 +358,7 @@ fn starts_ssa_assign(text: &str) -> bool {
 
 /// Structural-completeness check. Mirrors `_is_op_complete`: a terminal type
 /// annotation (`: T` / `-> T`), or a void terminator (`return`, `*.yield`).
-fn is_op_complete(text: &str) -> bool {
+pub fn is_op_complete(text: &str) -> bool {
     let text = text.trim_end();
     if text.is_empty() {
         return false;
@@ -1123,22 +1123,23 @@ fn parse_attr_value(val: &str) -> Option<Attr> {
         let vals: Option<Vec<i64>> = items.iter().map(|s| s.parse().ok()).collect();
         return vals.map(Attr::IntList);
     }
-    match val {
+    // Strip a trailing `: type` annotation MLIR attaches to typed attrs
+    // (`42 : i32` -> `42`), then classify the bare token.
+    let core = val.split(':').next().unwrap_or(val).trim();
+    match core {
         "true" => return Some(Attr::Bool(true)),
         "false" => return Some(Attr::Bool(false)),
         _ => {}
     }
-    if let Ok(i) = val.parse::<i64>() {
+    if let Ok(i) = core.parse::<i64>() {
         return Some(Attr::Int(i));
     }
-    if (val.contains('.') || val.contains('e') || val.contains('E'))
-        && let Ok(f) = val.parse::<f64>()
+    if (core.contains('.') || core.contains('e') || core.contains('E'))
+        && let Ok(f) = core.parse::<f64>()
     {
         return Some(Attr::Float(f));
     }
-    // Strip a trailing `: type` annotation MLIR attaches to typed attrs.
-    let s = val.split(':').next().unwrap_or(val).trim();
-    Some(Attr::Str(s.to_string()))
+    Some(Attr::Str(core.to_string()))
 }
 
 /// Parse the literal of `arith.constant <lit> : <type>` into a value `Attr`.
@@ -1148,6 +1149,14 @@ fn parse_attr_value(val: &str) -> Option<Attr> {
 /// (splat scalar or `[..]` list). Mirrors `parse_numeric` + the dense-payload
 /// handling in `parser_utils.py`.
 fn parse_constant_value(after_op: &str) -> Result<Attr, String> {
+    // Attribute-block form: `arith.constant { value = 42 : i32 } : index`.
+    // The value lives in the `{ }` block, not as a bare literal.
+    if after_op.trim_start().starts_with('{')
+        && let Some(Attr::Int(_) | Attr::Float(_) | Attr::Bool(_)) =
+            parse_attr_block(after_op).get("value")
+    {
+        return Ok(parse_attr_block(after_op).remove("value").unwrap());
+    }
     // The literal runs from after the op name to the `:` type annotation; for
     // `dense<...>` it may contain `[ , ]`, so take everything before the LAST
     // top-level `:` rather than the first whitespace token.

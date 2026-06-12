@@ -40,7 +40,7 @@ use crate::affine::{AffineExpr, AffineMap, AffineSet, Constraint, ConstraintKind
 /// integer literals, the multi-char operators `== >= <= ->`, and the single-char
 /// punctuation `+ - * ( ) , : [ ]`. Unknown characters are skipped (matching the
 /// Python `pos += 1` fall-through on a non-match).
-fn tokenise(text: &str) -> Vec<String> {
+pub fn tokenise(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;

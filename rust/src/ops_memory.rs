@@ -950,7 +950,7 @@ fn write_to_lx(ctx: &mut CoreContext, data: &[f32], dtype: DType) {
 // ===========================================================================
 
 /// Port of `MemoryOps._is_contiguous`: row-major C-order check.
-fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
+pub fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
     let mut expected: i64 = 1;
     for (&dim, &stride) in shape.iter().rev().zip(strides.iter().rev()) {
         if stride != expected {
