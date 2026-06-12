@@ -724,13 +724,25 @@ fn distributed_store_does_not_trample_outside_c_i_col_packed() {
 // ===========================================================================
 // RFC §C.3 reference example — per-core LX routing.
 //
-// Python marks this xfail (per-core LX gap) and loads an example .mlir file by
-// path.  There is no faithful crate analogue at the ops layer here, so it is
-// left as an ignored stub.
+// CORRECTION: the Python test PASSES (not xfail — confirmed by running
+// tests/test_distributed_view.py::test_distributed_view_copy_rfc, 16 passed).
+// It monkeypatches `_prepare_execution` to seed a 192×64 tensor split across
+// HBM + LX core 0 (col-packed strides) + LX core 1 (row-major) BEFORE running
+// distributed-view-copy.mlir, which copies the distributed A into contiguous
+// HBM B. Porting it needs a pre-execution memory-seed hook: public APIs to write
+// strided data into a specific core's LX and bump its next_ptr (the Python
+// `_write_strided` + `lx.next_ptr = …`), which the Rust crate does not yet
+// expose. So this is a REAL (un-ported) GAP, not a Python xfail — the
+// distributed-view machinery itself is exercised by `distributed_copy_all_cases`
+// at the ops layer, but the full RFC §C.3 kernel-level run is not yet covered.
 // ===========================================================================
 
 #[test]
-#[ignore = "RFC C.3 per-core LX routing example: xfail in Python; no ops-layer analogue"]
+#[ignore = "REAL GAP (not xfail — Python passes): needs a pre-execution per-core \
+            LX strided-seed hook to port test_distributed_view_copy_rfc. The \
+            distributed-view ops are covered by distributed_copy_all_cases; the \
+            kernel-level RFC C.3 run awaits a public LX-seed API."]
 fn distributed_view_copy_rfc() {
-    // Intentionally empty — see module/skipped notes.
+    // See the correction note above: Python passes via an LX-seed monkeypatch;
+    // the Rust execute_function has no memory-seed hook yet.
 }

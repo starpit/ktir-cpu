@@ -753,10 +753,17 @@ fn test_for_op_iter_args_running_sum() {
 }
 
 #[test]
-#[ignore = "GAP: scf.while is not implemented — no `scf.while` handler is registered in the Rust crate (dialects/scf.rs registers only scf.for/scf.if/scf.yield). The Python ControlOps.while_op has no Rust analogue."]
+#[ignore = "N/A (Python-internal, not an execution gap): test_while_op calls the \
+            op-layer helper ControlOps.while_op(ctx, \"before\", \"after\", executor) \
+            with a PYTHON CLOSURE as the region executor and string region names — \
+            no MLIR, no parser, no dialect dispatch. There is no `scf.while` op in \
+            Python either (scf_ops.py registers only scf.if/for/yield), so it is not \
+            a parseable/executable feature; the Rust dialect-dispatch architecture \
+            has no analogue for a closure-driven op-layer helper. Confirmed by \
+            reading tests/test_ops.py::test_while_op."]
 fn test_while_op() {
-    // Python: while before_region returns False stop; count increments to 3.
-    // No scf.while handler exists in the Rust crate.
+    // Python-only: ControlOps.while_op driven by a Python closure (no MLIR/dialect
+    // path). Not representable in the Rust dialect-dispatch model — N/A, compliant.
 }
 
 /// The matmul→elementwise peephole fusion produces the same result as running
