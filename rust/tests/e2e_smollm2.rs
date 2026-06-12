@@ -70,6 +70,16 @@ fn smollm2_135m_runs_end_to_end() {
     let mut cache: HashMap<String, ktir_cpu::ir::IRModule> = HashMap::new();
     let mut ran = 0usize;
 
+    // Profiling: re-run the whole node sweep `SMOLLM2_ITERS` times (sources are
+    // reloaded each pass) so a sampling profiler has enough wall time.
+    let iters: usize =
+        std::env::var("SMOLLM2_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let sources: HashMap<u64, Vec<f32>> = buf.clone();
+    for pass in 0..iters {
+        if pass > 0 {
+            buf.clone_from(&sources);
+            ran = 0;
+        }
     for (ni, node) in nodes.iter().enumerate() {
         let func = node["fn"].as_str().unwrap();
         let mlir_name = node["mlir"].as_str().unwrap();
@@ -108,10 +118,11 @@ fn smollm2_135m_runs_end_to_end() {
             }
         }
         ran += 1;
-        if ni % 50 == 0 {
+        if pass == 0 && ni % 50 == 0 {
             eprintln!("  node {ni}/{n_nodes} ({func}) ok");
         }
     }
+    } // pass loop
 
     assert_eq!(ran, n_nodes, "all nodes ran");
     eprintln!("SmolLM2-135M: all {n_nodes} nodes executed end-to-end ✓");

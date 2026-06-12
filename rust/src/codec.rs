@@ -14,7 +14,19 @@
 use crate::dtypes::DType;
 
 /// Decode IEEE-754 half-precision bits to f32.
+/// Convert IEEE-754 half-precision bits to f32. f16 has only 65536 possible bit
+/// patterns, so this is a single load from a lazily-built 256 KB lookup table —
+/// the hot path of every `ktdp.load` / `read_back` / `round_to_dtype` (the
+/// dominant cost in a real-model run profile). The exact arithmetic lives in
+/// [`f16_bits_to_f32_compute`], which fills the table.
 pub fn f16_bits_to_f32(h: u16) -> f32 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
+    TABLE.get_or_init(|| (0..=u16::MAX).map(f16_bits_to_f32_compute).collect())[h as usize]
+}
+
+/// Reference f16→f32 arithmetic (round-trip exact); used to build the table.
+fn f16_bits_to_f32_compute(h: u16) -> f32 {
     let sign = (h >> 15) & 1;
     let exp = (h >> 10) & 0x1f;
     let mant = h & 0x3ff;
