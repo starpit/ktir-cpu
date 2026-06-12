@@ -456,6 +456,15 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
         for (k, v) in parse_bare_attrs(after_op) {
             attributes.entry(k).or_insert(v);
         }
+        // `linalg.reduce { arith.maximumf }` shorthand: the `{ }` holds a bare
+        // combiner op name (no `=`, no region). Lift it to `reduce_fn` so the
+        // handler uses the right combiner instead of defaulting to addf.
+        if op_type == "linalg.reduce"
+            && !attributes.contains_key("reduce_fn")
+            && let Some(combiner) = reduce_shorthand_combiner(after_op)
+        {
+            attributes.insert("reduce_fn".to_string(), Attr::Str(combiner));
+        }
         // Derive `shape`/`dtype` from a `tensor<...>` result type when the op
         // doesn't carry them explicitly (tensor.splat/empty/generate read these).
         // Mirrors the `_result_shape`/`_result_dtype` population in
@@ -924,6 +933,28 @@ fn parse_attr_block(after_op: &str) -> std::collections::HashMap<String, Attr> {
         }
     }
     attrs
+}
+
+/// Extract the combiner op name from a `linalg.reduce { <dialect.op> }`
+/// shorthand block — a `{ }` whose content is a single `dialect.op` identifier
+/// (no `=`, no `%`). Returns `None` for the explicit-region form or no block.
+fn reduce_shorthand_combiner(after_op: &str) -> Option<String> {
+    let b = after_op.as_bytes();
+    let open = after_op.find('{')?;
+    let close = matching(b, open, b'{', b'}')?;
+    let inner = after_op[open + 1..close].trim();
+    if inner.contains('=') || inner.contains('%') || inner.contains('{') {
+        return None; // attribute block or region, not a combiner shorthand
+    }
+    // A single `dialect.op` token (letters/digits/_/.), e.g. `arith.maximumf`.
+    if !inner.is_empty()
+        && inner.contains('.')
+        && inner.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
+    {
+        Some(inner.to_string())
+    } else {
+        None
+    }
 }
 
 /// Scan for bare `key = value` attributes at top level (outside `()`, `{}`,

@@ -277,7 +277,6 @@ const SDPA_2D: &str = include_str!("../../examples/triton-ktir/sdpa_2d.mlir");
 // `linalg.matmul` expects `[32,1]` ("outs shape [1] != A@B shape [32,32]") —
 // a row-wise reduce/broadcast shape mismatch in this multi-step kernel.
 #[test]
-#[ignore = "GAP: sdpa softmax row-reduce yields [1] vs matmul-expected [32,1] (multi-step shape)"]
 fn sdpa_2d() {
     let module = parse_module(SDPA_2D).expect("parse sdpa_2d");
     let (n_rows, head_dim) = (32usize, 64usize);
