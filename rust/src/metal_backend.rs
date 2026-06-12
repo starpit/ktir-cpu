@@ -948,6 +948,7 @@ impl NaxGemm {
     /// where `E` is the row-major m×n elementwise operand. No host readback of
     /// the matmul result and no second kernel launch — the activation/bias runs
     /// in the GEMM store. See [`Epilogue`].
+    #[allow(clippy::too_many_arguments)]
     pub fn run_fused(
         &self,
         m: usize,
@@ -962,6 +963,7 @@ impl NaxGemm {
         self.run_epi(m, k, n, a, b, Some(e), epi)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_epi(
         &self,
         m: usize,
@@ -1179,6 +1181,32 @@ pub fn metal_gemm_or_blas(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) ->
     crate::blas::sgemm_rowmajor(m, k, n, a, b)
 }
 
+/// Fused `D = act(A·B BINOP E)` on the NAX engine, in one kernel — the matmul→
+/// elementwise fusion the interpreter peephole uses. Returns `Some(D)` only when
+/// the gate picks NAX (large enough to win) and the kernel runs; otherwise
+/// `None`, so the caller falls back to running the matmul and elementwise op
+/// separately. `e` is the row-major m×n elementwise operand.
+#[cfg(metal)]
+pub fn metal_gemm_fused(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    e: &[f32],
+    epi: Epilogue,
+) -> Option<Vec<f32>> {
+    let name = GEMM_DEVICE.with(|c| c.get_or_init(device_name).clone());
+    if !matches!(choose_matmul_backend(&name, m, k, n), MatmulBackend::Nax) {
+        return None;
+    }
+    GEMM_NAX.with(|c| {
+        c.get_or_init(|| NaxGemm::new().ok())
+            .as_ref()
+            .and_then(|g| g.run_fused(m, k, n, a, b, e, epi).ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,7 +1347,8 @@ kernel void mpp_probe(
         let e: Vec<f32> = (0..m * n).map(|i| (i % 11) as f32 * 0.1 - 0.5).collect();
         let mm = crate::blas::naive_sgemm(m, k, n, &a, &b);
 
-        let cases: &[(Epilogue, fn(f32, f32) -> f32)] = &[
+        type Case = (Epilogue, fn(f32, f32) -> f32);
+        let cases: &[Case] = &[
             (Epilogue::ADD, |c, ev| c + ev),
             (Epilogue::MUL, |c, ev| c * ev),
             (Epilogue::SUB, |c, ev| c - ev),

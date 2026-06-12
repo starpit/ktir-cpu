@@ -59,7 +59,7 @@ use ktir_cpu::context::CoreContext;
 use ktir_cpu::dialects::Dispatch;
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::env::{ExecutionEnv, GridExecutor};
-use ktir_cpu::interpreter::{execute_op, single_core_context};
+use ktir_cpu::interpreter::{execute_op, execute_ops, single_core_context};
 use ktir_cpu::ir::{Attr, Operation, Scalar, Value};
 use ktir_cpu::memory::SpyreMemoryHierarchy;
 use ktir_cpu::tile::Tile;
@@ -757,4 +757,51 @@ fn test_for_op_iter_args_running_sum() {
 fn test_while_op() {
     // Python: while before_region returns False stop; count increments to 3.
     // No scf.while handler exists in the Rust crate.
+}
+
+/// The matmul→elementwise peephole fusion produces the same result as running
+/// the two ops separately. Uses a size that trips the NAX gate so the fused
+/// kernel actually fires on an M5 (and falls back to exact separate execution
+/// when there's no Metal device — both must match the f32 oracle to tolerance).
+#[test]
+fn matmul_add_fusion_matches_separate() {
+    let (m, k, n) = (1024usize, 512usize, 1024usize);
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32 - 8.0) * 0.03).collect();
+    let e: Vec<f32> = (0..m * n).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+
+    // Oracle: f32 matmul then add E.
+    let mm = ktir_cpu::blas::naive_sgemm(m, k, n, &a, &b);
+    let want: Vec<f32> = mm.iter().zip(&e).map(|(&c, &ev)| c + ev).collect();
+
+    let dispatch = Dispatch::new();
+    let grid = GridExecutor::new((1, 1, 1));
+    let env = ExecutionEnv::new(&dispatch, &grid); // no tracker -> fusion may fire
+    // A real 1024² result tile (4 MB) exceeds the default 2 MB LX, so give this
+    // core a large LX to exercise the NAX-fused path end-to-end. (Per-op tiles in
+    // real KTIR programs are LX-bounded and thus below the NAX gate — see the
+    // note in metal_backend::choose_matmul_backend.)
+    let big_lx = Rc::new(std::cell::RefCell::new(ktir_cpu::memory::LXScratchpad::new(0, 256)));
+    let hbm = Rc::new(std::cell::RefCell::new(ktir_cpu::memory::HBMSimulator::default()));
+    let mut ctx = CoreContext::new(0, (0, 0, 0), hbm, Rc::clone(&big_lx), vec![big_lx]);
+    ctx.set_value("%A", tile_with(&a, DType::F32, &[m, k]));
+    ctx.set_value("%B", tile_with(&b, DType::F32, &[k, n]));
+    ctx.set_value("%E", tile_with(&e, DType::F32, &[m, n]));
+
+    let ops = vec![
+        Operation::new(Some("%C"), "linalg.matmul", &["%A", "%B"]),
+        Operation::new(Some("%D"), "linalg.add", &["%C", "%E"]),
+    ];
+    execute_ops(&ops, &mut ctx, &env).expect("execute fused ops");
+
+    let Value::Tile(d) = ctx.get_value("%D").expect("result %D") else {
+        panic!("%D is not a tile");
+    };
+    assert_eq!(d.shape, vec![m, n]);
+    let mut max_rel = 0.0f32;
+    for (got, w) in d.data.iter().zip(&want) {
+        max_rel = max_rel.max((got - w).abs() / w.abs().max(1.0));
+    }
+    // bf16 tolerance (NAX path); exact on the CPU-fallback path.
+    assert!(max_rel < 0.05, "fused matmul+add: max rel err {max_rel} too large");
 }

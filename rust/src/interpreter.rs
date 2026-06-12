@@ -80,10 +80,109 @@ pub fn execute_ops(
     ctx: &mut CoreContext,
     env: &ExecutionEnv,
 ) -> Result<(), String> {
-    for op in ops {
-        execute_op(op, ctx, env)?;
+    let mut i = 0;
+    while i < ops.len() {
+        // Peephole: fold `matmul` + a following elementwise op into one fused
+        // NAX kernel (no host elementwise pass, one GPU dispatch). Only fires
+        // when there's no latency tracker — the analytical model must still see
+        // each op individually — so it speeds up pure execution / validation
+        // without changing the latency report.
+        #[cfg(metal)]
+        if env.tracker.is_none()
+            && let Some(advance) = try_fuse_matmul_epilogue(ops, i, ctx)?
+        {
+            i += advance;
+            continue;
+        }
+        execute_op(&ops[i], ctx, env)?;
+        i += 1;
     }
     Ok(())
+}
+
+/// Try to fuse `ops[i]` (a 2-operand `linalg.matmul` producing `%c`) with the
+/// immediately following elementwise op that consumes `%c` (`linalg.add/mul/
+/// sub/max/min`), running both as one fused NAX kernel and binding the
+/// elementwise result. Returns `Some(2)` on a fuse, `None` to fall through to
+/// normal op-by-op execution. Conservative: only fuses when `%c` is used by
+/// nothing but that consumer, the shapes line up, and the size gate picks NAX.
+#[cfg(metal)]
+fn try_fuse_matmul_epilogue(
+    ops: &[Operation],
+    i: usize,
+    ctx: &mut CoreContext,
+) -> Result<Option<usize>, String> {
+    use crate::metal_backend::Epilogue;
+
+    let mm = &ops[i];
+    if mm.op_type != "linalg.matmul" || mm.operands.len() != 2 {
+        return Ok(None);
+    }
+    let Some(cname) = mm.result.as_deref() else { return Ok(None) };
+    let Some(ep) = ops.get(i + 1) else { return Ok(None) };
+    let Some(dname) = ep.result.as_deref() else { return Ok(None) };
+
+    // The consumer must be a fusable binary elementwise op with `%c` as one
+    // operand; `%e` is the other. For non-commutative ops the kernel computes
+    // `c BINOP e`, so `%c` must be the FIRST operand.
+    let Some(epi) = Epilogue::from_binary_op(&ep.op_type) else { return Ok(None) };
+    if ep.operands.len() != 2 {
+        return Ok(None);
+    }
+    let commutative = matches!(epi, Epilogue::ADD | Epilogue::MUL | Epilogue::MAX | Epilogue::MIN);
+    let ename = if ep.operands[0] == cname {
+        ep.operands[1].as_str()
+    } else if ep.operands[1] == cname && commutative {
+        ep.operands[0].as_str()
+    } else {
+        return Ok(None);
+    };
+
+    // `%c` must be dead after the consumer (else we'd still have to materialize
+    // it). Reject if it reappears later or is used twice by the consumer itself.
+    if ename == cname {
+        return Ok(None);
+    }
+    let reused = ops[i + 2..].iter().any(|o| o.operands.iter().any(|x| x == cname))
+        || ops[i + 1].operands.iter().filter(|x| x.as_str() == cname).count() > 1;
+    if reused {
+        return Ok(None);
+    }
+
+    // Pull A, B, E tiles; check 2-D, compatible inner dim, and E matching C.
+    let (a, b, e) = (
+        as_tile(ctx, &mm.operands[0])?,
+        as_tile(ctx, &mm.operands[1])?,
+        as_tile(ctx, ename)?,
+    );
+    if a.shape.len() != 2 || b.shape.len() != 2 || a.shape[1] != b.shape[0] {
+        return Ok(None);
+    }
+    let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
+    if e.shape != [m, n] {
+        return Ok(None);
+    }
+    let (a_data, b_data, e_data, dtype) =
+        (a.data.clone(), b.data.clone(), e.data.clone(), a.dtype);
+
+    // Fuse only if the gate picks NAX and the kernel runs; else fall through.
+    let Some(out) = crate::metal_backend::metal_gemm_fused(m, k, n, &a_data, &b_data, &e_data, epi)
+    else {
+        return Ok(None);
+    };
+    let tile = crate::tile::Tile::compute(out, dtype, vec![m, n]);
+    ctx.track_lx(dname, tile.size_bytes() as i64)?;
+    ctx.set_value(dname, crate::ir::Value::Tile(tile));
+    Ok(Some(2))
+}
+
+/// Borrow an SSA value as a `Tile`, or `Err` if it isn't one.
+#[cfg(metal)]
+fn as_tile<'a>(ctx: &'a CoreContext, name: &str) -> Result<&'a crate::tile::Tile, String> {
+    match ctx.get_value(name)? {
+        crate::ir::Value::Tile(t) => Ok(t),
+        _ => Err(format!("fuse: {name} is not a tile")),
+    }
 }
 
 /// Synchronous nested-region executor — the callback handlers use for scf.for
