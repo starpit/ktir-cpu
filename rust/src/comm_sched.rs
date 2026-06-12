@@ -192,6 +192,23 @@ impl CoreRunner {
             let op = &ops[self.op_idx];
             self.op_idx += 1;
             if is_comm_op(&op.op_type) {
+                // Charge the comm op's latency once (it doesn't go through
+                // execute_op). Cost is derived from the operand tile + grid size.
+                if let Some(tracker) = env.tracker {
+                    let operands: Vec<Option<Value>> = op
+                        .operands
+                        .iter()
+                        .map(|n| self.ctx.get_value(n).ok().cloned())
+                        .collect();
+                    // Comm ops aren't in the dispatch table; their class is Comm.
+                    tracker.borrow_mut().record_op(
+                        self.ctx.core_id,
+                        &op.op_type,
+                        crate::latency::LatencyCategory::Comm,
+                        &None,
+                        &operands,
+                    );
+                }
                 let mut comm = make_comm_op(op, &self.ctx)?;
                 match comm.step(&mut self.ctx, None)? {
                     CommStep::Recv(req) => {
@@ -229,8 +246,12 @@ pub fn execute_with_communication(
     ops: &[Operation],
     input_ptrs: &[(String, Value)],
     dispatch: &Dispatch,
+    tracker: Option<&std::cell::RefCell<crate::latency::LatencyTracker>>,
 ) -> Result<(), String> {
-    let env = ExecutionEnv { dispatch, grid };
+    let env = match tracker {
+        Some(t) => ExecutionEnv::with_tracker(dispatch, grid, t),
+        None => ExecutionEnv::new(dispatch, grid),
+    };
     let num_cores = grid.num_cores.max(1);
 
     let mut runners: BTreeMap<usize, CoreRunner> = BTreeMap::new();
@@ -327,7 +348,7 @@ mod tests {
         result_name: &str,
     ) -> Vec<Option<Value>> {
         let dispatch = Dispatch::new();
-        let env = ExecutionEnv { dispatch: &dispatch, grid };
+        let env = ExecutionEnv::new(&dispatch, grid);
         let n = grid.num_cores;
         let mut runners: Vec<CoreRunner> = (0..n)
             .map(|core_id| {
@@ -455,7 +476,7 @@ mod tests {
                 .with_attr("value", crate::ir::Attr::Int(7)),
             Operation::new(Some("%b"), "arith.addi", &["%a", "%a"]),
         ];
-        execute_with_communication(&grid, &mem, &ops, &[], &dispatch).unwrap();
+        execute_with_communication(&grid, &mem, &ops, &[], &dispatch, None).unwrap();
     }
 
     #[test]

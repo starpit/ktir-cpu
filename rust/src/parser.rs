@@ -897,7 +897,7 @@ mod tests {
 
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new(f.grid);
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         execute_ops(&f.operations, &mut ctx, &env).unwrap();
         match ctx.get_value("%d").unwrap() {

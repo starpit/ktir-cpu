@@ -345,7 +345,7 @@ mod tests {
     ) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new(grid);
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         execute_ops(ops, ctx, &env)
     }
 

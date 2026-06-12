@@ -467,7 +467,7 @@ mod tests {
     fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         execute_ops(ops, ctx, &env)
     }
 
@@ -828,7 +828,7 @@ mod tests {
         ctx.set_value("%v", Value::Scalar(Scalar::F32(3.0)));
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let op = Operation::new(None, "tensor.yield", &["%v"]);
         let out = execute_op(&op, &mut ctx, &env).unwrap();
         match out {

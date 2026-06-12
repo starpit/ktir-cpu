@@ -367,7 +367,7 @@ mod tests {
     fn run(op: &Operation, inputs: &[(&str, Value)]) -> Result<Value, String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         for (name, v) in inputs {
             ctx.set_value(name, v.clone());

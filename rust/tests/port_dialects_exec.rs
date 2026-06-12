@@ -1,4 +1,4 @@
-#![allow(clippy::needless_range_loop, clippy::type_complexity)]
+#![allow(clippy::needless_range_loop, clippy::type_complexity, clippy::approx_constant)]
 // Copyright 2025 The Torch-Spyre Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
@@ -62,7 +62,7 @@ fn run_op(op: &Operation, seed: &[(&str, Value)]) -> Value {
 fn run_op_try(op: &Operation, seed: &[(&str, Value)]) -> Result<Value, String> {
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     for (n, v) in seed {
         ctx.set_value(n, v.clone());
@@ -79,7 +79,7 @@ fn run_op_try(op: &Operation, seed: &[(&str, Value)]) -> Result<Value, String> {
 fn run_op_execute(op: &Operation, seed: &[(&str, Value)]) -> Value {
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     for (n, v) in seed {
         ctx.set_value(n, v.clone());
@@ -1095,7 +1095,7 @@ fn linalg_index() {
     // linalg.index returns a broadcasting index array for a dimension.
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     ctx.set_value("__linalg_shape__", Value::Tuple(vec![Value::Index(4), Value::Index(3)]));
     let o = Operation::new(Some("%r"), "linalg.index", &[]).with_attr("dim", Attr::Int(0));
@@ -1111,7 +1111,7 @@ fn linalg_yield() {
     // returns None (no SSA result). Drive it directly and check the parked value.
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     ctx.set_value("%v", idx(42));
     let o = Operation::new(None, "linalg.yield", &["%v"]);
@@ -1281,7 +1281,7 @@ fn return_no_value() {
     // func.return with no operands returns None.
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     let o = Operation::new(None, "func.return", &[]);
     let out = dispatch.handler("func.return").unwrap()(&o, &mut ctx, &env).unwrap();
@@ -1340,7 +1340,7 @@ fn get_compute_tile_id_single() {
     // Single-dim returns the x grid coordinate as an Index. Core at grid x = 3.
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((4, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mem = SpyreMemoryHierarchy::new(4);
     let mut ctx = CoreContext::new(3, (3, 0, 0), Rc::clone(&mem.hbm), mem.get_lx(3), mem.lx_scratchpads.clone());
     let o = Operation::new(Some("%id"), "ktdp.get_compute_tile_id", &[]);
@@ -1353,7 +1353,7 @@ fn get_compute_tile_id_multi() {
     // Multi-dim returns a tuple of grid coordinates. Core at grid (2,1,0).
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((4, 2, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mem = SpyreMemoryHierarchy::new(8);
     let core = grid.grid_to_linear(2, 1, 0);
     let mut ctx = CoreContext::new(core, (2, 1, 0), Rc::clone(&mem.hbm), mem.get_lx(core), mem.lx_scratchpads.clone());
@@ -1374,7 +1374,7 @@ fn construct_memory_view() {
     // Builds a MemRef at the given pointer with the given shape.
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
     let ptr = ctx.hbm.borrow_mut().allocate(256 * 2);
     ctx.set_value("%ptr", Value::Index(ptr));
@@ -1404,7 +1404,7 @@ fn load_store_roundtrip() {
 
     let dispatch = Dispatch::new();
     let grid = GridExecutor::new((1, 1, 1));
-    let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+    let env = ExecutionEnv::new(&dispatch, &grid);
     let mut ctx = single_core_context();
 
     let n = 8usize;

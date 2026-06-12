@@ -1006,7 +1006,7 @@ mod tests {
     fn run_op(op: &Operation, seed: &[(&str, Value)]) -> Value {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         for (n, v) in seed {
             ctx.set_value(n, v.clone());

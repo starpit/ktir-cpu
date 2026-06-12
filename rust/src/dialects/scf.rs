@@ -307,7 +307,7 @@ mod tests {
     fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         execute_ops(ops, ctx, &env)
     }
 
@@ -584,7 +584,7 @@ mod tests {
         ctx.set_value("%b", Value::Scalar(Scalar::I64(2)));
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let op = Operation::new(None, "scf.yield", &["%a", "%b"]);
         let out = scf_yield(&op, &mut ctx, &env).unwrap();
         match out {

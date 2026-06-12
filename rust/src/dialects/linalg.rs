@@ -756,7 +756,7 @@ mod tests {
     fn run(ops: &[Operation], ctx: &mut CoreContext) -> Result<(), String> {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         execute_ops(ops, ctx, &env)
     }
 
@@ -1149,7 +1149,7 @@ mod tests {
         ctx.set_value(SHAPE_KEY, Value::Tuple(vec![Value::Index(2), Value::Index(3)]));
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let op = Operation::new(Some("%i"), "linalg.index", &[]).with_attr("dim", Attr::Int(1));
         let v = super::index(&op, &mut ctx, &env).unwrap().unwrap();
         match v {
@@ -1168,7 +1168,7 @@ mod tests {
         ctx.set_value(SHAPE_KEY, Value::Tuple(vec![Value::Index(4), Value::Index(2)]));
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let op = Operation::new(Some("%i"), "linalg.index", &[]).with_attr("dim", Attr::Int(0));
         let v = super::index(&op, &mut ctx, &env).unwrap().unwrap();
         match v {

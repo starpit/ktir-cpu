@@ -13,7 +13,10 @@
 //! shared, read-only resources a handler needs: the dispatch table (to run
 //! nested regions) and grid metadata.
 
+use std::cell::RefCell;
+
 use crate::dialects::Dispatch;
+use crate::latency::LatencyTracker;
 
 /// Grid shape and linear<->(x,y,z) transforms. Mirrors `GridExecutor`'s
 /// `_linear_to_grid` / `_grid_to_linear`.
@@ -46,12 +49,35 @@ impl GridExecutor {
     }
 }
 
-/// Read-only resources passed to every handler. Mirrors `ExecutionEnv`.
-/// Borrows the dispatch table (handlers run nested regions through it) and grid
-/// metadata; mutates nothing.
+/// Resources passed to every handler. Mirrors `ExecutionEnv`. Borrows the
+/// dispatch table (handlers run nested regions through it) and grid metadata.
+///
+/// `tracker` is the optional latency tracker: when set, `execute_op` records
+/// each op's cost as it runs — and because the same `env` flows into handlers'
+/// `execute_region` calls, region-nested ops are metered too (matching the
+/// Python interpreter, where `_execute_op` always consults `self._latency_tracker`).
+/// `RefCell` because the env is shared `&` across the call tree but the tracker
+/// mutates; the interpreter is single-threaded/cooperative so no lock is needed.
 pub struct ExecutionEnv<'a> {
     pub dispatch: &'a Dispatch,
     pub grid: &'a GridExecutor,
+    pub tracker: Option<&'a RefCell<LatencyTracker>>,
+}
+
+impl<'a> ExecutionEnv<'a> {
+    /// Env with latency tracking disabled (the common case).
+    pub fn new(dispatch: &'a Dispatch, grid: &'a GridExecutor) -> Self {
+        ExecutionEnv { dispatch, grid, tracker: None }
+    }
+
+    /// Env that records per-op latency into `tracker`.
+    pub fn with_tracker(
+        dispatch: &'a Dispatch,
+        grid: &'a GridExecutor,
+        tracker: &'a RefCell<LatencyTracker>,
+    ) -> Self {
+        ExecutionEnv { dispatch, grid, tracker: Some(tracker) }
+    }
 }
 
 #[cfg(test)]

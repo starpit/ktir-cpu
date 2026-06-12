@@ -37,6 +37,21 @@ pub fn execute_op(
         .handler(&op.op_type)
         .ok_or_else(|| format!("no handler registered for op '{}'", op.op_type))?;
     let produced = handler(op, ctx, env)?;
+
+    // Latency: record this op's cost before binding its result (operands are
+    // still bound in scope; the result is not yet). Mirrors `_execute_op`.
+    if let Some(tracker) = env.tracker {
+        let operands: Vec<Option<Value>> = op
+            .operands
+            .iter()
+            .map(|n| ctx.get_value(n).ok().cloned())
+            .collect();
+        let category = env.dispatch.latency_category(&op.op_type);
+        tracker
+            .borrow_mut()
+            .record_op(ctx.core_id, &op.op_type, category, &produced, &operands);
+    }
+
     if let Some(name) = &op.result {
         match produced {
             Some(val) => {
@@ -131,10 +146,70 @@ pub fn execute_function(
     let grid = GridExecutor::new(func.grid);
     let dispatch = Dispatch::new();
 
-    // Allocate tensor inputs in HBM (stick index bound as the pointer); scalars
-    // bind directly. Record tensor metadata for read-back.
+    let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
+
+    // Drive all cores via the comm scheduler (cores with no comm op simply run
+    // to completion; ring/collective ops suspend and resume through it).
+    crate::comm_sched::execute_with_communication(
+        &grid,
+        &mem,
+        &func.operations,
+        &input_ptrs,
+        &dispatch,
+        None,
+    )?;
+
+    read_back(&mem, tensor_meta)
+}
+
+/// Like [`execute_function`], but records per-op latency and returns the report
+/// alongside the outputs. Port of running `KTIRInterpreter` with a
+/// `latency_config`. Every op (including region-nested ops, via the shared
+/// `ExecutionEnv`) is metered; comm ops are charged by the scheduler.
+pub fn execute_function_with_latency(
+    module: &IRModule,
+    func_name: &str,
+    args: &[(&str, Arg)],
+    config: crate::latency::HardwareConfig,
+) -> Result<(HashMap<String, Output>, crate::latency::LatencyReport), String> {
+    use std::cell::RefCell;
+
+    let func = module.get_function(func_name)?;
+    let (gx, gy, gz) = func.grid;
+    let num_cores = gx * gy * gz;
+
+    let mem = SpyreMemoryHierarchy::new(num_cores.max(1));
+    let grid = GridExecutor::new(func.grid);
+    let dispatch = Dispatch::new();
+    let tracker = RefCell::new(crate::latency::LatencyTracker::new(config));
+
+    let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
+
+    crate::comm_sched::execute_with_communication(
+        &grid,
+        &mem,
+        &func.operations,
+        &input_ptrs,
+        &dispatch,
+        Some(&tracker),
+    )?;
+
+    let outputs = read_back(&mem, tensor_meta)?;
+    let report = tracker.borrow().report();
+    Ok((outputs, report))
+}
+
+/// Tensor read-back metadata: `(name, stick, n_elements, shape, dtype)`.
+type TensorMeta = (String, i64, usize, Vec<usize>, DType);
+
+/// Marshal tensor args into HBM and return `(input_ptrs, tensor_meta)`.
+/// Shared by the plain and latency-tracked execution paths.
+fn marshal_inputs(
+    mem: &SpyreMemoryHierarchy,
+    args: &[(&str, Arg)],
+) -> (Vec<(String, Value)>, Vec<TensorMeta>) {
     let mut input_ptrs: Vec<(String, Value)> = Vec::new();
-    let mut tensor_meta: Vec<(String, i64, usize, Vec<usize>, DType)> = Vec::new(); // name, stick, n, shape, dtype
+    let mut tensor_meta: Vec<TensorMeta> = Vec::new();
     for (name, arg) in args {
         match arg {
             Arg::Tensor { data, shape, dtype } => {
@@ -146,37 +221,24 @@ pub fn execute_function(
                     stick
                 };
                 input_ptrs.push((name.to_string(), Value::Index(stick)));
-                tensor_meta.push((
-                    name.to_string(),
-                    stick,
-                    shape.iter().product(),
-                    shape.clone(),
-                    *dtype,
-                ));
+                tensor_meta.push((name.to_string(), stick, shape.iter().product(), shape.clone(), *dtype));
             }
             Arg::Scalar(s) => input_ptrs.push((name.to_string(), Value::Scalar(*s))),
         }
     }
+    (input_ptrs, tensor_meta)
+}
 
-    // Drive all cores via the comm scheduler (cores with no comm op simply run
-    // to completion; ring/collective ops suspend and resume through it).
-    crate::comm_sched::execute_with_communication(
-        &grid,
-        &mem,
-        &func.operations,
-        &input_ptrs,
-        &dispatch,
-    )?;
-
-    // Read tensor args back from HBM.
+/// Read every tensor arg back out of HBM into an `Output`.
+fn read_back(
+    mem: &SpyreMemoryHierarchy,
+    tensor_meta: Vec<TensorMeta>,
+) -> Result<HashMap<String, Output>, String> {
     let mut outputs = HashMap::new();
     for (name, stick, n, shape, dtype) in tensor_meta {
         let nbytes = n * dtype.bytes_per_elem();
         let bytes = mem.hbm.borrow().read_bytes(stick * STICK_BYTES, nbytes);
-        outputs.insert(
-            name,
-            Output { data: codec::decode(&bytes, n, dtype), shape, dtype },
-        );
+        outputs.insert(name, Output { data: codec::decode(&bytes, n, dtype), shape, dtype });
     }
     Ok(outputs)
 }
@@ -193,7 +255,7 @@ mod tests {
     fn run(ops: &[Operation]) -> CoreContext {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         execute_ops(ops, &mut ctx, &env).unwrap();
         ctx
@@ -218,7 +280,7 @@ mod tests {
     fn elementwise_tile_add_tracks_lx() {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         ctx.set_value("%x", Value::Tile(Tile::compute(vec![1.0, 2.0, 3.0], DType::F32, vec![3])));
         ctx.set_value("%y", Value::Tile(Tile::compute(vec![10.0, 20.0, 30.0], DType::F32, vec![3])));
@@ -236,7 +298,7 @@ mod tests {
     fn unknown_op_errors() {
         let dispatch = Dispatch::new();
         let grid = GridExecutor::new((1, 1, 1));
-        let env = ExecutionEnv { dispatch: &dispatch, grid: &grid };
+        let env = ExecutionEnv::new(&dispatch, &grid);
         let mut ctx = single_core_context();
         let ops = vec![Operation::new(Some("%z"), "ktdp.not_yet", &[])];
         let err = execute_ops(&ops, &mut ctx, &env).unwrap_err();
