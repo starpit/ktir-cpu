@@ -242,7 +242,7 @@ fn find_functions(text: &str) -> Result<Vec<ParsedFn>, String> {
         // `module {` close; intermediate blocks (the attributes block) are
         // skipped. Mirrors `_extract_brace_body`.
         let (body_open, body_close) =
-            last_top_level_block(bytes, rparen + 1).ok_or("function missing body")?;
+            last_top_level_block(text, rparen + 1).ok_or("function missing body")?;
         // The grid attribute lives in the header span up to the body block —
         // which still contains the skipped `attributes { grid = ... }`.
         let grid = parse_grid(&text[rparen..body_open]);
@@ -254,13 +254,23 @@ fn find_functions(text: &str) -> Result<Vec<ParsedFn>, String> {
     Ok(out)
 }
 
-/// Scan from `start`, skipping over each top-level `{...}` block, and return
-/// the `(open, close)` indices of the LAST one before an unmatched `}` (the
-/// enclosing scope's close) or end of input. Mirrors `_extract_brace_body`.
-fn last_top_level_block(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+/// Scan from `start`, skipping over each top-level `{...}` block, and return the
+/// `(open, close)` indices of the LAST one belonging to THIS function — i.e. the
+/// last block before the next top-level `func.func`, an unmatched `}` (the
+/// enclosing `module {` close), or end of input. The `func.func` stop is what
+/// keeps a multi-function module from grabbing a later function's body as this
+/// one's (a function's header has at most the attributes dict + the body block
+/// before the next `func.func`). Mirrors `_extract_brace_body`.
+fn last_top_level_block(text: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
     let mut pos = start;
     let mut last = None;
     while pos < bytes.len() {
+        // Once we've recorded this function's body, the next top-level
+        // `func.func` begins a sibling — stop before consuming its blocks.
+        if last.is_some() && text[pos..].starts_with("func.func") {
+            break;
+        }
         match bytes[pos] {
             b'{' => {
                 let close = matching(bytes, pos, b'{', b'}')?;
@@ -1845,6 +1855,40 @@ mod tests {
         assert_eq!(a.get("memory_space"), Some(&Attr::Str("LX".to_string())));
         assert_eq!(a.get("lx_core_id"), Some(&Attr::Int(3)));
         assert!(matches!(a.get("coordinate_set"), Some(Attr::AffineSet(_))));
+    }
+
+    #[test]
+    fn parses_multiple_functions_in_one_module() {
+        // Regression: a module with >1 func.func must keep every function with
+        // its OWN body (previously the body scan overshot and `@a` swallowed
+        // `@b`'s body, so `@b` was never registered).
+        let src = r#"
+            module {
+              func.func @a(%x: index) attributes {grid = [1]} {
+                %va = arith.constant 1 : index
+                return
+              }
+              func.func @b(%y: index) attributes {grid = [2]} {
+                %vb = arith.constant 2 : index
+                %wb = arith.constant 3 : index
+                return
+              }
+            }
+        "#;
+        let m = parse_module(src).unwrap();
+        let a = m.get_function("a").expect("@a present");
+        let b = m.get_function("b").expect("@b present");
+        assert_eq!(a.grid, (1, 1, 1), "@a grid");
+        assert_eq!(b.grid, (2, 1, 1), "@b grid");
+        // @a's body has one constant + return; @b's has two constants + return.
+        // (The overshoot bug gave @a @b's body, or dropped @b entirely.)
+        let consts = |f: &IRFunction| {
+            f.operations.iter().filter(|o| o.op_type == "arith.constant").count()
+        };
+        assert_eq!(consts(a), 1, "@a body kept its own ops");
+        assert_eq!(consts(b), 2, "@b body kept its own ops");
+        assert!(a.operations.iter().any(|o| o.result.as_deref() == Some("%va")));
+        assert!(b.operations.iter().any(|o| o.result.as_deref() == Some("%wb")));
     }
 
     #[test]

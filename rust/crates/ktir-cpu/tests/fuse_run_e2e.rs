@@ -29,10 +29,10 @@ const N: usize = 8; // producer tensor length
 const TILE: usize = 4; // consumer reads t2[0:TILE]
 
 /// `@a`: out = exp(in) over the whole length-N tensor (a whole-tensor edge on
-/// the produce side). Each node is its own single-function module — the KTIR
-/// emitter ships one function per file (nodeN.mlir), and the fusion driver
-/// assembles them into one `IRModule`, which is what we reproduce here.
-fn node_a() -> &'static str {
+/// the produce side). `@b`: out = exp(in[0:TILE]) — a contiguous sub-tile read,
+/// the tiled edge increment 2 forwards via extract_slice. Both live in one
+/// module (multi-function parsing works since the `last_top_level_block` fix).
+fn program() -> &'static str {
     r#"
 module {
   func.func @a(%in: index, %out: index) attributes {grid = [1]} {
@@ -58,15 +58,6 @@ module {
     ktdp.store %y, %tout : tensor<8xf16>, !ktdp.access_tile<8xindex>
     return
   }
-}
-"#
-}
-
-/// `@b`: out = exp(in[0:TILE]) — a contiguous sub-tile read, the tiled edge
-/// increment 2 forwards via extract_slice.
-fn node_b() -> &'static str {
-    r#"
-module {
   func.func @b(%in: index, %out: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %vin = ktdp.construct_memory_view %in, sizes: [8], strides: [1] {
@@ -92,18 +83,6 @@ module {
   }
 }
 "#
-}
-
-/// Assemble the per-node single-function modules into one `IRModule`.
-fn assembled_module() -> IRModule {
-    let mut m = IRModule::default();
-    for src in [node_a(), node_b()] {
-        let parsed = parse_module(src).expect("parse node module");
-        for (_, f) in parsed.functions {
-            m.add_function(f);
-        }
-    }
-    m
 }
 
 /// a: t1(src) -> t2;  b: t2 -> t3(result).  t2 is the tiled forwarded edge.
@@ -140,7 +119,7 @@ fn out(map: &std::collections::HashMap<String, Output>, key: &str) -> Vec<f32> {
 
 #[test]
 fn fused_tiled_edge_matches_per_node_oracle() {
-    let module = assembled_module();
+    let module = parse_module(program()).expect("parse two-node program");
 
     // Input t1: small values so exp(exp(.)) stays comfortably in f16 range.
     let t1: Vec<f32> = (0..N).map(|i| i as f32 * 0.1 - 0.3).collect();
