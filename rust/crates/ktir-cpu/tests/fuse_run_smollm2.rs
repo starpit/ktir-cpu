@@ -184,6 +184,50 @@ fn run_per_node_result(dir: &std::path::Path) -> Vec<f32> {
     buf[&manifest["result"].as_u64().unwrap()].clone()
 }
 
+/// PREFILL multi-core SPMD vs golden — the AUTHORITATIVE gate for cross-core
+/// grid execution. Runs every prefill node at its NATIVE grid ([1,1] / [8,1]
+/// token-parallel matmuls / [9,1] attention heads), threading one shared HBM
+/// buffer per tensor between nodes, and compares the final result to golden.bin.
+///
+/// Each [8,1] node has 8 cores compute one token row each (`%pid =
+/// get_compute_tile_id`, store `view[%pid, ...]`); each [9,1] node has 9 cores
+/// compute one attention head each (writing disjoint 64-column head slices of
+/// the shared rows). All cores write to the SAME shared HBM, and the readback
+/// must capture every core's slice. A broken multi-core path (e.g. cores
+/// clobbering each other's rows/columns, or get_compute_tile_id mapping, or a
+/// readback that only sees one core's HBM) produces head-0-only attention and
+/// diverges from golden by ~0.18. A correct one matches to f16 tolerance.
+///
+/// 0.05 is well above the observed ~0.0034 f16 noise yet far below the ~0.18 a
+/// broken multi-core attention would give, so it rigorously distinguishes
+/// correct cross-core SPMD from broken — it is not a rubber-stamp tolerance.
+#[test]
+#[ignore = "real-model prefill per-node multi-core; needs smollm2-135m-prefill. --ignored --nocapture"]
+fn smollm2_135m_prefill_per_node_multicore_matches_golden() {
+    let Some(dir) = bundle_dir_named("smollm2-135m-prefill") else {
+        eprintln!("SmolLM2 prefill bundle absent — skipping");
+        return;
+    };
+    let result = run_per_node_result(&dir);
+    let golden = read_f32(&dir.join("golden.bin"));
+    assert_eq!(result.len(), golden.len(), "result length");
+    let finite = result.iter().filter(|x| x.is_finite()).count();
+    let max_abs = result
+        .iter()
+        .zip(&golden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "PREFILL per-node MULTI-CORE result vs golden: {finite}/{} finite, max abs diff {max_abs:.5}",
+        result.len()
+    );
+    assert_eq!(finite, result.len(), "all result elements finite");
+    assert!(
+        max_abs < 0.05,
+        "prefill per-node multi-core diverges from golden by {max_abs} — cross-core SPMD is wrong"
+    );
+}
+
 /// Marshal the fused-function args for a bundle (sources from t{id}.bin, mask +
 /// results/intermediates zeroed), returning (fused module, arg list, result_id).
 fn fused_run_inputs(dir: &std::path::Path) -> (IRModule, Vec<(String, Arg)>, u64) {
@@ -366,17 +410,22 @@ fn smollm2_135m_prefill_fused_matches_golden() {
         "prefill fused diverges from golden by {golden_diff} — fusion/attention is wrong"
     );
 
-    // Informational: a from-scratch per-node oracle that runs each node at its
-    // OWN grid ([8,1]/[9,1]). It diverges from golden (~0.18) — i.e. the
-    // emulator's MULTI-CORE SPMD execution of prefill nodes does not reproduce
-    // golden's generation (a pre-existing question; the repo has no prefill
-    // per-node test, only decode). The fused path matches golden, so we gate on
-    // golden, not on this unvalidated oracle.
+    // CROSS-CORE GATE: a from-scratch per-node oracle that runs each node at its
+    // OWN grid ([8,1] token-parallel / [9,1] attention heads), the multi-core
+    // SPMD path. It now MATCHES golden to f16 tolerance (~0.0034) — i.e. the
+    // emulator's MULTI-CORE SPMD execution of prefill nodes reproduces golden's
+    // generation. (Earlier it diverged ~0.18 from a broken head-0-only
+    // attention; this asserts that regression cannot return.) The fused
+    // single-grid path also matches golden, so the two agree.
     let oracle = run_per_node_result(&dir);
     let golden = read_f32(&dir.join("golden.bin"));
     let oracle_vs_golden = oracle.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     let fused_vs_oracle = fused.iter().zip(&oracle).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    eprintln!("  (info) per-node multi-core oracle vs golden: {oracle_vs_golden:.5}; fused vs oracle: {fused_vs_oracle:.5}");
+    eprintln!("  per-node multi-core oracle vs golden: {oracle_vs_golden:.5}; fused vs oracle: {fused_vs_oracle:.5}");
+    assert!(
+        oracle_vs_golden < 0.05,
+        "prefill per-node multi-core SPMD diverges from golden by {oracle_vs_golden} — cross-core execution is wrong"
+    );
 }
 
 /// PREFILL readiness: fuse the M=8 prefill bundle and confirm EVERY scf.for
