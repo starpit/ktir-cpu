@@ -293,13 +293,40 @@ fn trace_buffer(name: &str, defs: &HashMap<String, &Operation>) -> Option<String
     None
 }
 
-/// Buffers feeding a compute op's tile operands (each operand is a load).
+/// Every distinct input buffer feeding a fused elementwise expression tree, in
+/// first-seen (DFS pre-order) order. Recurses through chained compute ops so a
+/// fused kernel binds each loaded buffer once, no matter how deep in the
+/// expression it appears.
 fn collect_input_buffers(compute: &Operation, defs: &HashMap<String, &Operation>) -> Vec<String> {
-    compute
-        .operands
-        .iter()
-        .filter_map(|o| trace_buffer(o, defs))
-        .collect()
+    let mut out = Vec::new();
+    collect_bufs(compute, defs, &mut out, 0);
+    out
+}
+
+fn collect_bufs(
+    op: &Operation,
+    defs: &HashMap<String, &Operation>,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > MAX_FUSE_DEPTH {
+        return;
+    }
+    for operand in &op.operands {
+        match defs.get(strip(operand)) {
+            // A loaded tile is a leaf buffer.
+            Some(d) if d.op_type == "ktdp.load" => {
+                if let Some(b) = trace_buffer(operand, defs)
+                    && !out.contains(&b)
+                {
+                    out.push(b);
+                }
+            }
+            // A chained compute op: descend into its inputs.
+            Some(d) => collect_bufs(d, defs, out, depth + 1),
+            None => {}
+        }
+    }
 }
 
 /// Element dtype of a buffer, read from the `construct_memory_view` that
@@ -330,17 +357,53 @@ fn msl_type(dt: DType) -> &'static str {
 
 // --- compute lowering ----------------------------------------------------
 
-/// Lower a single element-wise compute op into an MSL expression over `gid`.
-/// Operands resolve to `<buffer>[gid]`.
+/// Cap on fused-expression nesting — guards against pathological depth (and any
+/// accidental cycle) while comfortably covering real elementwise chains.
+const MAX_FUSE_DEPTH: usize = 256;
+
+/// Lower an element-wise compute op into an MSL expression over `gid`, recursing
+/// through chained compute operands so an entire elementwise DAG collapses into
+/// ONE fused expression. Loaded tiles become `<buffer>[gid]` leaves; a chained
+/// compute operand becomes a parenthesized sub-expression. This is the core of
+/// MLX-style kernel fusion: `load,load,mul,exp,add -> store` lowers to a single
+/// `exp(a[gid]*b[gid]) + c[gid]` kernel instead of three passes.
 fn lower_compute(op: &Operation, defs: &HashMap<String, &Operation>) -> Result<String, String> {
+    lower_compute_depth(op, defs, 0)
+}
+
+/// Resolve one operand SSA name to its MSL sub-expression: a loaded tile is a
+/// `buf[gid]` leaf; anything else is recursively lowered as a compute op (which
+/// errors if it isn't elementwise).
+fn lower_value(
+    name: &str,
+    defs: &HashMap<String, &Operation>,
+    depth: usize,
+) -> Result<String, String> {
+    if depth > MAX_FUSE_DEPTH {
+        return Err("metal: fused expression exceeds max depth".into());
+    }
+    match defs.get(strip(name)) {
+        None => Err(format!("metal: operand {name} has no defining op")),
+        Some(d) if d.op_type == "ktdp.load" => {
+            let buf = trace_buffer(name, defs)
+                .ok_or_else(|| format!("metal: operand {name} is not a loaded buffer"))?;
+            Ok(format!("{buf}[gid]"))
+        }
+        Some(d) => Ok(format!("({})", lower_compute_depth(d, defs, depth + 1)?)),
+    }
+}
+
+fn lower_compute_depth(
+    op: &Operation,
+    defs: &HashMap<String, &Operation>,
+    depth: usize,
+) -> Result<String, String> {
     let operand = |i: usize| -> Result<String, String> {
         let name = op
             .operands
             .get(i)
             .ok_or_else(|| format!("metal: {} missing operand {i}", op.op_type))?;
-        let buf = trace_buffer(name, defs)
-            .ok_or_else(|| format!("metal: operand {name} is not a loaded buffer"))?;
-        Ok(format!("{buf}[gid]"))
+        lower_value(name, defs, depth)
     };
 
     // Binary element-wise float ops -> infix operator.
@@ -2456,6 +2519,64 @@ kernel void mpp_probe(
         assert!(
             msl.contains("output_ptr[gid] = x_ptr[gid] + y_ptr[gid];"),
             "unexpected body:\n{msl}"
+        );
+    }
+
+    #[test]
+    fn fuses_elementwise_chain_into_one_expression() {
+        // exp(a * b) + c  -> a single fused kernel, not three passes.
+        let src = r#"
+module {
+  func.func @chain(%a_ptr: index, %b_ptr: index, %c_ptr: index, %out_ptr: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %va = ktdp.construct_memory_view %a_ptr, sizes: [8], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8xf16>
+    %vb = ktdp.construct_memory_view %b_ptr, sizes: [8], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8xf16>
+    %vc = ktdp.construct_memory_view %c_ptr, sizes: [8], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8xf16>
+    %ta = ktdp.construct_access_tile %va[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
+    %tb = ktdp.construct_access_tile %vb[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
+    %tc = ktdp.construct_access_tile %vc[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
+    %la = ktdp.load %ta : !ktdp.access_tile<8xindex> -> tensor<8xf16>
+    %lb = ktdp.load %tb : !ktdp.access_tile<8xindex> -> tensor<8xf16>
+    %lc = ktdp.load %tc : !ktdp.access_tile<8xindex> -> tensor<8xf16>
+    %ab = arith.mulf %la, %lb : tensor<8xf16>
+    %e = math.exp %ab : tensor<8xf16>
+    %r = arith.addf %e, %lc : tensor<8xf16>
+    %vout = ktdp.construct_memory_view %out_ptr, sizes: [8], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8xf16>
+    %tout = ktdp.construct_access_tile %vout[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
+    ktdp.store %r, %tout : tensor<8xf16>, !ktdp.access_tile<8xindex>
+    return
+  }
+}
+"#;
+        let module = parse_module(src).unwrap();
+        let kernel = emit_kernel(&module, "chain").expect("emit fused chain");
+        // One kernel, three input buffers (a,b,c) + one output, deduped & ordered.
+        let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["a_ptr", "b_ptr", "c_ptr", "out_ptr"], "fused buffer set");
+        assert_eq!(kernel.buffers.iter().filter(|b| b.is_output).count(), 1);
+        // The whole DAG collapses into one assignment: exp(a*b) + c.
+        assert!(
+            kernel.source.contains(
+                "out_ptr[gid] = (exp((a_ptr[gid] * b_ptr[gid]))) + c_ptr[gid];"
+            ),
+            "expected one fused expression, got:\n{}",
+            kernel.source
         );
     }
 
