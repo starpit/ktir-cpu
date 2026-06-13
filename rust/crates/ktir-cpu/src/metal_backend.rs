@@ -1446,35 +1446,91 @@ fn render_kernel(name: &str, buffers: &[BufferBinding], expr: &str) -> String {
 ///
 /// Returns `Err("no Metal device …")` when no GPU is available (e.g. headless
 /// CI), so callers can skip gracefully.
+/// Shared per-thread Metal device + queue + compiled-pipeline cache. Without
+/// this, `run_kernel` compiled a fresh MTLLibrary+pipeline on EVERY dispatch —
+/// fine for the old one-shot kernels, but with map-window fusion a single pass
+/// dispatches ~900 kernels, and recompiling each one per pass is both slow and
+/// exhausts GPU pipeline objects across many passes. Pipelines are keyed by MSL
+/// source hash (the model's repeated layers share identical kernels), so each
+/// distinct kernel compiles exactly once per thread.
+#[cfg(metal)]
+struct MetalDispatch {
+    device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+    pipelines: HashMap<
+        u64,
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+    >,
+}
+
+#[cfg(metal)]
+thread_local! {
+    static METAL_DISPATCH: std::cell::RefCell<Option<MetalDispatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Device + queue + the cached pipeline for `kernel` (compiled on first sight).
+#[cfg(metal)]
+#[allow(clippy::type_complexity)]
+fn cached_dispatch(
+    kernel: &MslKernel,
+) -> Result<
+    (
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+    ),
+    String,
+> {
+    use objc2_foundation::NSString;
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary};
+    use std::hash::{Hash, Hasher};
+
+    METAL_DISPATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+            let queue = device.newCommandQueue().ok_or("metal: newCommandQueue nil")?;
+            *slot = Some(MetalDispatch { device, queue, pipelines: HashMap::new() });
+        }
+        let d = slot.as_mut().unwrap();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        kernel.source.hash(&mut h);
+        let key = h.finish();
+        if !d.pipelines.contains_key(&key) {
+            let opts = objc2_metal::MTLCompileOptions::new();
+            let src = NSString::from_str(&kernel.source);
+            let library = d
+                .device
+                .newLibraryWithSource_options_error(&src, Some(&opts))
+                .map_err(|e| format!("metal: MSL compile failed: {e:?}"))?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str(&kernel.name))
+                .ok_or_else(|| format!("metal: kernel {:?} not found", kernel.name))?;
+            let pipeline = d
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
+            d.pipelines.insert(key, pipeline);
+        }
+        Ok((d.device.clone(), d.queue.clone(), d.pipelines[&key].clone()))
+    })
+}
+
 pub fn run_kernel(
     kernel: &MslKernel,
     inputs: &[Vec<f32>],
     out_len: usize,
 ) -> Result<Vec<f32>, String> {
-    use objc2_foundation::NSString;
     use objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-        MTLResourceOptions, MTLSize,
+        MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
     };
     use std::ffi::c_void;
     use std::ptr::NonNull;
 
-    let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
-    let opts = objc2_metal::MTLCompileOptions::new();
-    let src = NSString::from_str(&kernel.source);
-    let library = device
-        .newLibraryWithSource_options_error(&src, Some(&opts))
-        .map_err(|e| format!("metal: MSL compile failed: {e:?}"))?;
-    let function = library
-        .newFunctionWithName(&NSString::from_str(&kernel.name))
-        .ok_or_else(|| format!("metal: kernel {:?} not found", kernel.name))?;
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
-    let queue = device
-        .newCommandQueue()
-        .ok_or("metal: newCommandQueue returned nil")?;
+    // Cached device/queue/pipeline — compiled once per distinct MSL source.
+    let (device, queue, pipeline) = cached_dispatch(kernel)?;
 
     let res = MTLResourceOptions::StorageModeShared;
     let mut gpu_buffers = Vec::with_capacity(kernel.buffers.len());
