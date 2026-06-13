@@ -389,7 +389,90 @@ fn lower_value(
                 .ok_or_else(|| format!("metal: operand {name} is not a loaded buffer"))?;
             Ok(format!("{buf}[gid]"))
         }
+        // A broadcast reads its (buffer) input at a gid-derived index that
+        // repeats along the broadcast axes — `w[gid % N]` for a per-column
+        // weight, `s[0]` for a scalar. The input must trace to a loaded buffer
+        // (a computed value broadcast across a reduction is a separate kernel).
+        Some(d) if d.op_type == "linalg.broadcast" => lower_broadcast(d, defs),
         Some(d) => Ok(format!("({})", lower_compute_depth(d, defs, depth + 1)?)),
+    }
+}
+
+/// Lower `linalg.broadcast ins(%x) outs(%init) dimensions=[..]` to `buf[idx]`,
+/// where `idx` maps the kernel's flat `gid` (over the broadcast's output shape)
+/// to the input buffer's element, holding the broadcast axes constant.
+fn lower_broadcast(op: &Operation, defs: &HashMap<String, &Operation>) -> Result<String, String> {
+    let input = op
+        .operands
+        .first()
+        .ok_or("metal: linalg.broadcast missing ins operand")?;
+    let buf = trace_buffer(input, defs).ok_or(
+        "metal: broadcast input must be a loaded buffer (a value broadcast across a \
+         reduction is a separate kernel)",
+    )?;
+    let in_shape = shape_attr_vec(defs.get(strip(input)).copied())
+        .ok_or("metal: broadcast input has no shape")?;
+    let out_shape = shape_attr_vec(Some(op)).ok_or("metal: broadcast has no output shape")?;
+    let mut dims = int_list_attr_vec(op, "dimensions").unwrap_or_default();
+    dims.sort_unstable();
+
+    // Expanded input shape = in_shape with a size-1 axis inserted at each
+    // (sorted) broadcast dimension — rank now matches the output.
+    let mut expanded = in_shape;
+    for &d in &dims {
+        let d = d as usize;
+        if d > expanded.len() {
+            return Err(format!("metal: broadcast dim {d} out of range"));
+        }
+        expanded.insert(d, 1);
+    }
+    Ok(format!("{buf}[{}]", broadcast_index_expr(&out_shape, &expanded)))
+}
+
+/// MSL index into a broadcast input: sum over axes whose expanded input size is
+/// > 1 of `coord(axis) * input_stride`, where `coord(axis) = (gid / out_stride)
+/// % out_dim`. Size-1 (broadcast) axes contribute nothing. Empty sum -> "0".
+fn broadcast_index_expr(out_shape: &[i64], expanded_in: &[i64]) -> String {
+    let r = out_shape.len();
+    let mut terms: Vec<String> = Vec::new();
+    for k in 0..r {
+        if expanded_in.get(k).copied().unwrap_or(1) <= 1 {
+            continue; // broadcast axis: contributes 0
+        }
+        let out_stride: i64 = out_shape[k + 1..].iter().product();
+        let in_stride: i64 = expanded_in[k + 1..].iter().product();
+        let coord = if out_stride == 1 {
+            "gid".to_string()
+        } else {
+            format!("(gid / {out_stride})")
+        };
+        let coord = format!("({coord} % {})", out_shape[k]);
+        terms.push(if in_stride == 1 {
+            coord
+        } else {
+            format!("{coord} * {in_stride}")
+        });
+    }
+    if terms.is_empty() {
+        "0".to_string()
+    } else {
+        terms.join(" + ")
+    }
+}
+
+/// Read an op's `shape` attribute as an `i64` vector.
+fn shape_attr_vec(op: Option<&Operation>) -> Option<Vec<i64>> {
+    match op?.attributes.get("shape") {
+        Some(crate::ir::Attr::IntList(v)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// Read a named `IntList` attribute as an `i64` vector.
+fn int_list_attr_vec(op: &Operation, key: &str) -> Option<Vec<i64>> {
+    match op.attributes.get(key) {
+        Some(crate::ir::Attr::IntList(v)) => Some(v.clone()),
+        _ => None,
     }
 }
 
@@ -2641,6 +2724,54 @@ module {
         assert!(
             kernel.source.contains("out_ptr[gid] = half(((float(a_ptr[gid])) * ((2.0))));"),
             "unexpected fused body:\n{}",
+            kernel.source
+        );
+    }
+
+    #[test]
+    fn fuses_broadcast_per_column_weight() {
+        // out[1,576] = a[1,576] * broadcast(w[576], dims=[0])  — RMSNorm's final
+        // per-column gamma multiply. The weight indexes by column (gid % 576),
+        // not gid, so this exercises shape-aware broadcast indexing.
+        let src = r#"
+module {
+  func.func @scale(%a_ptr: index, %w_ptr: index, %out_ptr: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %va = ktdp.construct_memory_view %a_ptr, sizes: [1, 576], strides: [576, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<1x576xf16>
+    %vw = ktdp.construct_memory_view %w_ptr, sizes: [576], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 575 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<576xf16>
+    %ta = ktdp.construct_access_tile %va[%c0, %c0] {
+      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+    } : memref<1x576xf16> -> !ktdp.access_tile<1x576xindex>
+    %tw = ktdp.construct_access_tile %vw[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 575 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<576xf16> -> !ktdp.access_tile<576xindex>
+    %la = ktdp.load %ta : !ktdp.access_tile<1x576xindex> -> tensor<1x576xf16>
+    %lw = ktdp.load %tw : !ktdp.access_tile<576xindex> -> tensor<576xf16>
+    %ginit = tensor.empty() : tensor<1x576xf16>
+    %gb = linalg.broadcast ins(%lw : tensor<576xf16>) outs(%ginit : tensor<1x576xf16>) dimensions = [0]
+    %y = arith.mulf %la, %gb : tensor<1x576xf16>
+    %vout = ktdp.construct_memory_view %out_ptr, sizes: [1, 576], strides: [576, 1] {
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<1x576xf16>
+    %tout = ktdp.construct_access_tile %vout[%c0, %c0] {
+      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 575 >= 0)>, access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+    } : memref<1x576xf16> -> !ktdp.access_tile<1x576xindex>
+    ktdp.store %y, %tout : tensor<1x576xf16>, !ktdp.access_tile<1x576xindex>
+    return
+  }
+}
+"#;
+        let module = parse_module(src).unwrap();
+        let kernel = emit_kernel(&module, "scale").expect("emit broadcast chain");
+        let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["a_ptr", "w_ptr", "out_ptr"]);
+        assert!(
+            kernel.source.contains("out_ptr[gid] = a_ptr[gid] * w_ptr[(gid % 576)];"),
+            "unexpected broadcast body:\n{}",
             kernel.source
         );
     }
