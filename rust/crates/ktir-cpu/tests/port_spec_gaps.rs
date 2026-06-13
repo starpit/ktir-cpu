@@ -173,13 +173,14 @@ module {
 "#;
 
 #[test]
-fn tensor_extract_slice_gap() {
-    // Current behaviour: parses, execution fails (observed:
-    // "no handler registered for op 'tensor.extract_slice'").
+fn tensor_extract_slice_runs() {
+    // GAP CLOSED (increment 2): the emulator now executes tensor.extract_slice
+    // (parser captures the [offsets][sizes][strides] triple; the handler
+    // materializes the strided sub-view). The kernel runs to completion.
     let res = run(EXTRACT_SLICE_MLIR, "extract_slice_kernel", &[]);
     assert!(
-        res.is_err(),
-        "expected tensor.extract_slice gap to persist (it ran to completion)"
+        res.is_ok(),
+        "tensor.extract_slice should now run to completion: {res:?}"
     );
 }
 

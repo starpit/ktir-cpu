@@ -92,11 +92,11 @@ The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialect
 
 ### Tensor dialect
 
-Currently implemented: `tensor.splat`, `tensor.extract`, `tensor.expand_shape`, `tensor.collapse_shape`.
+Currently implemented: `tensor.splat`, `tensor.extract`, `tensor.extract_slice`, `tensor.expand_shape`, `tensor.collapse_shape`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 28 | `tensor.extract_slice` | ❌ | Spec explicitly calls this out for tensor-level slicing |
+| 28 | `tensor.extract_slice` | ✅ | Parser captures `[offsets][sizes][strides]` (static + dynamic SSA); handler materializes the strided sub-view. Closed in the fusion increment-2 work. |
 | 29 | `tensor.insert_slice`, `tensor.collapse_shape` | 🟡 | `collapse_shape` implemented; `insert_slice` still missing |
 
 ### MemRef dialect
@@ -140,7 +140,7 @@ Limits dialect coverage for real-world kernels:
 - **#9–12**: ❌ SCF parallel/reduce operations
 - **#13–19**: ❌/🟡 Many standard arith ops (cmpf, negf, absf, minf, signed int ops)
 - **#20–24**: ✅ All math ops now implemented (log2, log1p, tanh, sin, cos, rsqrt, absf, ceil, floor, erf, powf, fma)
-- **#28, #30–31**: ❌ `tensor.extract_slice`, entire `memref` dialect
+- **#28**: ✅ `tensor.extract_slice` implemented; **#30–31**: ❌ entire `memref` dialect
 - **#32**: 🟡 Dynamic sizes/strides not supported
 
 ### Lower Priority
@@ -176,8 +176,8 @@ Remaining notable gaps:
   cannot execute without it.
 - `coordinate_set` on memory views (#5) is preserved in the IR but not used
   to enforce coordinate constraints during dispatch.
-- SCF parallel/reduce ops (#9–12), `tensor.extract_slice` (#28), and the
-  entire `memref` dialect (#30–31) remain unimplemented.
+- SCF parallel/reduce ops (#9–12) and the entire `memref` dialect (#30–31)
+  remain unimplemented. `tensor.extract_slice` (#28) is now implemented.
 
 ## J. Prioritized Conformance Roadmap
 
@@ -202,7 +202,7 @@ Goal: support the rest of the ops the RFC explicitly calls out.
 
 - Add `linalg.add` so the RFC's canonical matrix-add example can execute
   without translation.
-- Add `tensor.extract_slice`.
+- ~~Add `tensor.extract_slice`.~~ Done (fusion increment 2).
 - Add `memref.subview` and the minimal `memref` dialect support required to
   interpret it.
 - Add the missing SCF ops explicitly named by the RFC:
@@ -273,7 +273,7 @@ If we want the fastest path to meaningful conformance progress:
 2. ✅ Rework `ktdp.load` / `ktdp.store` around that representation.
 3. ✅ Add `construct_indirect_access_tile`.
 4. ✅ Add `construct_distributed_memory_view`.
-5. ❌ Add `linalg.add`, `tensor.extract_slice`, and `memref.subview`.
+5. 🟡 `linalg.add` ✅ and `tensor.extract_slice` ✅ done; `memref.subview` ❌ still missing.
 6. ❌ Fill in the missing RFC-listed SCF ops.
 7. ❌ Expand broader Arith/Math/Linalg coverage as compiler demand appears.
 

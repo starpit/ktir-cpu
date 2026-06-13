@@ -31,6 +31,7 @@ pub fn register(d: &mut Dispatch) {
     d.register("tensor.empty", LatencyCategory::Zero, empty);
     d.register("tensor.splat", LatencyCategory::Zero, splat);
     d.register("tensor.extract", LatencyCategory::Zero, extract);
+    d.register("tensor.extract_slice", LatencyCategory::Zero, extract_slice);
     d.register("tensor.expand_shape", LatencyCategory::Zero, expand_shape);
     d.register(
         "tensor.collapse_shape",
@@ -160,6 +161,110 @@ fn extract(
         .ok_or_else(|| format!("tensor.extract: flat index {flat} out of bounds"))?;
 
     Ok(Some(scalar_for_dtype(elem, tile.dtype)))
+}
+
+/// `%slice = tensor.extract_slice %src[offsets][sizes][strides] : T to U` —
+/// a strided rectangular sub-view of `src`, materialized as a fresh tile.
+///
+/// The parser captured the three offset-size-stride lists as `StrList` token
+/// attributes (`slice_offsets` / `slice_sizes` / `slice_strides`); each token is
+/// either a static integer or a dynamic `%ssa` resolved here against the value
+/// table (the tiled K-loop edge passes its induction variable as a dynamic
+/// offset). For output element at multi-index `c` (row-major over `sizes`), the
+/// source element is at `offset[k] + c[k] * stride[k]` per axis `k`, flattened
+/// row-major over the source shape. Result dtype follows the source tile.
+///
+/// Rank-reduced results (where `sizes` has fewer entries than the source rank,
+/// MLIR's unit-dim drop) are not produced by our fusion path and are rejected
+/// rather than guessed.
+fn extract_slice(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
+    if op.operands.is_empty() {
+        return Err("tensor.extract_slice: missing source operand".into());
+    }
+    let src = ctx.get_value(&op.operands[0])?.clone();
+    let tile = match src {
+        Value::Tile(t) => t,
+        other => {
+            return Err(format!(
+                "tensor.extract_slice: source must be a tensor, got {other:?}"
+            ));
+        }
+    };
+
+    let offsets = resolve_slice_list(op, ctx, "slice_offsets")?;
+    let sizes = resolve_slice_list(op, ctx, "slice_sizes")?;
+    let strides = resolve_slice_list(op, ctx, "slice_strides")?;
+    let rank = tile.shape.len();
+    if offsets.len() != rank || sizes.len() != rank || strides.len() != rank {
+        return Err(format!(
+            "tensor.extract_slice: offsets/sizes/strides ranks {}/{}/{} must equal source rank {rank}",
+            offsets.len(),
+            sizes.len(),
+            strides.len()
+        ));
+    }
+
+    // Row-major strides of the source buffer (elements per step along each axis).
+    let mut src_strides = vec![1i64; rank];
+    for k in (0..rank.saturating_sub(1)).rev() {
+        src_strides[k] = src_strides[k + 1] * tile.shape[k + 1] as i64;
+    }
+
+    let out_n: usize = sizes.iter().map(|&s| s.max(0) as usize).product();
+    let mut out = Vec::with_capacity(out_n);
+    let mut coord = vec![0i64; rank]; // current output multi-index
+    for _ in 0..out_n {
+        let mut flat = 0i64;
+        for k in 0..rank {
+            let s = offsets[k] + coord[k] * strides[k];
+            if s < 0 || s >= tile.shape[k] as i64 {
+                return Err(format!(
+                    "tensor.extract_slice: source index {s} out of bounds on axis {k} (size {})",
+                    tile.shape[k]
+                ));
+            }
+            flat += s * src_strides[k];
+        }
+        out.push(tile.data[flat as usize]);
+        // increment row-major over `sizes` (rightmost axis fastest).
+        for k in (0..rank).rev() {
+            coord[k] += 1;
+            if coord[k] < sizes[k] {
+                break;
+            }
+            coord[k] = 0;
+        }
+    }
+
+    let shape: Vec<usize> = sizes.iter().map(|&s| s as usize).collect();
+    Ok(Some(Value::Tile(Tile::compute(out, tile.dtype, shape))))
+}
+
+/// Resolve a `slice_offsets`/`slice_sizes`/`slice_strides` token list to i64s:
+/// `%ssa` tokens read the value table (dynamic dims), the rest parse as ints.
+fn resolve_slice_list(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    key: &str,
+) -> Result<Vec<i64>, String> {
+    let toks = match op.attributes.get(key) {
+        Some(Attr::StrList(v)) => v,
+        _ => return Err(format!("tensor.extract_slice: missing '{key}' attribute")),
+    };
+    toks.iter()
+        .map(|tok| {
+            if tok.starts_with('%') {
+                as_i64(ctx.get_value(tok)?, key)
+            } else {
+                tok.parse::<i64>()
+                    .map_err(|_| format!("tensor.extract_slice: non-integer {key} token {tok:?}"))
+            }
+        })
+        .collect()
 }
 
 /// `%t = tensor.expand_shape %src ... into tensor<...>` — reinterpret under a
@@ -710,6 +815,69 @@ mod tests {
         );
         ctx.set_value("%i", Value::Index(5));
         let op = Operation::new(Some("%s"), "tensor.extract", &["%t", "%i"]);
+        assert!(run(&[op], &mut ctx).is_err());
+    }
+
+    // --- extract_slice ---------------------------------------------------
+
+    fn slice_op(src: &str, offsets: &[&str], sizes: &[i64], strides: &[i64]) -> Operation {
+        let strs = |xs: &[&str]| Attr::StrList(xs.iter().map(|s| s.to_string()).collect());
+        let ints = |xs: &[i64]| Attr::StrList(xs.iter().map(|n| n.to_string()).collect());
+        Operation::new(Some("%slice"), "tensor.extract_slice", &[src])
+            .with_attr("slice_offsets", strs(offsets))
+            .with_attr("slice_sizes", ints(sizes))
+            .with_attr("slice_strides", ints(strides))
+    }
+
+    #[test]
+    fn extract_slice_static_2d_block() {
+        let mut ctx = single_core_context();
+        // 4x4 with values 0..16, take [1,1][2,2][1,1] -> rows 1..2, cols 1..2.
+        let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
+        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])));
+        let op = slice_op("%t", &["1", "1"], &[2, 2], &[1, 1]);
+        run(&[op], &mut ctx).unwrap();
+        let s = tile(&ctx, "%slice");
+        assert_eq!(s.shape, vec![2, 2]);
+        // row1 = [4,5,6,7], row2 = [8,9,10,11] -> cols 1,2 -> [5,6,9,10]
+        assert_eq!(s.data.to_vec(), vec![5.0, 6.0, 9.0, 10.0]);
+        assert_eq!(s.dtype, DType::F32);
+    }
+
+    #[test]
+    fn extract_slice_strided_1d() {
+        let mut ctx = single_core_context();
+        let data: Vec<f32> = (0..8).map(|x| x as f32).collect();
+        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![8])));
+        // offset 1, size 3, stride 2 -> elements 1,3,5
+        let op = slice_op("%t", &["1"], &[3], &[2]);
+        run(&[op], &mut ctx).unwrap();
+        let s = tile(&ctx, "%slice");
+        assert_eq!(s.data.to_vec(), vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn extract_slice_dynamic_offset_row() {
+        let mut ctx = single_core_context();
+        // 4x4; the tiled K-loop edge passes its induction var as a dynamic row
+        // offset and reads a 1x4 sub-tile.
+        let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
+        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])));
+        ctx.set_value("%k", Value::Index(2));
+        let op = slice_op("%t", &["%k", "0"], &[1, 4], &[1, 1]);
+        run(&[op], &mut ctx).unwrap();
+        let s = tile(&ctx, "%slice");
+        assert_eq!(s.shape, vec![1, 4]);
+        assert_eq!(s.data.to_vec(), vec![8.0, 9.0, 10.0, 11.0]); // row 2
+    }
+
+    #[test]
+    fn extract_slice_out_of_bounds_errors() {
+        let mut ctx = single_core_context();
+        let data: Vec<f32> = (0..4).map(|x| x as f32).collect();
+        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![4])));
+        // offset 3, size 2, stride 1 -> would read index 4 (out of bounds).
+        let op = slice_op("%t", &["3"], &[2], &[1]);
         assert!(run(&[op], &mut ctx).is_err());
     }
 

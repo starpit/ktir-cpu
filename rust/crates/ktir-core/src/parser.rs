@@ -613,6 +613,8 @@ fn parse_operation(text: &str) -> Result<Option<Operation>, String> {
             &operands,
             &mut attributes,
         )?;
+    } else if op_type == "tensor.extract_slice" {
+        parse_extract_slice_attrs(after_op, result_type.as_deref(), &mut attributes)?;
     } else {
         // General attributes: the `{ key = value, ... }` block AND bare
         // `key = value` attributes (MLIR named ops carry `permutation = [..]`,
@@ -870,6 +872,73 @@ fn parse_construct_access_tile_attrs(
     }
 
     Ok(())
+}
+
+/// Parse `tensor.extract_slice %src[offsets][sizes][strides] : T to U`.
+///
+/// MLIR's offset-size-stride list form: three consecutive `[...]` groups after
+/// the source operand, each a comma-separated list of either static integers or
+/// dynamic SSA values (`%name`). We keep every token verbatim as a `StrList`
+/// (`slice_offsets` / `slice_sizes` / `slice_strides`); the handler resolves
+/// `%`-tokens against the value table at execution time and parses the rest as
+/// integers. The result tensor type (after ` to `) pins `shape`/`dtype`; the
+/// general tensor-type derivation would otherwise pick up the *source* type
+/// (the first `tensor<...>` before ` to `).
+fn parse_extract_slice_attrs(
+    after_op: &str,
+    result_type: Option<&str>,
+    attrs: &mut std::collections::HashMap<String, Attr>,
+) -> Result<(), String> {
+    // The `[...]` groups live before the `:` type annotation; types use `<>`,
+    // never `[]`, so every top-level bracket group is an offset/size/stride list.
+    let operand_part = match after_op.find(" : ") {
+        Some(c) => &after_op[..c],
+        None => after_op,
+    };
+    let groups = bracket_groups(operand_part);
+    if groups.len() != 3 {
+        return Err(format!(
+            "tensor.extract_slice: expected 3 bracket lists [offsets][sizes][strides], got {}",
+            groups.len()
+        ));
+    }
+    attrs.insert("slice_offsets".to_string(), Attr::StrList(groups[0].clone()));
+    attrs.insert("slice_sizes".to_string(), Attr::StrList(groups[1].clone()));
+    attrs.insert("slice_strides".to_string(), Attr::StrList(groups[2].clone()));
+
+    // shape/dtype from the destination type (`... to tensor<...>`).
+    let dest = result_type.and_then(|rt| rt.rsplit(" to ").next()).or(result_type);
+    if let Some((shape, dt)) = dest.and_then(parse_tensor_type) {
+        attrs.insert("shape".to_string(), Attr::IntList(shape));
+        attrs.insert("dtype".to_string(), Attr::Str(dt));
+    }
+    Ok(())
+}
+
+/// Collect every top-level `[ ... ]` group in `text`, each split on commas into
+/// trimmed tokens. Bracket nesting is tracked so a `[a, [b], c]` stays one group
+/// (not that extract_slice nests, but it keeps the scan honest).
+fn bracket_groups(text: &str) -> Vec<Vec<String>> {
+    let bytes = text.as_bytes();
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'['
+            && let Some(close) = matching(bytes, i, b'[', b']')
+        {
+            let inner = &text[i + 1..close];
+            let toks: Vec<String> = inner
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            groups.push(toks);
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    groups
 }
 
 /// Find a `keyword: [ ... ]` segment (e.g. `sizes: [4096]`) and return the
@@ -1776,6 +1845,41 @@ mod tests {
         assert_eq!(a.get("memory_space"), Some(&Attr::Str("LX".to_string())));
         assert_eq!(a.get("lx_core_id"), Some(&Attr::Int(3)));
         assert!(matches!(a.get("coordinate_set"), Some(Attr::AffineSet(_))));
+    }
+
+    #[test]
+    fn extract_slice_captures_offset_size_stride_and_dest_shape() {
+        // Mixed static/dynamic offsets; result shape must come from the type
+        // after ` to ` (the dest), not the source `tensor<8x8xf16>`.
+        let src = r#"
+            module {
+              func.func @k(%c0: index, %k7: index) attributes {grid = [1]} {
+                %slice = tensor.extract_slice %tile[%c0, %k7][1, 64][1, 1] : tensor<8x8xf16> to tensor<1x64xf16>
+                return
+              }
+            }
+        "#;
+        let module = parse_module(src).unwrap();
+        let f = module.get_function("k").unwrap();
+        let a = attrs_of(f, "%slice");
+        assert_eq!(
+            a.get("slice_offsets"),
+            Some(&Attr::StrList(vec!["%c0".into(), "%k7".into()]))
+        );
+        assert_eq!(
+            a.get("slice_sizes"),
+            Some(&Attr::StrList(vec!["1".into(), "64".into()]))
+        );
+        assert_eq!(
+            a.get("slice_strides"),
+            Some(&Attr::StrList(vec!["1".into(), "1".into()]))
+        );
+        // dest shape (1x64), not source (8x8).
+        assert_eq!(a.get("shape"), Some(&Attr::IntList(vec![1, 64])));
+        assert_eq!(a.get("dtype"), Some(&Attr::Str("f16".to_string())));
+        // the source tile + the two dynamic offsets are the operands, in order.
+        let op = f.operations.iter().find(|o| o.result.as_deref() == Some("%slice")).unwrap();
+        assert_eq!(op.operands, vec!["%tile", "%c0", "%k7"]);
     }
 
     #[test]
