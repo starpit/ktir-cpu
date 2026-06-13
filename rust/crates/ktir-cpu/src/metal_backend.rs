@@ -21,7 +21,7 @@
 //! (threadgroup memory), cross-core comm (the global-sync problem), distributed
 //! and indirect access. Each is its own slice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dtypes::DType;
 use crate::ir::{Attr, IRFunction, IRModule, Operation};
@@ -548,6 +548,509 @@ fn matmul_operand_full(
     }
 }
 
+// =========================================================================
+// Runtime map-region fusion — wire the MLX-style elementwise codegen into the
+// EXECUTION path. `plan_kernels` carves a fused function's op stream into Map
+// windows; here each Map window is compiled to ONE fused MSL kernel and run on
+// the GPU at runtime (the analogue of the matmul-loop offload), instead of the
+// interpreter running its ops one-by-one. A window with !=1 live-out (or any op
+// we can't lower) returns Err so those ops stay on the interpreter.
+// =========================================================================
+
+/// A Map window compiled to one fused GPU kernel: the MSL, the window's external
+/// inputs (the buffers the kernel reads, in `[[buffer(i)]]` order — original SSA
+/// names with `%`), the single window result it produces, and that result's
+/// shape/dtype for the output tile.
+#[derive(Clone, Debug)]
+pub struct MapRegionKernel {
+    pub kernel: MslKernel,
+    /// External inputs in buffer order: load results, prior-region outputs (e.g.
+    /// the reduce sum), or any value defined outside the window. Original SSA
+    /// (with `%`) so the runtime resolves them from the value table.
+    pub live_ins: Vec<String>,
+    /// The single window result consumed outside the window (original SSA, `%`).
+    pub live_out: String,
+    pub out_shape: Vec<usize>,
+    pub out_dtype: DType,
+}
+
+/// Compile a Map window (the `window` op indices into `ops`, from `plan_kernels`)
+/// into one fused MSL kernel. Computes the window's single LIVE-OUT (the result
+/// used by any op OUTSIDE the window), then lowers from its defining op into one
+/// MSL expression over `gid`, collecting the external LIVE-INS as buffer leaves.
+/// `Err` (≠1 live-out, or an unlowerable op) leaves the window on the interpreter.
+pub fn emit_map_region_kernel(
+    ops: &[Operation],
+    window: &[usize],
+) -> Result<MapRegionKernel, String> {
+    // Standalone entry: build the function-wide def map and use map once, then
+    // delegate. `map_fusion_plan` shares one prebuilt pair across all windows so
+    // the (linear-in-ops) analysis isn't redone per window.
+    let defs = def_map_all(ops);
+    let uses = build_uses(ops);
+    emit_map_region_kernel_with(ops, window, &defs, &uses)
+}
+
+/// `emit_map_region_kernel` with the function-wide def map and use map supplied
+/// by the caller (so a whole-function plan builds them once, not per window).
+/// `uses[name]` = the set of TOP-LEVEL op indices that reference `name` (operands
+/// or SSA string attrs, counting uses nested in that op's regions).
+fn emit_map_region_kernel_with(
+    ops: &[Operation],
+    window: &[usize],
+    defs: &HashMap<String, &Operation>,
+    uses: &HashMap<String, HashSet<usize>>,
+) -> Result<MapRegionKernel, String> {
+    if window.is_empty() {
+        return Err("metal: empty map window".into());
+    }
+    let win_set: HashSet<usize> = window.iter().copied().collect();
+
+    // LIVE-OUT: a window result used by any op OUTSIDE the window. With the
+    // prebuilt `uses` map this is a per-result lookup (not a scan of all ops).
+    let mut live_outs: Vec<String> = Vec::new();
+    for &i in window {
+        let Some(r) = ops[i].result.as_deref() else {
+            continue;
+        };
+        let name = strip(r);
+        if let Some(idxs) = uses.get(name)
+            && idxs.iter().any(|u| !win_set.contains(u))
+        {
+            live_outs.push(name.to_string());
+        }
+    }
+    if live_outs.len() != 1 {
+        return Err(format!(
+            "metal: map window has {} live-outs (need exactly 1) — stays on interpreter",
+            live_outs.len()
+        ));
+    }
+    // Result SSA (stripped) produced by an op in this window — the recursion
+    // boundary for lowering (an operand in this set is in-window).
+    let in_window: HashSet<String> = window
+        .iter()
+        .filter_map(|&i| ops[i].result.as_deref().map(|r| strip(r).to_string()))
+        .collect();
+    let live_out_name = live_outs.into_iter().next().unwrap();
+    let root = *defs
+        .get(live_out_name.as_str())
+        .ok_or("metal: map window live-out has no defining op")?;
+
+    // Lower the live-out's defining op into one MSL expression, accumulating the
+    // external live-in buffers (original SSA, first-seen order).
+    let mut live_ins: Vec<String> = Vec::new();
+    let expr = lower_map_compute(root, defs, &in_window, &mut live_ins, 0)?;
+
+    // out shape/dtype from the live-out op's attrs (default f16, the KTIR tile dtype).
+    let out_shape: Vec<usize> = shape_attr_vec(Some(root))
+        .ok_or("metal: map window live-out has no shape attribute")?
+        .into_iter()
+        .map(|d| d as usize)
+        .collect();
+    let out_dtype = match root.attributes.get("dtype") {
+        Some(Attr::Str(dt)) => DType::parse(dt).unwrap_or(DType::F16),
+        _ => DType::F16,
+    };
+
+    // One f32 buffer per live-in (in order), then the f32 output. We read/write
+    // f32 throughout (the kernel computes in float and the resident tiles are
+    // f32-backed), so encode/decode are no-ops and there is no half rounding in
+    // the I/O — the per-step f16 rounding the oracle does is captured by writing
+    // the result Tile via `Tile::compute(.., out_dtype, ..)` in `run_map_region_gpu`.
+    let mut buffers: Vec<BufferBinding> = Vec::with_capacity(live_ins.len() + 1);
+    for name in &live_ins {
+        buffers.push(BufferBinding {
+            name: strip(name).to_string(),
+            is_output: false,
+            dtype: DType::F32,
+        });
+    }
+    let kname = format!("map_region_{}", strip(&live_out_name));
+    buffers.push(BufferBinding {
+        name: strip(&live_out_name).to_string(),
+        is_output: true,
+        dtype: DType::F32,
+    });
+    let source = render_kernel(&kname, &buffers, &expr);
+    Ok(MapRegionKernel {
+        kernel: MslKernel {
+            source,
+            name: kname,
+            buffers,
+        },
+        live_ins,
+        live_out: live_out_name,
+        out_shape,
+        out_dtype,
+    })
+}
+
+/// Build `name (no %) -> set of TOP-LEVEL op indices that reference it`, in one
+/// linear pass over the function. A name is "referenced" by a top-level op if it
+/// appears in that op's operands or SSA-bearing string attributes, OR in any op
+/// nested in its regions (so a value consumed only inside an `scf.for` body
+/// counts as used by the loop's top-level index). This is the prebuilt index the
+/// per-window live-out check consults — mirrors the use-counting in
+/// `comm_sched::compute_dies_at`, just keyed name -> indices instead of last-use.
+fn build_uses(ops: &[Operation]) -> HashMap<String, HashSet<usize>> {
+    fn note(op: &Operation, top_idx: usize, uses: &mut HashMap<String, HashSet<usize>>) {
+        for operand in &op.operands {
+            if operand.starts_with('%') {
+                uses.entry(strip(operand).to_string()).or_default().insert(top_idx);
+            }
+        }
+        for attr in op.attributes.values() {
+            match attr {
+                Attr::Str(s) if s.starts_with('%') => {
+                    uses.entry(strip(s).to_string()).or_default().insert(top_idx);
+                }
+                Attr::StrList(xs) => {
+                    for x in xs {
+                        if x.starts_with('%') {
+                            uses.entry(strip(x).to_string()).or_default().insert(top_idx);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for region in &op.regions {
+            for inner in region {
+                note(inner, top_idx, uses);
+            }
+        }
+    }
+    let mut uses: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        note(op, i, &mut uses);
+    }
+    uses
+}
+
+/// Lower an in-window compute op into an MSL expression over `gid`, recursing
+/// through in-window operands and turning external operands into live-in buffer
+/// leaves. The map-region twin of [`lower_compute_depth`]: same operator table
+/// (via [`compose_compute_expr`]), different leaf rule — the leaf is decided by
+/// window membership, not by "is it a load".
+fn lower_map_compute(
+    op: &Operation,
+    defs: &HashMap<String, &Operation>,
+    in_window: &HashSet<String>,
+    live_ins: &mut Vec<String>,
+    depth: usize,
+) -> Result<String, String> {
+    compose_compute_expr(op, &mut |i: usize| -> Result<String, String> {
+        let name = op
+            .operands
+            .get(i)
+            .ok_or_else(|| format!("metal: {} missing operand {i}", op.op_type))?;
+        lower_map_value(name, defs, in_window, live_ins, depth)
+    })
+}
+
+/// Resolve one operand SSA name to its MSL sub-expression inside a map window.
+///   * an `arith.constant` -> folded literal,
+///   * a `tensor.splat` -> transparent (lower its scalar operand),
+///   * a `linalg.broadcast` whose input is external/a load -> buffer leaf with the
+///     broadcast index expr; if its input is an in-window scalar -> recurse,
+///   * any other in-window compute op -> recurse,
+///   * anything else (a load, a value from outside the window, the reduce sum)
+///     -> a LIVE-IN buffer leaf, read `buf[0]` if scalar else `buf[gid]`.
+fn lower_map_value(
+    name: &str,
+    defs: &HashMap<String, &Operation>,
+    in_window: &HashSet<String>,
+    live_ins: &mut Vec<String>,
+    depth: usize,
+) -> Result<String, String> {
+    if depth > MAX_FUSE_DEPTH {
+        return Err("metal: fused map expression exceeds max depth".into());
+    }
+    let key = strip(name);
+    let in_win = in_window.contains(key);
+    match defs.get(key) {
+        // Constants and splats fold/are transparent regardless of window
+        // membership (they're scheduling plumbing, never window members).
+        Some(d) if d.op_type == "arith.constant" => constant_literal(d),
+        Some(d) if d.op_type == "tensor.splat" => {
+            // Splat is transparent (every lane reads the same scalar sub-expr);
+            // parenthesize so a compound scalar keeps precedence in its parent.
+            let inner = d
+                .operands
+                .first()
+                .ok_or("metal: tensor.splat missing operand")?;
+            Ok(format!(
+                "({})",
+                lower_map_value(inner, defs, in_window, live_ins, depth + 1)?
+            ))
+        }
+        Some(d) if d.op_type == "linalg.broadcast" => {
+            let input = d
+                .operands
+                .first()
+                .ok_or("metal: linalg.broadcast missing ins operand")?;
+            // Broadcasting a scalar constant (directly, or via a splat) is
+            // transparent — every output element is that scalar. Fold it so the
+            // constant never becomes a (would-be-Scalar-at-runtime) live-in.
+            if let Some(lit) = try_fold_scalar(input, defs) {
+                return Ok(lit);
+            }
+            let input_in_win = in_window.contains(strip(input));
+            let input_is_load = defs
+                .get(strip(input))
+                .is_some_and(|x| x.op_type == "ktdp.load");
+            // The input is SCALAR (shape product == 1) iff broadcasting it is a
+            // pure splat: every output lane reads the one value. Only then is
+            // recursing into an in-window input correct — the recursed expression
+            // reads its leaves at fixed (scalar) indices, valid for every `gid`.
+            let input_scalar = shape_attr_vec(defs.get(strip(input)).copied())
+                .map(|s| s.iter().product::<i64>() == 1)
+                .unwrap_or(false);
+            if input_in_win && !input_is_load {
+                // Recursing into an in-window scalar input gives the MLX scalar-tail
+                // fusion (e.g. RMSNorm's `1/rms` folded into the final multiply).
+                // Parenthesized to preserve precedence in the parent expression.
+                if input_scalar {
+                    Ok(format!(
+                        "({})",
+                        lower_map_value(input, defs, in_window, live_ins, depth + 1)?
+                    ))
+                } else {
+                    // A rank-reducing broadcast of an in-window NON-scalar value
+                    // (e.g. prefill's per-row `inv[8]` broadcast to `[8,576]`)
+                    // can't be inlined: the recursed expression would index the
+                    // lower-rank value by the output `gid` (out of bounds). The
+                    // value would have to be materialized first, which it isn't in
+                    // this window — so fail and leave the window to the interpreter.
+                    Err(format!(
+                        "metal: rank-reducing broadcast of in-window value {input} \
+                         (not scalar) — window stays on interpreter"
+                    ))
+                }
+            } else {
+                // An external (load / prior-region) input: read it through the
+                // broadcast index expression (a materialized buffer leaf).
+                lower_map_broadcast(d, input, defs, live_ins)
+            }
+        }
+        // An in-window compute op: descend, PARENTHESIZED so the inlined
+        // sub-expression keeps its precedence inside the parent op (e.g. SiLU's
+        // `v2 / (1 + exp(-v2))` must not flatten to `v2 / 1 + exp(-v2)`). Mirrors
+        // the parenthesizing in `lower_value`.
+        Some(d) if in_win => {
+            Ok(format!("({})", lower_map_compute(d, defs, in_window, live_ins, depth + 1)?))
+        }
+        // A scalar constant (directly or via splat) reached as a plain operand
+        // folds to its literal — it would be a `Value::Scalar` at runtime, not a
+        // resident tile, so it must never become a live-in buffer.
+        _ if try_fold_scalar(name, defs).is_some() => {
+            Ok(try_fold_scalar(name, defs).unwrap())
+        }
+        // A non-constant SCALAR value (e.g. an `arith.maximumf : f16` from an
+        // attention softmax's scalar max/sum reduction, or any non-tensor op
+        // result) is a `Value::Scalar` at runtime — it can't be bound as a tile
+        // buffer and we can't fold it. Fail the window so it stays on the
+        // interpreter (correctness over fusion).
+        Some(d) if !is_tensor_valued(d) => Err(format!(
+            "metal: map window needs scalar value {name} (def {}) — not a resident tile; \
+             window stays on interpreter",
+            d.op_type
+        )),
+        // Any other value (a load result, a value produced outside the window —
+        // e.g. a prior region's output or the reduce sum) is an external input.
+        _ => Ok(map_live_in_leaf(name, defs, live_ins)),
+    }
+}
+
+/// Whether an op produces a tensor value (a resident `Tile` at runtime), vs a
+/// scalar (`Value::Scalar`). The parser attaches a `shape` attribute exactly for
+/// tensor/memref result types, so its presence is the tensor test. A would-be
+/// live-in without a shape is a scalar that can't be bound as a kernel buffer.
+fn is_tensor_valued(op: &Operation) -> bool {
+    op.attributes.contains_key("shape")
+}
+
+/// If `name` is a scalar `arith.constant` (folded to its MSL literal) or a
+/// `tensor.splat` of one (recursively), return that literal. `None` otherwise.
+/// A scalar constant is a `Value::Scalar` at runtime, never a resident tile, so
+/// it must be folded into the expression rather than bound as a live-in buffer.
+fn try_fold_scalar(name: &str, defs: &HashMap<String, &Operation>) -> Option<String> {
+    let d = defs.get(strip(name))?;
+    match d.op_type.as_str() {
+        "arith.constant" => constant_literal(d).ok(),
+        "tensor.splat" => try_fold_scalar(d.operands.first()?, defs),
+        _ => None,
+    }
+}
+
+/// Emit a live-in buffer leaf for `name`: register it (dedup, original SSA) and
+/// return `buf[0]` if it's a scalar (shape product == 1, e.g. the reduce sum),
+/// else `buf[gid]`. `buf` is the sanitized identifier the buffer binding uses.
+fn map_live_in_leaf(
+    name: &str,
+    defs: &HashMap<String, &Operation>,
+    live_ins: &mut Vec<String>,
+) -> String {
+    let orig = if name.starts_with('%') {
+        name.to_string()
+    } else {
+        format!("%{name}")
+    };
+    if !live_ins.contains(&orig) {
+        live_ins.push(orig);
+    }
+    let buf = strip(name).to_string();
+    let scalar = shape_attr_vec(defs.get(strip(name)).copied())
+        .map(|s| s.iter().product::<i64>() == 1)
+        .unwrap_or(false);
+    if scalar {
+        format!("{buf}[0]")
+    } else {
+        format!("{buf}[gid]")
+    }
+}
+
+/// Lower a `linalg.broadcast` whose input is an external buffer to `buf[idx]`,
+/// where `idx = broadcast_index_expr(out_shape, expanded_in)` maps the output
+/// `gid` to the input element. Registers `input` as a live-in (the buffer named
+/// `buf`). Mirrors [`lower_broadcast`] but takes the input as a live-in rather
+/// than tracing it to a pointer argument.
+fn lower_map_broadcast(
+    op: &Operation,
+    input: &str,
+    defs: &HashMap<String, &Operation>,
+    live_ins: &mut Vec<String>,
+) -> Result<String, String> {
+    let in_shape = shape_attr_vec(defs.get(strip(input)).copied())
+        .ok_or("metal: broadcast input has no shape")?;
+    let out_shape = shape_attr_vec(Some(op)).ok_or("metal: broadcast has no output shape")?;
+    let mut dims = int_list_attr_vec(op, "dimensions").unwrap_or_default();
+    dims.sort_unstable();
+    let mut expanded = in_shape;
+    for &d in &dims {
+        let d = d as usize;
+        if d > expanded.len() {
+            return Err(format!("metal: broadcast dim {d} out of range"));
+        }
+        expanded.insert(d, 1);
+    }
+    // Register the input buffer (dedup, original SSA).
+    let orig = if input.starts_with('%') {
+        input.to_string()
+    } else {
+        format!("%{input}")
+    };
+    if !live_ins.contains(&orig) {
+        live_ins.push(orig);
+    }
+    let buf = strip(input).to_string();
+    Ok(format!("{buf}[{}]", broadcast_index_expr(&out_shape, &expanded)))
+}
+
+/// Count of Map windows successfully offloaded to a fused GPU kernel (test /
+/// telemetry proof the fused map path actually used Metal). Mirrors
+/// [`MATMUL_LOOP_GPU_COUNT`].
+#[cfg(metal)]
+pub static MAP_REGION_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Run a compiled Map window as one fused GPU kernel, binding its live-out tile
+/// in `ctx`. Reads each live-in's f32 data from the value table (must be a
+/// resident `Tile`), dispatches the kernel (one thread per output element), and
+/// binds the result as a `Tile` of `out_dtype`/`out_shape`. Returns `Err` if a
+/// live-in is missing/not a tile or the kernel can't run — the caller treats a
+/// trigger failure as fatal (the window's ops were skipped on the interpreter).
+#[cfg(metal)]
+pub fn run_map_region_gpu(
+    mrk: &MapRegionKernel,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    let mut inputs: Vec<Vec<f32>> = Vec::with_capacity(mrk.live_ins.len());
+    for name in &mrk.live_ins {
+        match ctx.get_value(name)? {
+            crate::ir::Value::Tile(t) => inputs.push(t.data.to_vec()),
+            other => {
+                return Err(format!(
+                    "metal: map-region live-in {name} is {other:?}, expected a resident tile"
+                ));
+            }
+        }
+    }
+    let out_len: usize = mrk.out_shape.iter().product();
+    let out = run_kernel(&mrk.kernel, &inputs, out_len)?;
+    let tile = crate::tile::Tile::compute(out, mrk.out_dtype, mrk.out_shape.clone());
+    let bytes = tile.size_bytes() as i64;
+    ctx.set_value(&mrk.live_out, crate::ir::Value::Tile(tile));
+    ctx.track_lx(&mrk.live_out, bytes)?;
+    MAP_REGION_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Plan a fused function's Map windows for runtime GPU offload. Walks the op
+/// stream with the SAME classification `plan_kernels` uses — Map ops accumulate
+/// into a window; a Reduce / Matmul / Boundary / `scf.for` flushes it; plumbing
+/// doesn't break a window — and for each window TRIES [`emit_map_region_kernel`].
+/// On success the window registers its TRIGGER (the last op index — run the
+/// kernel there) and all its op indices in the SKIP set; on failure the window's
+/// ops are left to the interpreter. Returns `(trigger -> kernel, skip set)`.
+pub fn map_fusion_plan(
+    ops: &[Operation],
+) -> (HashMap<usize, MapRegionKernel>, HashSet<usize>) {
+    // Build the function-wide def map and use map ONCE; share them across every
+    // window's emit (the analysis is linear in ops, so per-window rebuilds would
+    // make planning quadratic in a 35k-op fused model).
+    let defs = def_map_all(ops);
+    let uses = build_uses(ops);
+    let mut triggers: HashMap<usize, MapRegionKernel> = HashMap::new();
+    let mut skip: HashSet<usize> = HashSet::new();
+    let mut window: Vec<usize> = Vec::new();
+    let try_flush = |window: &mut Vec<usize>,
+                     triggers: &mut HashMap<usize, MapRegionKernel>,
+                     skip: &mut HashSet<usize>| {
+        if window.is_empty() {
+            return;
+        }
+        let w = std::mem::take(window);
+        if let Ok(mrk) = emit_map_region_kernel_with(ops, &w, &defs, &uses) {
+            let trigger = *w.last().unwrap();
+            for &i in &w {
+                skip.insert(i);
+            }
+            triggers.insert(trigger, mrk);
+        }
+    };
+    for (i, op) in ops.iter().enumerate() {
+        // scf.for: same boundary treatment as plan_kernels (a matmul K-loop or an
+        // unfusable loop both flush the current map window).
+        if op.op_type == "scf.for" {
+            try_flush(&mut window, &mut triggers, &mut skip);
+            continue;
+        }
+        match classify(op) {
+            // A SCALAR map op (e.g. an attention softmax's `arith.maximumf : f16`
+            // row-max, or a scalar `arith.addf`) produces a `Value::Scalar`, not a
+            // resident tile — it can't be a buffer leaf and the kernel is a
+            // per-element tensor map. Treat it as a boundary: flush the current
+            // tensor window and let the scalar op run on the interpreter (so the
+            // surrounding tensor windows still fuse, rather than the whole window
+            // failing because one scalar op snuck in).
+            OpClass::Map if is_tensor_valued(op) => {
+                window.push(i);
+                if window.len() >= MAX_KERNEL_WINDOW {
+                    try_flush(&mut window, &mut triggers, &mut skip);
+                }
+            }
+            OpClass::Map | OpClass::Reduce | OpClass::Matmul | OpClass::Boundary => {
+                try_flush(&mut window, &mut triggers, &mut skip);
+            }
+            OpClass::Plumbing => {} // traced by the emitter; doesn't break a window
+        }
+    }
+    try_flush(&mut window, &mut triggers, &mut skip);
+    (triggers, skip)
+}
+
 /// Lower `func_name` to a full [`MslKernel`] (source + buffer bindings).
 pub fn emit_kernel(module: &IRModule, func_name: &str) -> Result<MslKernel, String> {
     let f = module.get_function(func_name)?;
@@ -827,48 +1330,67 @@ fn lower_compute_depth(
     defs: &HashMap<String, &Operation>,
     depth: usize,
 ) -> Result<String, String> {
-    let operand = |i: usize| -> Result<String, String> {
+    compose_compute_expr(op, &mut |i: usize| -> Result<String, String> {
         let name = op
             .operands
             .get(i)
             .ok_or_else(|| format!("metal: {} missing operand {i}", op.op_type))?;
         lower_value(name, defs, depth)
-    };
+    })
+}
 
+/// The shared op-type -> MSL-expression table, parameterized over how an operand
+/// resolves to its MSL sub-expression (`resolve(i)`). Both the store-rooted
+/// elementwise lowering ([`lower_compute_depth`]) and the window-rooted map-region
+/// lowering ([`lower_map_compute`]) compose through here, so the operator set —
+/// and thus the precision/casting semantics — stays identical between them.
+fn compose_compute_expr(
+    op: &Operation,
+    resolve: &mut dyn FnMut(usize) -> Result<String, String>,
+) -> Result<String, String> {
+    let operand = |i: usize, r: &mut dyn FnMut(usize) -> Result<String, String>| r(i);
     // Binary element-wise float ops -> infix operator.
-    let binop = |sym: &str| -> Result<String, String> {
-        Ok(format!("{} {} {}", operand(0)?, sym, operand(1)?))
+    let binop = |sym: &str,
+                 r: &mut dyn FnMut(usize) -> Result<String, String>|
+     -> Result<String, String> {
+        Ok(format!("{} {} {}", operand(0, r)?, sym, operand(1, r)?))
     };
     // Unary math ops -> MSL intrinsic call.
-    let unary = |func: &str| -> Result<String, String> { Ok(format!("{func}({})", operand(0)?)) };
+    let unary = |func: &str,
+                 r: &mut dyn FnMut(usize) -> Result<String, String>|
+     -> Result<String, String> { Ok(format!("{func}({})", operand(0, r)?)) };
 
     match op.op_type.as_str() {
-        "arith.addf" => binop("+"),
-        "arith.subf" => binop("-"),
-        "arith.mulf" => binop("*"),
-        "arith.divf" => binop("/"),
-        "arith.maximumf" | "arith.maxf" => Ok(format!("max({}, {})", operand(0)?, operand(1)?)),
-        "arith.minimumf" | "arith.minf" => Ok(format!("min({}, {})", operand(0)?, operand(1)?)),
-        "arith.negf" => Ok(format!("-{}", operand(0)?)),
-        "arith.absf" | "math.absf" => unary("abs"),
-        "math.exp" => unary("exp"),
-        "math.log" => unary("log"),
-        "math.sqrt" => unary("sqrt"),
-        "math.sin" => unary("sin"),
-        "math.cos" => unary("cos"),
-        "math.tanh" => unary("tanh"),
-        "linalg.add" => binop("+"),
-        "linalg.mul" => binop("*"),
-        "linalg.sub" => binop("-"),
+        "arith.addf" => binop("+", resolve),
+        "arith.subf" => binop("-", resolve),
+        "arith.mulf" => binop("*", resolve),
+        "arith.divf" => binop("/", resolve),
+        "arith.maximumf" | "arith.maxf" => {
+            Ok(format!("max({}, {})", operand(0, resolve)?, operand(1, resolve)?))
+        }
+        "arith.minimumf" | "arith.minf" => {
+            Ok(format!("min({}, {})", operand(0, resolve)?, operand(1, resolve)?))
+        }
+        "arith.negf" => Ok(format!("-{}", operand(0, resolve)?)),
+        "arith.absf" | "math.absf" => unary("abs", resolve),
+        "math.exp" => unary("exp", resolve),
+        "math.log" => unary("log", resolve),
+        "math.sqrt" => unary("sqrt", resolve),
+        "math.sin" => unary("sin", resolve),
+        "math.cos" => unary("cos", resolve),
+        "math.tanh" => unary("tanh", resolve),
+        "linalg.add" => binop("+", resolve),
+        "linalg.mul" => binop("*", resolve),
+        "linalg.sub" => binop("-", resolve),
         // A scalar constant folds into the expression as an MSL literal.
         "arith.constant" => constant_literal(op),
         // splat broadcasts a scalar to a tensor; in the per-element kernel it is
         // transparent — every lane reads the same scalar sub-expression.
-        "tensor.splat" => operand(0),
+        "tensor.splat" => operand(0, resolve),
         // dtype casts: compute in the wider type, narrow on store. Explicit so
         // an extf'd chain runs in float (matching the CPU oracle), not half.
-        "arith.extf" => Ok(format!("float({})", operand(0)?)),
-        "arith.truncf" => Ok(format!("half({})", operand(0)?)),
+        "arith.extf" => Ok(format!("float({})", operand(0, resolve)?)),
+        "arith.truncf" => Ok(format!("half({})", operand(0, resolve)?)),
         other => Err(format!(
             "metal: compute op {other:?} not lowerable (element-wise / scalar only)"
         )),

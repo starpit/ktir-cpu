@@ -232,14 +232,34 @@ impl CoreRunner {
         // the interpreter loop. Skipped under a latency tracker (the model must
         // see each op). The fused whole-program function is grid [1,1].
         #[cfg(metal)]
-        let matmul_sched = if env.tracker.is_none()
+        let gpu_offload = env.tracker.is_none()
             && env.grid.num_cores == 1
-            && std::env::var_os("KTIR_NO_GPU_GEMM").is_none()
-        {
+            && std::env::var_os("KTIR_NO_GPU_GEMM").is_none();
+        #[cfg(metal)]
+        let matmul_sched = if gpu_offload {
             crate::metal_backend::matmul_loop_schedule(ops)
         } else {
             std::collections::HashMap::new()
         };
+        // MLX-style map-window fusion: each maximal run of fusable elementwise/
+        // cast/broadcast ops runs as ONE fused GPU kernel (instead of op-by-op on
+        // the interpreter). Same gating as the matmul-loop offload above. The plan
+        // maps each window's TRIGGER op (its last op) -> the compiled kernel, and a
+        // SKIP set of all window op indices; non-trigger window ops are subsumed by
+        // the fused kernel (their values come from it) and are not executed.
+        #[cfg(metal)]
+        let (map_triggers, map_skip) = if gpu_offload
+            && std::env::var_os("KTIR_NO_GPU_MAP").is_none()
+        {
+            crate::metal_backend::map_fusion_plan(ops)
+        } else {
+            (std::collections::HashMap::new(), std::collections::HashSet::new())
+        };
+
+        // Window op indices whose liveness reclaim is deferred to the window's
+        // trigger (so a fused kernel's live-ins survive until it has read them).
+        #[cfg(metal)]
+        let mut pending_skip: Vec<usize> = Vec::new();
 
         // Run remaining top-level ops.
         while self.op_idx < ops.len() {
@@ -258,6 +278,37 @@ impl CoreRunner {
                         self.ctx.forget(name);
                     }
                 }
+                continue;
+            }
+            // Map-window GPU fusion: at a window's TRIGGER op, run the whole window
+            // as one fused kernel (its loads/plumbing already ran, populating the
+            // live-ins). A trigger failure is FATAL — the rest of the window's ops
+            // were skipped, so there's no interpreter result to fall back to.
+            //
+            // Liveness for window ops is DEFERRED to the trigger: a live-in tile
+            // whose last use is an earlier (skipped) window op must not be freed
+            // before the fused kernel reads it. So skipped ops accumulate their
+            // indices in `pending_skip` and we reclaim the whole window's dead
+            // values only AFTER the kernel has run.
+            #[cfg(metal)]
+            if let Some(mrk) = map_triggers.get(&this_idx) {
+                crate::metal_backend::run_map_region_gpu(mrk, &mut self.ctx)?;
+                pending_skip.push(this_idx);
+                for idx in pending_skip.drain(..) {
+                    if let Some(dead) = self.dies_at.get(idx) {
+                        for name in dead {
+                            self.ctx.forget(name);
+                        }
+                    }
+                }
+                continue;
+            }
+            // A non-trigger op inside a fused window: its value is subsumed by the
+            // fused kernel run at the trigger, so don't execute it. Defer its
+            // liveness reclaim to the trigger (see above).
+            #[cfg(metal)]
+            if map_skip.contains(&this_idx) {
+                pending_skip.push(this_idx);
                 continue;
             }
             if is_comm_op(&op.op_type) {

@@ -319,13 +319,19 @@ fn smollm2_135m_fused_matches_golden() {
         return;
     };
     #[cfg(metal)]
-    ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    {
+        ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     let (max_abs, _) = run_fused_golden(&dir, "SmolLM2-135M decode");
     #[cfg(metal)]
     {
         let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!("  matmul K-loops offloaded to GPU GEMM: {gpu}");
+        eprintln!("  map windows offloaded to fused GPU kernel: {maps}");
         assert!(gpu >= 200, "expected the K-loops to run on GPU, only {gpu} did");
+        assert!(maps > 0, "expected map windows to run on GPU, none did");
     }
     assert!(max_abs < 0.2, "decode fused diverges from golden by {max_abs}");
 }
@@ -341,10 +347,14 @@ fn smollm2_135m_prefill_fused_matches_golden() {
         return;
     };
     ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     let (golden_diff, fused) = run_fused_golden(&dir, "SmolLM2-135M PREFILL");
     let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!("  prefill matmul K-loops offloaded to GPU GEMM: {gpu}");
+    eprintln!("  prefill map windows offloaded to fused GPU kernel: {maps}");
     assert!(gpu >= 200, "expected prefill K-loops on GPU, only {gpu} did");
+    assert!(maps > 0, "expected prefill map windows on GPU, none did");
 
     // AUTHORITATIVE GATE: the fused single-grid + GPU-GEMM run must match
     // golden.bin (the reference scratchy generates). 0.05 is well above the
@@ -397,4 +407,62 @@ fn prefill_matmul_loops_all_recognized() {
         "every prefill K-loop must collapse to one GEMM (M=8) — {} unrecognized",
         total - recognized
     );
+}
+
+/// MAP-WINDOW FUSION readiness: fuse the decode bundle and confirm `map_fusion_plan`
+/// carves the elementwise op stream into fused GPU kernels — proving the runtime
+/// map offload has work to do (the number of windows = the MAP_REGION_GPU_COUNT a
+/// run produces). No GPU dispatch: just the plan, so it's fast and device-free.
+#[cfg(metal)]
+#[test]
+#[ignore = "real-model map-fusion plan; needs ~/.cache/cudaforge/ktir/smollm2-135m. \
+            Run with --ignored --nocapture"]
+fn map_fusion_plan_carves_windows() {
+    if bundle_dir().is_none() {
+        eprintln!("SmolLM2 bundle absent — skipping");
+        return;
+    }
+    for which in ["smollm2-135m", "smollm2-135m-prefill"] {
+        let Some(d) = bundle_dir_named(which) else { continue };
+        let b = fuse_bundle(&d);
+        let ops = &b.func.operations;
+        let (triggers, skip) = ktir_cpu::metal_backend::map_fusion_plan(ops);
+        eprintln!(
+            "{which} fused ({} nodes -> 1 fn): {} map windows -> GPU kernels, {} op indices subsumed",
+            b.n_nodes, triggers.len(), skip.len()
+        );
+        // element count per SSA result (product of its shape attr)
+        let mut numel: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        fn rec(ops: &[ktir_cpu::ir::Operation], m: &mut std::collections::HashMap<String, i64>) {
+            for op in ops {
+                if let Some(r) = &op.result
+                    && let Some(ktir_cpu::ir::Attr::IntList(s)) = op.attributes.get("shape")
+                {
+                    m.insert(r.trim_start_matches('%').to_string(), s.iter().product());
+                }
+                for region in &op.regions { rec(region, m); }
+            }
+        }
+        rec(ops, &mut numel);
+        // For each kernel: a live-in read as `name[gid]` (not a broadcast index)
+        // MUST have element count == out_len, else gid runs out of bounds.
+        let mut mism = 0;
+        for mrk in triggers.values() {
+            let out_len: i64 = mrk.out_shape.iter().map(|&x| x as i64).product();
+            for li in &mrk.live_ins {
+                let key = li.trim_start_matches('%');
+                let n = *numel.get(key).unwrap_or(&-1);
+                let reads_gid = mrk.kernel.source.contains(&format!("{key}[gid]"));
+                if reads_gid && n != out_len {
+                    if mism < 15 {
+                        eprintln!("  MISMATCH {which}: live_out {} reads {key}[gid] len={n} but out_len={out_len}", mrk.live_out);
+                    }
+                    mism += 1;
+                }
+            }
+        }
+        eprintln!("  {which}: {mism} live-ins read [gid] with len != out_len (would corrupt)");
+        assert_eq!(mism, 0, "{which}: gid-indexed live-in length mismatch");
+        assert!(!triggers.is_empty(), "{which}: expected fusable windows");
+    }
 }
