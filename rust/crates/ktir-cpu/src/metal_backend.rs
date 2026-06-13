@@ -202,6 +202,111 @@ pub fn emit_msl(module: &IRModule, func_name: &str) -> Result<String, String> {
     Ok(emit_kernel(module, func_name)?.source)
 }
 
+// =========================================================================
+// Kernel scheduling — partition a fused function's op stream into kernels.
+//
+// The ktir-optimizer fuses a whole program into one SSA function (no
+// inter-function HBM). MLX-style, we then carve that op stream into kernels:
+// maximal windows of fusable "map" ops (one fused MSL kernel each), with
+// reductions and matmuls as their own kernels (they need different templates /
+// the GEMM path). Windows are capped at MAX_KERNEL_WINDOW so a single kernel
+// never grows unbounded (register pressure), matching MLX's bounded subgraphs.
+// =========================================================================
+
+/// Max map ops fused into one kernel before forcing a new window. MLX-style
+/// bounded subgraphs — keeps register pressure and compile time in check.
+pub const MAX_KERNEL_WINDOW: usize = 40;
+
+/// One scheduled unit of a fused function's top-level op stream. Indices point
+/// into the function body; the loads/stores feeding a region are traced by the
+/// emitter (they are plumbing, not separately scheduled).
+#[derive(Debug, PartialEq, Eq)]
+pub enum KernelRegion {
+    /// A maximal run of fusable map ops -> one fused MSL kernel.
+    Map(Vec<usize>),
+    /// A single reduction op -> its own (reduction) kernel.
+    Reduce(usize),
+    /// A single matmul -> a GEMM dispatch.
+    Matmul(usize),
+}
+
+/// How an op participates in scheduling.
+enum OpClass {
+    /// Fuses into a map kernel (elementwise / cast / broadcast).
+    Map,
+    /// A reduction — its own kernel, and a window boundary.
+    Reduce,
+    /// A matmul — its own GEMM dispatch, and a window boundary.
+    Matmul,
+    /// Dataflow/init plumbing the emitter traces through: never its own kernel,
+    /// never a window output, does not break a window (loads, views, tiles,
+    /// stores, constants, splat/empty inits, returns).
+    Plumbing,
+    /// Can't fuse (scf.*, comm, anything unrecognized) — forces a wholesale
+    /// interpreter fallback for the function.
+    Boundary,
+}
+
+fn classify(op: &Operation) -> OpClass {
+    match op.op_type.as_str() {
+        "arith.addf" | "arith.subf" | "arith.mulf" | "arith.divf" | "arith.maximumf"
+        | "arith.maxf" | "arith.minimumf" | "arith.minf" | "arith.negf" | "arith.absf"
+        | "math.absf" | "math.exp" | "math.log" | "math.sqrt" | "math.sin" | "math.cos"
+        | "math.tanh" | "arith.extf" | "arith.truncf" | "linalg.add" | "linalg.mul"
+        | "linalg.sub" | "linalg.broadcast" => OpClass::Map,
+        "linalg.reduce" => OpClass::Reduce,
+        "linalg.matmul" => OpClass::Matmul,
+        // Folded/plumbing: constants & splat fold into expressions; empty is an
+        // init shape hint; the ktdp.* memory ops + return are traced, not scheduled.
+        "arith.constant" | "tensor.splat" | "tensor.empty" | "func.return" => OpClass::Plumbing,
+        s if s.starts_with("ktdp.") => OpClass::Plumbing,
+        _ => OpClass::Boundary,
+    }
+}
+
+/// Partition a fused function's top-level ops into a kernel schedule. Greedily
+/// grows a map window until a boundary (reduce/matmul) flushes it or it hits the
+/// size cap; reductions and matmuls become their own regions. Returns `Err` if
+/// the function contains an unfusable op (scf.for, comm, …) so the caller falls
+/// back to the interpreter wholesale — the resident-buffer GPU path handles only
+/// fully map/reduce/matmul functions for now.
+pub fn plan_kernels(ops: &[Operation]) -> Result<Vec<KernelRegion>, String> {
+    let mut regions: Vec<KernelRegion> = Vec::new();
+    let mut window: Vec<usize> = Vec::new();
+    let flush = |w: &mut Vec<usize>, r: &mut Vec<KernelRegion>| {
+        if !w.is_empty() {
+            r.push(KernelRegion::Map(std::mem::take(w)));
+        }
+    };
+    for (i, op) in ops.iter().enumerate() {
+        match classify(op) {
+            OpClass::Map => {
+                window.push(i);
+                if window.len() >= MAX_KERNEL_WINDOW {
+                    flush(&mut window, &mut regions);
+                }
+            }
+            OpClass::Reduce => {
+                flush(&mut window, &mut regions);
+                regions.push(KernelRegion::Reduce(i));
+            }
+            OpClass::Matmul => {
+                flush(&mut window, &mut regions);
+                regions.push(KernelRegion::Matmul(i));
+            }
+            OpClass::Plumbing => {} // traced by the emitter; doesn't break a window
+            OpClass::Boundary => {
+                return Err(format!(
+                    "metal: op '{}' is not fusable — function falls back to the interpreter",
+                    op.op_type
+                ));
+            }
+        }
+    }
+    flush(&mut window, &mut regions);
+    Ok(regions)
+}
+
 /// Lower `func_name` to a full [`MslKernel`] (source + buffer bindings).
 pub fn emit_kernel(module: &IRModule, func_name: &str) -> Result<MslKernel, String> {
     let f = module.get_function(func_name)?;
@@ -2726,6 +2831,79 @@ module {
             "unexpected fused body:\n{}",
             kernel.source
         );
+    }
+
+    // --- kernel scheduling (partitioner) --------------------------------
+
+    /// Build a bare op with just a type (the partitioner only reads op_type).
+    fn op(ty: &str) -> Operation {
+        Operation::new(Some("%r"), ty, &[])
+    }
+
+    #[test]
+    fn partitions_rmsnorm_shape_into_map_reduce_map() {
+        // load, [extf, mulf], reduce, [divf, sqrt], store, return
+        // -> Map([1,2]), Reduce(3), Map([4,5])  (plumbing skipped, not boundaries)
+        let ops = vec![
+            op("ktdp.load"),     // 0 plumbing
+            op("arith.extf"),    // 1 map
+            op("arith.mulf"),    // 2 map
+            op("linalg.reduce"), // 3 reduce
+            op("arith.divf"),    // 4 map
+            op("math.sqrt"),     // 5 map
+            op("ktdp.store"),    // 6 plumbing
+            op("func.return"),   // 7 plumbing
+        ];
+        let plan = plan_kernels(&ops).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                KernelRegion::Map(vec![1, 2]),
+                KernelRegion::Reduce(3),
+                KernelRegion::Map(vec![4, 5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn partitions_matmul_as_its_own_region() {
+        // broadcast then matmul then add -> Map, Matmul, Map
+        let ops = vec![
+            op("linalg.broadcast"), // 0 map
+            op("linalg.matmul"),    // 1 matmul
+            op("arith.addf"),       // 2 map
+        ];
+        let plan = plan_kernels(&ops).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                KernelRegion::Map(vec![0]),
+                KernelRegion::Matmul(1),
+                KernelRegion::Map(vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn unfusable_op_forces_fallback() {
+        let ops = vec![op("arith.mulf"), op("scf.for"), op("arith.addf")];
+        assert!(plan_kernels(&ops).is_err(), "scf.for must force a fallback");
+    }
+
+    #[test]
+    fn map_window_respects_size_cap() {
+        // 2*CAP + 5 consecutive map ops -> windows of CAP, CAP, then 5.
+        let n = MAX_KERNEL_WINDOW * 2 + 5;
+        let ops: Vec<Operation> = (0..n).map(|_| op("arith.addf")).collect();
+        let plan = plan_kernels(&ops).unwrap();
+        let sizes: Vec<usize> = plan
+            .iter()
+            .map(|r| match r {
+                KernelRegion::Map(v) => v.len(),
+                _ => panic!("expected only map regions"),
+            })
+            .collect();
+        assert_eq!(sizes, vec![MAX_KERNEL_WINDOW, MAX_KERNEL_WINDOW, 5]);
     }
 
     #[test]
