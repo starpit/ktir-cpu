@@ -11,4 +11,4 @@
 //! a single function where those intermediates are SSA values, eliminating the
 //! per-edge `store → HBM → load` round-trip.
 
-// (passes land here)
+pub mod fusion;
