@@ -189,6 +189,13 @@ struct CoreRunner {
     op_idx: usize,
     /// `Some` while suspended inside a comm op: `(machine, result_name)`.
     active: Option<(Box<dyn CommOp>, Option<String>)>,
+    /// `dies_at[i]` = function-scope SSA tiles whose LAST use is top-level op `i`
+    /// (counting uses nested in regions). After running op `i` they are dead, so
+    /// their LX is reclaimed. Without this, a whole-program-fused function would
+    /// hold every node's tiles resident at once and blow the 2 MB LX budget; the
+    /// per-node runner gets the same effect for free via a fresh memory hierarchy
+    /// per call. Shared (identical for every core).
+    dies_at: Rc<Vec<Vec<String>>>,
 }
 
 enum Poll {
@@ -219,6 +226,7 @@ impl CoreRunner {
         // Run remaining top-level ops.
         while self.op_idx < ops.len() {
             let op = &ops[self.op_idx];
+            let this_idx = self.op_idx;
             self.op_idx += 1;
             if is_comm_op(&op.op_type) {
                 // Charge the comm op's latency once (it doesn't go through
@@ -249,9 +257,52 @@ impl CoreRunner {
             } else {
                 execute_op(op, &mut self.ctx, env)?;
             }
+            // Reclaim LX for every value that just went dead at this op.
+            if let Some(dead) = self.dies_at.get(this_idx) {
+                for name in dead {
+                    self.ctx.untrack_lx(name);
+                }
+            }
         }
         Ok(Poll::Done)
     }
+}
+
+/// Compute, for a top-level op list, which SSA values become dead after each op
+/// — i.e. `dies_at[i]` lists every value whose LAST use (as an operand, counting
+/// uses nested in regions) is op `i`. A value never read after definition dies at
+/// its own op. Used to reclaim LX as a fused function streams through, instead of
+/// holding every intermediate resident. Values defined inside regions are managed
+/// by region scope pop and are not tracked here.
+fn compute_dies_at(ops: &[Operation]) -> Vec<Vec<String>> {
+    // Recursively record the highest TOP-LEVEL index at which each name is used.
+    fn note_uses(op: &Operation, top_idx: usize, last_use: &mut HashMap<String, usize>) {
+        for operand in &op.operands {
+            if operand.starts_with('%') {
+                last_use.insert(operand.clone(), top_idx);
+            }
+        }
+        for region in &op.regions {
+            for inner in region {
+                note_uses(inner, top_idx, last_use);
+            }
+        }
+    }
+    let mut last_use: HashMap<String, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        note_uses(op, i, &mut last_use);
+    }
+    // A defined-but-never-used value dies at its own op (still tracked LX to free).
+    for (i, op) in ops.iter().enumerate() {
+        if let Some(r) = &op.result {
+            last_use.entry(r.clone()).or_insert(i);
+        }
+    }
+    let mut dies_at = vec![Vec::new(); ops.len()];
+    for (name, idx) in last_use {
+        dies_at[idx].push(name);
+    }
+    dies_at
 }
 
 /// Bind a comm op's result value to its SSA name, tracking LX for Tiles
@@ -287,6 +338,9 @@ pub fn execute_with_communication(
     };
     let num_cores = grid.num_cores.max(1);
 
+    // Liveness for LX reclaim (identical for every core) — see `CoreRunner::dies_at`.
+    let dies_at = Rc::new(compute_dies_at(ops));
+
     let mut runners: BTreeMap<usize, CoreRunner> = BTreeMap::new();
     for core_id in 0..num_cores {
         let mut ctx = CoreContext::new(
@@ -305,6 +359,7 @@ pub fn execute_with_communication(
                 ctx,
                 op_idx: 0,
                 active: None,
+                dies_at: Rc::clone(&dies_at),
             },
         );
     }
@@ -407,6 +462,7 @@ mod tests {
         let dispatch = Dispatch::new();
         let env = ExecutionEnv::new(&dispatch, grid);
         let n = grid.num_cores;
+        let dies_at = Rc::new(compute_dies_at(ops));
         let mut runners: Vec<CoreRunner> = (0..n)
             .map(|core_id| {
                 let mut ctx = CoreContext::new(
@@ -423,6 +479,7 @@ mod tests {
                     ctx,
                     op_idx: 0,
                     active: None,
+                    dies_at: Rc::clone(&dies_at),
                 }
             })
             .collect();

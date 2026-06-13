@@ -78,9 +78,18 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
             && !spec.results.contains(&t)
     };
 
-    // `produced[T]` = the fused-function SSA value currently holding tensor T,
-    // once its producing node has been inlined and its store forwarded.
-    let mut produced: HashMap<u64, String> = HashMap::new();
+    // Analyze every node once (region-aware) and cache — `all_consumers_*`
+    // would otherwise re-walk every consumer per producer (O(nodes²)).
+    let analyses: Vec<Analysis> = spec
+        .nodes
+        .iter()
+        .map(|n| module.get_function(&n.func).map(analyze))
+        .collect::<Result<_, _>>()?;
+
+    // `produced[T]` = (fused-function SSA value holding tensor T, its full shape),
+    // recorded once its producing node is inlined and its whole-tensor store
+    // forwarded. The shape pins the layout a tiled consumer slices into.
+    let mut produced: HashMap<u64, (String, Vec<i64>)> = HashMap::new();
     // Pointer args the fused function still needs (sources, results, and any
     // intermediate edge we could not forward), keyed by tensor id.
     let mut needed_args: Vec<(u64, String)> = Vec::new();
@@ -88,50 +97,84 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
     let mut body: Vec<Operation> = Vec::new();
 
     for (ni, node) in spec.nodes.iter().enumerate() {
-        let func = module.get_function(&node.func)?;
-        let analysis = analyze(func);
+        let an = &analyses[ni];
         let arg_to_tensor: HashMap<&str, &Binding> =
             node.bindings.iter().map(|b| (b.arg.as_str(), b)).collect();
 
-        // Build the SSA rename map for this node: internal defs get an `nN_`
-        // prefix; arg pointers map to either a forwarded value, a dropped chain,
-        // or the canonical fused-function arg `%t<id>_ptr`.
-        let mut rename: HashMap<String, String> = HashMap::new();
-        let mut dropped: HashSet<usize> = HashSet::new(); // op indices to skip
-        // load_idx -> the extract_slice that replaces a tiled forwarded load.
-        let mut replace: HashMap<usize, SliceForward> = HashMap::new();
-        // Args (by name) whose load was forwarded — no HBM pointer needed.
+        // ----- decide which of this node's pointer args get forwarded -----
+        // An INPUT arg is forwarded iff its producer is resident AND *every*
+        // load through it reads the producer's full-shape layout in a way we can
+        // model — whole-tensor (alias) or a contiguous sub-tile (extract_slice).
         let mut forwarded_args: HashSet<String> = HashSet::new();
-
-        // Forward intermediate INPUTS off the producer's resident SSA value:
-        //   - whole-tensor load  -> alias the loaded SSA to the producer value
-        //     (drop the view→tile→load chain entirely).
-        //   - tiled, contiguous load -> replace the load with a
-        //     `tensor.extract_slice` of the producer value at the access tile's
-        //     offsets/shape (drop the view/tile, keep a slice in place of the
-        //     load). The offset operands stay live and rename normally.
-        for ld in &analysis.loads {
-            let b = match arg_to_tensor.get(ld.arg.as_str()) {
-                Some(b) => *b,
-                None => continue,
-            };
+        let mut loads_by_arg: HashMap<&str, Vec<&LoadChain>> = HashMap::new();
+        for ld in &an.loads {
+            loads_by_arg.entry(ld.arg.as_str()).or_default().push(ld);
+        }
+        for (arg, lds) in &loads_by_arg {
+            let Some(b) = arg_to_tensor.get(*arg) else { continue };
             if b.is_output || !is_intermediate(b.tensor) {
                 continue;
             }
-            let Some(val) = produced.get(&b.tensor) else {
-                continue; // producer not resident as SSA -> keep HBM load
+            let Some((_, pshape)) = produced.get(&b.tensor) else {
+                continue; // producer not resident -> keep HBM load
             };
+            if lds
+                .iter()
+                .all(|l| &l.view_shape == pshape && (l.whole_tensor || l.sliceable))
+            {
+                forwarded_args.insert((*arg).to_string());
+            }
+        }
+        // An OUTPUT arg is forwarded iff the producer writes the whole tensor and
+        // every consuming node can forward it (same full-shape + whole/sliceable).
+        // Record the resident SSA so later nodes can forward off it.
+        for st in &an.stores {
+            let Some(b) = arg_to_tensor.get(st.arg.as_str()) else { continue };
+            if b.is_output
+                && st.whole_tensor
+                && is_intermediate(b.tensor)
+                && all_consumers_forwardable(spec, &analyses, b.tensor, &st.view_shape)
+            {
+                forwarded_args.insert(st.arg.clone());
+                produced.insert(b.tensor, (prefixed(ni, &st.stored), st.view_shape.clone()));
+            }
+        }
+
+        // ----- turn the forwarding decision into concrete drop/rename ops -----
+        let mut rename: HashMap<String, String> = HashMap::new();
+        // Op result SSAs to drop entirely (views/tiles on forwarded args, and
+        // whole-tensor loads whose value is aliased to the producer).
+        let mut drop_results: HashSet<String> = HashSet::new();
+        // ktdp.store ops whose tile operand is in here are dropped.
+        let mut drop_store_tiles: HashSet<String> = HashSet::new();
+        // load result SSA -> the extract_slice that replaces it (tiled forward).
+        let mut slice_at_load: HashMap<String, SliceForward> = HashMap::new();
+
+        // Drop the construct_memory_view of every forwarded arg (its HBM pointer
+        // is gone), then the access tiles built on those views.
+        for (vssa, (arg, _)) in &an.views {
+            if forwarded_args.contains(arg) {
+                drop_results.insert(vssa.clone());
+            }
+        }
+        for (tssa, ti) in &an.tiles {
+            if drop_results.contains(&ti.view) {
+                drop_results.insert(tssa.clone());
+            }
+        }
+        // Loads on dropped tiles: alias (whole) or slice (tiled).
+        for ld in &an.loads {
+            if !drop_results.contains(&ld.tile) {
+                continue;
+            }
+            let Some(b) = arg_to_tensor.get(ld.arg.as_str()) else { continue };
+            let Some((val, _)) = produced.get(&b.tensor) else { continue };
             if ld.whole_tensor {
                 rename.insert(ld.loaded.clone(), val.clone());
-                dropped.insert(ld.load_idx);
-                dropped.insert(ld.tile_idx);
-                if let Some(vidx) = ld.view_idx {
-                    dropped.insert(vidx);
-                }
-                forwarded_args.insert(ld.arg.clone());
-            } else if ld.sliceable {
-                replace.insert(
-                    ld.load_idx,
+                drop_results.insert(ld.loaded.clone());
+            } else {
+                slice_at_load.insert(
+                    ld.loaded.clone(),
                     SliceForward {
                         source: val.clone(),
                         loaded: ld.loaded.clone(),
@@ -139,67 +182,38 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
                         sizes: ld.tile_shape.clone(),
                     },
                 );
-                dropped.insert(ld.tile_idx);
-                if let Some(vidx) = ld.view_idx {
-                    dropped.insert(vidx);
-                }
-                forwarded_args.insert(ld.arg.clone());
+            }
+        }
+        // Stores on dropped tiles: drop the store itself.
+        for st in &an.stores {
+            if drop_results.contains(&st.tile) {
+                drop_store_tiles.insert(st.tile.clone());
             }
         }
 
-        // Forward intermediate OUTPUTS: when the producer writes the whole
-        // tensor in one store and every consumer can be forwarded (whole-tensor
-        // or contiguous-tiled), drop the store/view/tile and record the stored
-        // value as the resident producer of that tensor. If any consumer can't
-        // be forwarded, keep the store — that consumer keeps its HBM load (the
-        // tensor simply never lands in `produced`), so resident-but-unforwarded
-        // edges stay correct.
-        for st in &analysis.stores {
-            let b = match arg_to_tensor.get(st.arg.as_str()) {
-                Some(b) => *b,
-                None => continue,
-            };
-            if b.is_output
-                && st.whole_tensor
-                && is_intermediate(b.tensor)
-                && all_consumers_forwardable(module, spec, b.tensor)
-            {
-                dropped.insert(st.store_idx);
-                dropped.insert(st.tile_idx);
-                if let Some(vidx) = st.view_idx {
-                    dropped.insert(vidx);
-                }
-                produced.insert(b.tensor, prefixed(ni, &st.stored));
-            }
-        }
-
-        // Any arg whose load/store we did NOT forward and that points at a
-        // tensor still needing HBM (source, result, or unforwarded intermediate)
-        // becomes a fused-function arg, shared by tensor id under the canonical name.
+        // Non-forwarded args keep an HBM pointer, shared by tensor id under the
+        // canonical name; map this node's arg name onto it.
         for b in &node.bindings {
-            let forwarded_in = forwarded_args.contains(&b.arg);
-            let forwarded_out = produced.contains_key(&b.tensor) && b.is_output;
-            if !forwarded_in && !forwarded_out {
-                let canon = format!("%t{}_ptr", b.tensor);
-                rename.insert(b.arg.clone(), canon.clone());
-                if have_arg.insert(b.tensor) {
-                    needed_args.push((b.tensor, canon));
-                }
+            if forwarded_args.contains(&b.arg) {
+                continue;
+            }
+            let canon = format!("%t{}_ptr", b.tensor);
+            rename.insert(b.arg.clone(), canon.clone());
+            if have_arg.insert(b.tensor) {
+                needed_args.push((b.tensor, canon));
             }
         }
 
-        // Emit the node's ops, renamed, skipping dropped ones and substituting
-        // the tiled-forward loads with their extract_slice.
-        for (idx, op) in func.operations.iter().enumerate() {
-            if dropped.contains(&idx) {
-                continue;
-            }
-            if let Some(sf) = replace.get(&idx) {
-                body.push(sf.build(ni, &rename));
-                continue;
-            }
-            body.push(rename_op(op, ni, &rename));
-        }
+        // Emit the node's ops (recursively, into regions), renamed, dropping the
+        // forwarded chains and substituting tiled loads with their extract_slice.
+        body.extend(emit_ops(
+            &module.get_function(&node.func)?.operations,
+            ni,
+            &rename,
+            &drop_results,
+            &drop_store_tiles,
+            &slice_at_load,
+        ));
     }
 
     // Fused function args, in a deterministic order: sources, then results.
@@ -233,25 +247,30 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
 }
 
 /// True if every node consuming `tensor` reads it in a way we can forward off a
-/// resident SSA value: a whole-tensor load, or a contiguous tiled load we can
-/// model with `tensor.extract_slice`. If any consumer reads it some other way
-/// (non-identity base_map, indirect/gather access), the producer store is kept
-/// and that consumer keeps its HBM load.
-fn all_consumers_forwardable(module: &IRModule, spec: &ProgramSpec, tensor: u64) -> bool {
-    for node in &spec.nodes {
+/// resident SSA value of shape `pshape`: every load through that arg must read
+/// the producer's full-shape layout (`view_shape == pshape`) as a whole tensor
+/// or a contiguous sub-tile. Any other read (a different view shape, a
+/// non-identity base_map, indirect/gather access, or no load at all) keeps the
+/// producer store and that consumer's HBM load. `analyses[i]` is node `i`'s
+/// cached analysis.
+fn all_consumers_forwardable(
+    spec: &ProgramSpec,
+    analyses: &[Analysis],
+    tensor: u64,
+    pshape: &[i64],
+) -> bool {
+    for (i, node) in spec.nodes.iter().enumerate() {
         for b in &node.bindings {
             if !b.is_output && b.tensor == tensor {
-                let Ok(func) = module.get_function(&node.func) else {
-                    return false;
-                };
-                let a = analyze(func);
-                let ok = a
-                    .loads
+                let lds: Vec<&LoadChain> =
+                    analyses[i].loads.iter().filter(|l| l.arg == b.arg).collect();
+                if lds.is_empty() {
+                    return false; // consumed but no recognizable load -> can't forward
+                }
+                if !lds
                     .iter()
-                    .find(|l| l.arg == b.arg)
-                    .map(|l| l.whole_tensor || l.sliceable)
-                    .unwrap_or(false);
-                if !ok {
+                    .all(|l| l.view_shape == pshape && (l.whole_tensor || l.sliceable))
+                {
                     return false;
                 }
             }
@@ -284,123 +303,160 @@ impl SliceForward {
     }
 }
 
-// --- per-function analysis -------------------------------------------------
+// --- per-function analysis (region-aware) ----------------------------------
 
 struct LoadChain {
     arg: String,
     loaded: String,
+    /// View SSA the access tile is built on (dropped when the arg is forwarded).
+    #[allow(dead_code)]
+    view: String,
+    /// Access-tile SSA — identifies the tile op to drop and the load to rewrite.
+    tile: String,
     whole_tensor: bool,
-    load_idx: usize,
-    tile_idx: usize,
-    view_idx: Option<usize>,
     /// The access tile's index operands (`construct_access_tile %view[%i, %j]`).
     /// With an identity `base_map` these are the slice's per-axis start offsets.
     offsets: Vec<String>,
     /// The access tile's logical shape — the slice sizes for a tiled forward.
     tile_shape: Vec<i64>,
+    /// The memory-view's shape — must equal the producer's stored shape for the
+    /// forward to index the right layout.
+    view_shape: Vec<i64>,
     /// True when the access tile reads a contiguous box at `offsets` (identity
     /// `base_map`, no reordering) — the only shape a plain `extract_slice` models.
-    /// A non-identity map (transpose/broadcast/gather) is left to the HBM path.
     sliceable: bool,
 }
 struct StoreChain {
     arg: String,
     stored: String,
+    tile: String,
     whole_tensor: bool,
-    store_idx: usize,
-    tile_idx: usize,
-    view_idx: Option<usize>,
+    view_shape: Vec<i64>,
 }
+
+/// A construct_access_tile's decoded fields.
+struct TileInfo {
+    view: String,
+    offsets: Vec<String>,
+    shape: Vec<i64>,
+    base_identity: bool,
+    has_order: bool,
+}
+
 #[derive(Default)]
 struct Analysis {
     loads: Vec<LoadChain>,
     stores: Vec<StoreChain>,
+    /// view SSA -> (arg pointer it interprets, view shape).
+    views: HashMap<String, (String, Vec<i64>)>,
+    /// access-tile SSA -> decoded tile.
+    tiles: HashMap<String, TileInfo>,
 }
 
-/// Trace each top-level `ktdp.load`/`ktdp.store` back through its access-tile and
-/// memory-view to the function arg pointer it touches, and decide whether it
-/// covers the whole tensor (access-tile shape == memory-view shape).
+/// Trace every `ktdp.load`/`ktdp.store` — at any region depth — back through its
+/// access tile and memory view to the function arg pointer it touches. The real
+/// model issues its tiled loads INSIDE an `scf.for`, so the walk must recurse
+/// into op regions; views/tiles are collected across all depths first (a tile in
+/// a loop body is built on a view declared at function top level).
 fn analyze(func: &IRFunction) -> Analysis {
-    // result-SSA -> op index, for the top-level ops.
-    let mut def: HashMap<&str, usize> = HashMap::new();
-    for (i, op) in func.operations.iter().enumerate() {
-        if let Some(r) = &op.result {
-            def.insert(r.as_str(), i);
-        }
-    }
-    let shape_of = |idx: usize| -> Option<&Vec<i64>> {
-        match func.operations[idx].attributes.get("shape") {
-            Some(Attr::IntList(v)) => Some(v),
-            _ => None,
-        }
-    };
-
     let mut a = Analysis::default();
-    for (i, op) in func.operations.iter().enumerate() {
+    collect_views_tiles(&func.operations, &mut a);
+    // Borrow-split: read views/tiles while pushing into loads/stores.
+    let Analysis { views, tiles, loads, stores } = &mut a;
+    collect_loads_stores(&func.operations, views, tiles, loads, stores);
+    a
+}
+
+fn shape_attr_of(op: &Operation) -> Vec<i64> {
+    match op.attributes.get("shape") {
+        Some(Attr::IntList(v)) => v.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn collect_views_tiles(ops: &[Operation], a: &mut Analysis) {
+    for op in ops {
         match op.op_type.as_str() {
-            "ktdp.load" => {
-                let tile = op.operands.first();
-                let tile_idx = tile.and_then(|t| def.get(t.as_str())).copied();
-                if let (Some(loaded), Some(tile_idx)) = (op.result.as_ref(), tile_idx) {
-                    let tile_op = &func.operations[tile_idx];
-                    let view_idx = tile_op.operands.first().and_then(|v| def.get(v.as_str())).copied();
-                    let arg = view_idx
-                        .and_then(|vi| func.operations[vi].operands.first().cloned());
-                    if let Some(arg) = arg {
-                        let whole = match (shape_of(tile_idx), view_idx.and_then(shape_of)) {
-                            (Some(ts), Some(vs)) => ts == vs,
-                            _ => false,
-                        };
-                        // index operands after the view = per-axis start coords.
-                        let offsets: Vec<String> = tile_op.operands[1..].to_vec();
-                        let tile_shape = shape_of(tile_idx).cloned().unwrap_or_default();
-                        let sliceable = base_map_is_identity(tile_op)
-                            && !tile_op.attributes.contains_key("coordinate_order")
-                            && !offsets.is_empty()
-                            && offsets.len() == tile_shape.len();
-                        a.loads.push(LoadChain {
-                            arg,
-                            loaded: loaded.clone(),
-                            whole_tensor: whole,
-                            load_idx: i,
-                            tile_idx,
-                            view_idx,
-                            offsets,
-                            tile_shape,
-                            sliceable,
-                        });
-                    }
+            "ktdp.construct_memory_view" => {
+                if let (Some(res), Some(arg)) = (&op.result, op.operands.first()) {
+                    a.views.insert(res.clone(), (arg.clone(), shape_attr_of(op)));
                 }
             }
-            "ktdp.store" => {
-                // store %value, %tile
-                let stored = op.operands.first().cloned();
-                let tile_idx = op.operands.get(1).and_then(|t| def.get(t.as_str())).copied();
-                if let (Some(stored), Some(tile_idx)) = (stored, tile_idx) {
-                    let tile_op = &func.operations[tile_idx];
-                    let view_idx = tile_op.operands.first().and_then(|v| def.get(v.as_str())).copied();
-                    let arg = view_idx
-                        .and_then(|vi| func.operations[vi].operands.first().cloned());
-                    if let Some(arg) = arg {
-                        let whole = match (shape_of(tile_idx), view_idx.and_then(shape_of)) {
-                            (Some(ts), Some(vs)) => ts == vs,
-                            _ => false,
-                        };
-                        a.stores.push(StoreChain {
-                            arg,
-                            stored,
-                            whole_tensor: whole,
-                            store_idx: i,
-                            tile_idx,
-                            view_idx,
-                        });
-                    }
+            "ktdp.construct_access_tile" => {
+                if let (Some(res), Some(view)) = (&op.result, op.operands.first()) {
+                    a.tiles.insert(
+                        res.clone(),
+                        TileInfo {
+                            view: view.clone(),
+                            offsets: op.operands[1..].to_vec(),
+                            shape: shape_attr_of(op),
+                            base_identity: base_map_is_identity(op),
+                            has_order: op.attributes.contains_key("coordinate_order"),
+                        },
+                    );
                 }
             }
             _ => {}
         }
+        for rg in &op.regions {
+            collect_views_tiles(rg, a);
+        }
     }
-    a
+}
+
+fn collect_loads_stores(
+    ops: &[Operation],
+    views: &HashMap<String, (String, Vec<i64>)>,
+    tiles: &HashMap<String, TileInfo>,
+    loads: &mut Vec<LoadChain>,
+    stores: &mut Vec<StoreChain>,
+) {
+    for op in ops {
+        match op.op_type.as_str() {
+            "ktdp.load" => {
+                if let (Some(loaded), Some(tile_ssa)) = (&op.result, op.operands.first())
+                    && let Some(ti) = tiles.get(tile_ssa)
+                    && let Some((arg, vshape)) = views.get(&ti.view)
+                {
+                    let whole = !ti.shape.is_empty() && &ti.shape == vshape;
+                    let sliceable = ti.base_identity
+                        && !ti.has_order
+                        && !ti.offsets.is_empty()
+                        && ti.offsets.len() == ti.shape.len();
+                    loads.push(LoadChain {
+                        arg: arg.clone(),
+                        loaded: loaded.clone(),
+                        view: ti.view.clone(),
+                        tile: tile_ssa.clone(),
+                        whole_tensor: whole,
+                        offsets: ti.offsets.clone(),
+                        tile_shape: ti.shape.clone(),
+                        view_shape: vshape.clone(),
+                        sliceable,
+                    });
+                }
+            }
+            "ktdp.store" => {
+                if let (Some(stored), Some(tile_ssa)) = (op.operands.first(), op.operands.get(1))
+                    && let Some(ti) = tiles.get(tile_ssa)
+                    && let Some((arg, vshape)) = views.get(&ti.view)
+                {
+                    let whole = !ti.shape.is_empty() && &ti.shape == vshape;
+                    stores.push(StoreChain {
+                        arg: arg.clone(),
+                        stored: stored.clone(),
+                        tile: tile_ssa.clone(),
+                        whole_tensor: whole,
+                        view_shape: vshape.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        for rg in &op.regions {
+            collect_loads_stores(rg, views, tiles, loads, stores);
+        }
+    }
 }
 
 /// True when a `construct_access_tile` op's `base_map` is the identity (so the
@@ -413,7 +469,7 @@ fn base_map_is_identity(tile_op: &Operation) -> bool {
     }
 }
 
-// --- SSA renaming ----------------------------------------------------------
+// --- SSA renaming + recursive emit -----------------------------------------
 
 /// `%foo` -> `%nN_foo` (node-local rename to avoid collisions across inlined nodes).
 fn prefixed(ni: usize, ssa: &str) -> String {
@@ -433,20 +489,84 @@ fn resolve(ni: usize, name: &str, rename: &HashMap<String, String>) -> String {
     }
 }
 
-/// Deep-copy an op with all SSA names (result, operands, nested regions) renamed.
-fn rename_op(op: &Operation, ni: usize, rename: &HashMap<String, String>) -> Operation {
-    Operation {
-        result: op.result.as_ref().map(|r| resolve(ni, r, rename)),
-        op_type: op.op_type.clone(),
-        operands: op.operands.iter().map(|o| resolve(ni, o, rename)).collect(),
-        attributes: op.attributes.clone(),
-        result_type: op.result_type.clone(),
-        regions: op
-            .regions
-            .iter()
-            .map(|region| region.iter().map(|o| rename_op(o, ni, rename)).collect())
-            .collect(),
+/// Some ops carry SSA names in ATTRIBUTES, not just operands — `scf.for`'s
+/// induction variable (`iter_var`) and loop-carried names (`iter_args`), and any
+/// op's multi-result `result_names` / a view's dynamic `sizes_dyn`. These must be
+/// renamed in lockstep with the op stream, or a fused loop body would reference a
+/// differently-prefixed induction variable than the one the loop binds.
+fn rename_attrs(
+    op: &Operation,
+    ni: usize,
+    rename: &HashMap<String, String>,
+) -> std::collections::HashMap<String, Attr> {
+    let mut attrs = op.attributes.clone();
+    for key in ["iter_var", "iter_args", "result_names", "sizes_dyn"] {
+        match attrs.get(key) {
+            Some(Attr::Str(s)) => {
+                attrs.insert(key.to_string(), Attr::Str(resolve(ni, s, rename)));
+            }
+            Some(Attr::StrList(xs)) => {
+                let mapped = xs.iter().map(|s| resolve(ni, s, rename)).collect();
+                attrs.insert(key.to_string(), Attr::StrList(mapped));
+            }
+            _ => {}
+        }
     }
+    attrs
+}
+
+/// Emit a node's ops into the fused body, recursing into regions: rename every
+/// SSA (operands, results, SSA-bearing attributes, nested regions), drop the
+/// forwarded view/tile/load/store chains, and substitute each tiled forwarded
+/// load with its `extract_slice`. Per-node `func.return`s are dropped (the fused
+/// function gets a single trailing return).
+fn emit_ops(
+    ops: &[Operation],
+    ni: usize,
+    rename: &HashMap<String, String>,
+    drop_results: &HashSet<String>,
+    drop_store_tiles: &HashSet<String>,
+    slice_at_load: &HashMap<String, SliceForward>,
+) -> Vec<Operation> {
+    let mut out = Vec::new();
+    for op in ops {
+        if op.op_type == "func.return" {
+            continue;
+        }
+        if let Some(r) = &op.result
+            && drop_results.contains(r)
+        {
+            continue;
+        }
+        if op.op_type == "ktdp.store"
+            && let Some(tile) = op.operands.get(1)
+            && drop_store_tiles.contains(tile)
+        {
+            continue;
+        }
+        if op.op_type == "ktdp.load"
+            && let Some(r) = &op.result
+            && let Some(sf) = slice_at_load.get(r)
+        {
+            out.push(sf.build(ni, rename));
+            continue;
+        }
+        out.push(Operation {
+            result: op.result.as_ref().map(|r| resolve(ni, r, rename)),
+            op_type: op.op_type.clone(),
+            operands: op.operands.iter().map(|o| resolve(ni, o, rename)).collect(),
+            attributes: rename_attrs(op, ni, rename),
+            result_type: op.result_type.clone(),
+            regions: op
+                .regions
+                .iter()
+                .map(|rg| {
+                    emit_ops(rg, ni, rename, drop_results, drop_store_tiles, slice_at_load)
+                })
+                .collect(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
