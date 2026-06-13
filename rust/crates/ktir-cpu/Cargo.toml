@@ -47,6 +47,9 @@ path = "src/lib.rs"
 # Test-only: the SmolLM2 model runner (e2e_smollm2.rs) parses manifest.json.
 [dev-dependencies]
 serde_json = "1"
+# Fuse-then-run e2e: drive the optimizer's fusion-pass output through the
+# execution layer and check it against the per-node (unfused) oracle.
+ktir-optimizer = { path = "../ktir-optimizer" }
 
 # Profiling target for the real-model run. Plain `fn main` (no libtest harness).
 [[bench]]

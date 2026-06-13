@@ -98,63 +98,86 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
         // or the canonical fused-function arg `%t<id>_ptr`.
         let mut rename: HashMap<String, String> = HashMap::new();
         let mut dropped: HashSet<usize> = HashSet::new(); // op indices to skip
+        // load_idx -> the extract_slice that replaces a tiled forwarded load.
+        let mut replace: HashMap<usize, SliceForward> = HashMap::new();
+        // Args (by name) whose load was forwarded — no HBM pointer needed.
+        let mut forwarded_args: HashSet<String> = HashSet::new();
 
-        // Forward whole-tensor intermediate INPUTS: drop view→tile→load chain,
-        // alias the loaded SSA to the producer value.
+        // Forward intermediate INPUTS off the producer's resident SSA value:
+        //   - whole-tensor load  -> alias the loaded SSA to the producer value
+        //     (drop the view→tile→load chain entirely).
+        //   - tiled, contiguous load -> replace the load with a
+        //     `tensor.extract_slice` of the producer value at the access tile's
+        //     offsets/shape (drop the view/tile, keep a slice in place of the
+        //     load). The offset operands stay live and rename normally.
         for ld in &analysis.loads {
             let b = match arg_to_tensor.get(ld.arg.as_str()) {
                 Some(b) => *b,
                 None => continue,
             };
-            if !b.is_output
-                && ld.whole_tensor
-                && is_intermediate(b.tensor)
-                && let Some(val) = produced.get(&b.tensor)
-            {
+            if b.is_output || !is_intermediate(b.tensor) {
+                continue;
+            }
+            let Some(val) = produced.get(&b.tensor) else {
+                continue; // producer not resident as SSA -> keep HBM load
+            };
+            if ld.whole_tensor {
                 rename.insert(ld.loaded.clone(), val.clone());
                 dropped.insert(ld.load_idx);
                 dropped.insert(ld.tile_idx);
                 if let Some(vidx) = ld.view_idx {
                     dropped.insert(vidx);
                 }
+                forwarded_args.insert(ld.arg.clone());
+            } else if ld.sliceable {
+                replace.insert(
+                    ld.load_idx,
+                    SliceForward {
+                        source: val.clone(),
+                        loaded: ld.loaded.clone(),
+                        offsets: ld.offsets.clone(),
+                        sizes: ld.tile_shape.clone(),
+                    },
+                );
+                dropped.insert(ld.tile_idx);
+                if let Some(vidx) = ld.view_idx {
+                    dropped.insert(vidx);
+                }
+                forwarded_args.insert(ld.arg.clone());
             }
         }
 
-        // Forward whole-tensor intermediate OUTPUTS: drop the store (and its
-        // view/tile), record the stored value as the producer of that tensor.
+        // Forward intermediate OUTPUTS: when the producer writes the whole
+        // tensor in one store and every consumer can be forwarded (whole-tensor
+        // or contiguous-tiled), drop the store/view/tile and record the stored
+        // value as the resident producer of that tensor. If any consumer can't
+        // be forwarded, keep the store — that consumer keeps its HBM load (the
+        // tensor simply never lands in `produced`), so resident-but-unforwarded
+        // edges stay correct.
         for st in &analysis.stores {
             let b = match arg_to_tensor.get(st.arg.as_str()) {
                 Some(b) => *b,
                 None => continue,
             };
-            if b.is_output && st.whole_tensor && is_intermediate(b.tensor) {
-                // Forwarded only if every consumer reads it whole-tensor;
-                // increment 1 forwards optimistically and the consumer side
-                // falls back to HBM if its own load is not whole-tensor. To stay
-                // correct, only drop the store when we can also keep an HBM copy
-                // is unnecessary here: a non-whole consumer simply won't find the
-                // tensor in `produced` and will keep its (HBM) load — which means
-                // we must NOT drop the store in that case. Conservatively keep
-                // the store unless we can prove all consumers forward.
-                if all_consumers_whole(module, spec, b.tensor) {
-                    dropped.insert(st.store_idx);
-                    dropped.insert(st.tile_idx);
-                    if let Some(vidx) = st.view_idx {
-                        dropped.insert(vidx);
-                    }
-                    produced.insert(b.tensor, prefixed(ni, &st.stored));
+            if b.is_output
+                && st.whole_tensor
+                && is_intermediate(b.tensor)
+                && all_consumers_forwardable(module, spec, b.tensor)
+            {
+                dropped.insert(st.store_idx);
+                dropped.insert(st.tile_idx);
+                if let Some(vidx) = st.view_idx {
+                    dropped.insert(vidx);
                 }
+                produced.insert(b.tensor, prefixed(ni, &st.stored));
             }
         }
 
-        // Any arg whose chain we did NOT drop and that points at a tensor still
-        // needing HBM (source, result, or unforwarded intermediate) becomes a
-        // fused-function arg, shared by tensor id under the canonical name.
+        // Any arg whose load/store we did NOT forward and that points at a
+        // tensor still needing HBM (source, result, or unforwarded intermediate)
+        // becomes a fused-function arg, shared by tensor id under the canonical name.
         for b in &node.bindings {
-            let forwarded_in = analysis
-                .loads
-                .iter()
-                .any(|l| l.arg == b.arg && rename.contains_key(&l.loaded));
+            let forwarded_in = forwarded_args.contains(&b.arg);
             let forwarded_out = produced.contains_key(&b.tensor) && b.is_output;
             if !forwarded_in && !forwarded_out {
                 let canon = format!("%t{}_ptr", b.tensor);
@@ -165,9 +188,14 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
             }
         }
 
-        // Emit the node's ops, renamed, skipping dropped ones.
+        // Emit the node's ops, renamed, skipping dropped ones and substituting
+        // the tiled-forward loads with their extract_slice.
         for (idx, op) in func.operations.iter().enumerate() {
             if dropped.contains(&idx) {
+                continue;
+            }
+            if let Some(sf) = replace.get(&idx) {
+                body.push(sf.build(ni, &rename));
                 continue;
             }
             body.push(rename_op(op, ni, &rename));
@@ -204,8 +232,12 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
     })
 }
 
-/// True if every node that consumes `tensor` does so with a whole-tensor load.
-fn all_consumers_whole(module: &IRModule, spec: &ProgramSpec, tensor: u64) -> bool {
+/// True if every node consuming `tensor` reads it in a way we can forward off a
+/// resident SSA value: a whole-tensor load, or a contiguous tiled load we can
+/// model with `tensor.extract_slice`. If any consumer reads it some other way
+/// (non-identity base_map, indirect/gather access), the producer store is kept
+/// and that consumer keeps its HBM load.
+fn all_consumers_forwardable(module: &IRModule, spec: &ProgramSpec, tensor: u64) -> bool {
     for node in &spec.nodes {
         for b in &node.bindings {
             if !b.is_output && b.tensor == tensor {
@@ -213,19 +245,43 @@ fn all_consumers_whole(module: &IRModule, spec: &ProgramSpec, tensor: u64) -> bo
                     return false;
                 };
                 let a = analyze(func);
-                let whole = a
+                let ok = a
                     .loads
                     .iter()
                     .find(|l| l.arg == b.arg)
-                    .map(|l| l.whole_tensor)
+                    .map(|l| l.whole_tensor || l.sliceable)
                     .unwrap_or(false);
-                if !whole {
+                if !ok {
                     return false;
                 }
             }
         }
     }
     true
+}
+
+/// A tiled forwarded load rewritten as a `tensor.extract_slice` of the
+/// producer's resident SSA value. Built at emit time so its offset operands
+/// resolve through the node's final rename map; the `source` is already in the
+/// fused namespace (the producer node prefixed it) and is emitted verbatim.
+struct SliceForward {
+    source: String,
+    loaded: String,
+    offsets: Vec<String>,
+    sizes: Vec<i64>,
+}
+
+impl SliceForward {
+    fn build(&self, ni: usize, rename: &HashMap<String, String>) -> Operation {
+        let res = resolve(ni, &self.loaded, rename);
+        let offsets: Vec<String> = self.offsets.iter().map(|o| resolve(ni, o, rename)).collect();
+        let sizes: Vec<String> = self.sizes.iter().map(|n| n.to_string()).collect();
+        let strides: Vec<String> = self.sizes.iter().map(|_| "1".to_string()).collect();
+        Operation::new(Some(&res), "tensor.extract_slice", &[self.source.as_str()])
+            .with_attr("slice_offsets", Attr::StrList(offsets))
+            .with_attr("slice_sizes", Attr::StrList(sizes))
+            .with_attr("slice_strides", Attr::StrList(strides))
+    }
 }
 
 // --- per-function analysis -------------------------------------------------
@@ -237,6 +293,15 @@ struct LoadChain {
     load_idx: usize,
     tile_idx: usize,
     view_idx: Option<usize>,
+    /// The access tile's index operands (`construct_access_tile %view[%i, %j]`).
+    /// With an identity `base_map` these are the slice's per-axis start offsets.
+    offsets: Vec<String>,
+    /// The access tile's logical shape — the slice sizes for a tiled forward.
+    tile_shape: Vec<i64>,
+    /// True when the access tile reads a contiguous box at `offsets` (identity
+    /// `base_map`, no reordering) — the only shape a plain `extract_slice` models.
+    /// A non-identity map (transpose/broadcast/gather) is left to the HBM path.
+    sliceable: bool,
 }
 struct StoreChain {
     arg: String,
@@ -286,6 +351,13 @@ fn analyze(func: &IRFunction) -> Analysis {
                             (Some(ts), Some(vs)) => ts == vs,
                             _ => false,
                         };
+                        // index operands after the view = per-axis start coords.
+                        let offsets: Vec<String> = tile_op.operands[1..].to_vec();
+                        let tile_shape = shape_of(tile_idx).cloned().unwrap_or_default();
+                        let sliceable = base_map_is_identity(tile_op)
+                            && !tile_op.attributes.contains_key("coordinate_order")
+                            && !offsets.is_empty()
+                            && offsets.len() == tile_shape.len();
                         a.loads.push(LoadChain {
                             arg,
                             loaded: loaded.clone(),
@@ -293,6 +365,9 @@ fn analyze(func: &IRFunction) -> Analysis {
                             load_idx: i,
                             tile_idx,
                             view_idx,
+                            offsets,
+                            tile_shape,
+                            sliceable,
                         });
                     }
                 }
@@ -326,6 +401,16 @@ fn analyze(func: &IRFunction) -> Analysis {
         }
     }
     a
+}
+
+/// True when a `construct_access_tile` op's `base_map` is the identity (so the
+/// access reads a contiguous box starting at its index operands). An absent
+/// `base_map` is identity by construction (the emulator synthesizes one).
+fn base_map_is_identity(tile_op: &Operation) -> bool {
+    match tile_op.attributes.get("base_map") {
+        Some(Attr::AffineMap(m)) => m.is_identity(),
+        _ => true,
+    }
 }
 
 // --- SSA renaming ----------------------------------------------------------
@@ -407,6 +492,44 @@ mod tests {
         }
     }
 
+    /// Consumer that reads a contiguous sub-tile of `in_arg` at a dynamic offset
+    /// (`construct_access_tile %vin[%c0]`, identity base_map) — the tiled edge
+    /// increment 2 forwards via `tensor.extract_slice`. Produces a `tile`-sized
+    /// result stored whole to `out_arg`.
+    fn tiled_consumer(name: &str, in_arg: &str, out_arg: &str, shape: i64, tile: i64) -> IRFunction {
+        IRFunction {
+            name: name.to_string(),
+            arguments: vec![
+                (in_arg.to_string(), "index".into()),
+                (out_arg.to_string(), "index".into()),
+            ],
+            grid: (1, 1, 1),
+            return_type: None,
+            operations: vec![
+                Operation::new(Some("%c0"), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+                Operation::new(Some("%vin"), "ktdp.construct_memory_view", &[in_arg])
+                    .with_attr("shape", Attr::IntList(vec![shape]))
+                    .with_attr("strides", Attr::IntList(vec![1]))
+                    .with_attr("memory_space", Attr::Str("HBM".into()))
+                    .with_attr("dtype", Attr::Str("f16".into())),
+                // access tile at offset %c0, size `tile` (a sub-tile of the view).
+                Operation::new(Some("%tin"), "ktdp.construct_access_tile", &["%vin", "%c0"])
+                    .with_attr("shape", Attr::IntList(vec![tile])),
+                Operation::new(Some("%loaded"), "ktdp.load", &["%tin"]),
+                Operation::new(Some("%y"), "math.exp", &["%loaded"]),
+                Operation::new(Some("%vout"), "ktdp.construct_memory_view", &[out_arg])
+                    .with_attr("shape", Attr::IntList(vec![tile]))
+                    .with_attr("strides", Attr::IntList(vec![1]))
+                    .with_attr("memory_space", Attr::Str("HBM".into()))
+                    .with_attr("dtype", Attr::Str("f16".into())),
+                Operation::new(Some("%tout"), "ktdp.construct_access_tile", &["%vout"])
+                    .with_attr("shape", Attr::IntList(vec![tile])),
+                Operation::new(None, "ktdp.store", &["%y", "%tout"]),
+                Operation::new(None, "func.return", &[]),
+            ],
+        }
+    }
+
     fn module(funcs: Vec<IRFunction>) -> IRModule {
         let mut m = IRModule::default();
         for f in funcs {
@@ -467,8 +590,9 @@ mod tests {
     }
 
     #[test]
-    fn tiled_edge_falls_back_to_hbm() {
-        // b loads t2 as a sub-tile (not whole) -> cannot forward; keep HBM.
+    fn unsliceable_tiled_edge_falls_back_to_hbm() {
+        // b reads a sub-tile with NO index operands (offsets empty) — not a
+        // contiguous extract_slice we can place, so it stays an HBM round-trip.
         let m = module(vec![
             copy_node("a", "%in", "%out", 16, true),
             copy_node("b", "%in", "%out", 16, false),
@@ -476,12 +600,66 @@ mod tests {
         let fused = fuse_program(&m, &two_node_spec()).unwrap();
         let loads = fused.operations.iter().filter(|o| o.op_type == "ktdp.load").count();
         let stores = fused.operations.iter().filter(|o| o.op_type == "ktdp.store").count();
+        let slices = fused.operations.iter().filter(|o| o.op_type == "tensor.extract_slice").count();
         // a still stores t2, b still loads it (resident HBM within the fused fn).
         assert_eq!(loads, 2, "source + tiled intermediate load both kept");
         assert_eq!(stores, 2, "intermediate + result stores both kept");
+        assert_eq!(slices, 0, "no extract_slice emitted for the unsliceable edge");
         // The intermediate pointer is still a fused-function arg.
         let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
         assert!(arg_names.contains(&"%t2_ptr"), "intermediate kept as HBM arg: {arg_names:?}");
+    }
+
+    #[test]
+    fn tiled_edge_forwards_via_extract_slice() {
+        // a writes t2 whole; b reads a contiguous sub-tile of t2 at offset %c0.
+        // The edge forwards: a's store and b's load are gone, replaced by a
+        // tensor.extract_slice of a's resident SSA value — no HBM round-trip.
+        let m = module(vec![
+            copy_node("a", "%in", "%out", 16, true),
+            tiled_consumer("b", "%in", "%out", 16, 8),
+        ]);
+        let fused = fuse_program(&m, &two_node_spec()).unwrap();
+
+        // Only the source load (a) and the result store (b) survive.
+        let loads = fused.operations.iter().filter(|o| o.op_type == "ktdp.load").count();
+        let stores = fused.operations.iter().filter(|o| o.op_type == "ktdp.store").count();
+        assert_eq!(loads, 1, "intermediate load replaced by extract_slice");
+        assert_eq!(stores, 1, "intermediate store dropped (producer resident)");
+
+        // The extract_slice reads a's stored value at the tile offset/size.
+        let slice = fused
+            .operations
+            .iter()
+            .find(|o| o.op_type == "tensor.extract_slice")
+            .expect("extract_slice emitted for the tiled edge");
+        assert_eq!(slice.operands, vec!["%n0_y"], "slices a's resident producer SSA");
+        assert_eq!(slice.result.as_deref(), Some("%n1_loaded"));
+        assert_eq!(
+            slice.attributes.get("slice_offsets"),
+            Some(&Attr::StrList(vec!["%n1_c0".into()])),
+            "offset is b's renamed index operand"
+        );
+        assert_eq!(
+            slice.attributes.get("slice_sizes"),
+            Some(&Attr::StrList(vec!["8".into()]))
+        );
+        assert_eq!(
+            slice.attributes.get("slice_strides"),
+            Some(&Attr::StrList(vec!["1".into()]))
+        );
+
+        // b's exp consumes the slice (downstream SSA lines up).
+        let b_exp = fused
+            .operations
+            .iter()
+            .find(|o| o.op_type == "math.exp" && o.result.as_deref() == Some("%n1_y"))
+            .expect("b's exp present");
+        assert_eq!(b_exp.operands, vec!["%n1_loaded"]);
+
+        // No HBM pointer for the forwarded intermediate t2.
+        let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(arg_names, vec!["%t1_ptr", "%t3_ptr"], "no t2 pointer: {arg_names:?}");
     }
 
     #[test]
