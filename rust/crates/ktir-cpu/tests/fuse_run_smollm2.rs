@@ -24,9 +24,84 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 fn bundle_dir() -> Option<PathBuf> {
+    bundle_dir_named("smollm2-135m")
+}
+
+fn bundle_dir_named(model: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".cache/cudaforge/ktir/smollm2-135m");
+    let dir = PathBuf::from(home).join(".cache/cudaforge/ktir").join(model);
     dir.join("manifest.json").is_file().then_some(dir)
+}
+
+/// A whole bundle fused into one function, plus the metadata to run it.
+struct Fused {
+    func: ktir_cpu::ir::IRFunction,
+    /// tensor id -> (rows, cols, is_source)
+    shape: HashMap<u64, (usize, usize, bool)>,
+    result_id: u64,
+    mask_id: Option<u64>,
+    n_nodes: usize,
+}
+
+/// Load a bundle's manifest + per-node MLIR, build the ProgramSpec, and fuse the
+/// whole program into one function (decode or prefill — same path).
+fn fuse_bundle(dir: &std::path::Path) -> Fused {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+
+    let mut shape: HashMap<u64, (usize, usize, bool)> = HashMap::new();
+    let mut sources: HashSet<u64> = HashSet::new();
+    for t in manifest["tensors"].as_array().unwrap() {
+        let id = t["id"].as_u64().unwrap();
+        let is_src = t["is_source"].as_bool().unwrap_or(false);
+        shape.insert(
+            id,
+            (
+                t["rows"].as_u64().unwrap() as usize,
+                t["cols"].as_u64().unwrap() as usize,
+                is_src,
+            ),
+        );
+        if is_src {
+            sources.insert(id);
+        }
+    }
+    let result_id = manifest["result"].as_u64().unwrap();
+    let mask_id = manifest["attn_mask"].as_u64();
+    if let Some(m) = mask_id {
+        sources.insert(m);
+    }
+
+    let mut module = IRModule::default();
+    let mut nodes: Vec<NodeSpec> = Vec::new();
+    for node in manifest["nodes"].as_array().unwrap() {
+        let func = node["fn"].as_str().unwrap().to_string();
+        let mlir = node["mlir"].as_str().unwrap();
+        let src = std::fs::read_to_string(dir.join(mlir)).unwrap();
+        let parsed = parse_module(&src).unwrap_or_else(|e| panic!("parse {mlir}: {e}"));
+        for (_, f) in parsed.functions {
+            module.add_function(f);
+        }
+        let bindings = node["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| Binding {
+                arg: format!("%{}", a["name"].as_str().unwrap()),
+                tensor: a["tensor"].as_u64().unwrap(),
+                is_output: a["is_output"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        nodes.push(NodeSpec { func, bindings });
+    }
+    let n_nodes = nodes.len();
+    let spec = ProgramSpec {
+        nodes,
+        sources,
+        results: HashSet::from([result_id]),
+    };
+    let func = fuse_program(&module, &spec).expect("fuse bundle");
+    Fused { func, shape, result_id, mask_id, n_nodes }
 }
 
 fn read_f32(path: &std::path::Path) -> Vec<f32> {
@@ -54,68 +129,9 @@ fn smollm2_135m_fused_matches_golden() {
         eprintln!("SmolLM2 bundle absent — skipping");
         return;
     };
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-
-    // tensor id -> (rows, cols, is_source)
-    let mut shape: HashMap<u64, (usize, usize, bool)> = HashMap::new();
-    let mut sources: HashSet<u64> = HashSet::new();
-    for t in manifest["tensors"].as_array().unwrap() {
-        let id = t["id"].as_u64().unwrap();
-        let is_src = t["is_source"].as_bool().unwrap_or(false);
-        shape.insert(
-            id,
-            (
-                t["rows"].as_u64().unwrap() as usize,
-                t["cols"].as_u64().unwrap() as usize,
-                is_src,
-            ),
-        );
-        if is_src {
-            sources.insert(id);
-        }
-    }
-    let result_id = manifest["result"].as_u64().unwrap();
-    // The attn_mask is a runtime input (no t{id}.bin), all-zeros for full causal
-    // decode visibility — same as the per-node oracle. It is a source (not node-produced).
-    let mask_id = manifest["attn_mask"].as_u64();
-    if let Some(m) = mask_id {
-        sources.insert(m);
-    }
-
-    // Build the combined module (one function per nodeN.mlir) + the ProgramSpec.
-    let mut module = IRModule::default();
-    let mut nodes: Vec<NodeSpec> = Vec::new();
-    for node in manifest["nodes"].as_array().unwrap() {
-        let func = node["fn"].as_str().unwrap().to_string();
-        let mlir = node["mlir"].as_str().unwrap();
-        let src = std::fs::read_to_string(dir.join(mlir)).unwrap();
-        let parsed = parse_module(&src).unwrap_or_else(|e| panic!("parse {mlir}: {e}"));
-        for (_, f) in parsed.functions {
-            module.add_function(f);
-        }
-        let bindings = node["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| Binding {
-                // manifest arg names have no leading `%`; the IR's pointers do.
-                arg: format!("%{}", a["name"].as_str().unwrap()),
-                tensor: a["tensor"].as_u64().unwrap(),
-                is_output: a["is_output"].as_bool().unwrap_or(false),
-            })
-            .collect();
-        nodes.push(NodeSpec { func, bindings });
-    }
-    let n_nodes = nodes.len();
-    let spec = ProgramSpec {
-        nodes,
-        sources: sources.clone(),
-        results: HashSet::from([result_id]),
-    };
-
-    // Fuse all nodes into one function.
-    let fused = fuse_program(&module, &spec).expect("fuse SmolLM2");
+    let b = fuse_bundle(&dir);
+    let (shape, result_id, mask_id, n_nodes) = (&b.shape, b.result_id, b.mask_id, b.n_nodes);
+    let fused = b.func;
     let n_ops = fused.operations.len();
     let n_slices = fused
         .operations
@@ -183,6 +199,36 @@ fn smollm2_135m_fused_matches_golden() {
     assert!(
         max_abs < 0.2,
         "fused result diverges from golden by {max_abs} — fusion changed semantics"
+    );
+}
+
+/// PREFILL readiness: fuse the M=8 prefill bundle and confirm EVERY scf.for
+/// K-loop is recognized as a single full-shape GEMM (the grid/token-parallel and
+/// K-tiling decomposition collapses to one [8,k]@[k,n] matmul). This is the
+/// proof that prefill is a first-class target, not a deferred one — the Metal
+/// executor ignores the Spyre SPMD grid and reconstructs the whole GEMM.
+#[cfg(metal)]
+#[test]
+#[ignore = "real-model prefill recognition; needs ~/.cache/cudaforge/ktir/smollm2-135m-prefill. \
+            Run with --ignored --nocapture"]
+fn prefill_matmul_loops_all_recognized() {
+    let Some(dir) = bundle_dir_named("smollm2-135m-prefill") else {
+        eprintln!("SmolLM2 prefill bundle absent — skipping");
+        return;
+    };
+    let b = fuse_bundle(&dir);
+    let (total, recognized) = ktir_cpu::metal_backend::count_matmul_loops(&b.func.operations);
+    eprintln!(
+        "prefill fused ({} nodes -> 1 fn): {} ops, {total} scf.for K-loops, \
+         {recognized} recognized as GEMMs",
+        b.n_nodes,
+        b.func.operations.len()
+    );
+    assert!(total > 0, "expected matmul K-loops in the fused prefill function");
+    assert_eq!(
+        total, recognized,
+        "every prefill K-loop must collapse to one GEMM (M=8) — {} unrecognized",
+        total - recognized
     );
 }
 

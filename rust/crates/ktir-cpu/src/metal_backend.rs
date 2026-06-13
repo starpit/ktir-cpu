@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use crate::dtypes::DType;
-use crate::ir::{IRFunction, IRModule, Operation};
+use crate::ir::{Attr, IRFunction, IRModule, Operation};
 
 // =========================================================================
 // Matmul acceleration tier — the GPU analogue of the BLAS auto-select.
@@ -228,6 +228,25 @@ pub enum KernelRegion {
     Reduce(usize),
     /// A single matmul -> a GEMM dispatch.
     Matmul(usize),
+    /// An `scf.for` K-loop recognized as a single GEMM (the Spyre K-tiling and
+    /// grid/M decomposition collapse into one full-shape matmul). Covers decode
+    /// (M=1) and prefill (M=8) uniformly — the M comes from the operand's full
+    /// view/producer shape, not the per-iteration tile.
+    MatmulLoop(MatmulLoopInfo),
+}
+
+/// A K-loop matmul collapsed to one GEMM: `out[m,n] = A[m,k] @ B[k,n]`, with the
+/// resident-buffer SSA roots of the full A and B tensors. `a_root`/`b_root` are
+/// the SSA/pointer names the executor looks up (A is typically a forwarded
+/// `tensor.extract_slice` source — the resident activation; B a weight load).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct MatmulLoopInfo {
+    pub m: i64,
+    pub k: i64,
+    pub n: i64,
+    pub a_root: String,
+    pub b_root: String,
+    pub out_ssa: String,
 }
 
 /// How an op participates in scheduling.
@@ -271,6 +290,7 @@ fn classify(op: &Operation) -> OpClass {
 /// back to the interpreter wholesale — the resident-buffer GPU path handles only
 /// fully map/reduce/matmul functions for now.
 pub fn plan_kernels(ops: &[Operation]) -> Result<Vec<KernelRegion>, String> {
+    let defs = def_map_all(ops);
     let mut regions: Vec<KernelRegion> = Vec::new();
     let mut window: Vec<usize> = Vec::new();
     let flush = |w: &mut Vec<usize>, r: &mut Vec<KernelRegion>| {
@@ -279,6 +299,24 @@ pub fn plan_kernels(ops: &[Operation]) -> Result<Vec<KernelRegion>, String> {
         }
     };
     for (i, op) in ops.iter().enumerate() {
+        // An scf.for is fusable ONLY if it's a recognizable matmul K-loop;
+        // otherwise it's a hard boundary (the function falls back).
+        if op.op_type == "scf.for" {
+            match recognize_matmul_loop(op, &defs) {
+                Some(info) => {
+                    flush(&mut window, &mut regions);
+                    regions.push(KernelRegion::MatmulLoop(info));
+                    continue;
+                }
+                None => {
+                    return Err(
+                        "metal: scf.for is not a recognizable matmul K-loop — function \
+                         falls back to the interpreter"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         match classify(op) {
             OpClass::Map => {
                 window.push(i);
@@ -305,6 +343,119 @@ pub fn plan_kernels(ops: &[Operation]) -> Result<Vec<KernelRegion>, String> {
     }
     flush(&mut window, &mut regions);
     Ok(regions)
+}
+
+/// Diagnostic: `(top-level scf.for count, of which recognized as matmul K-loops)`.
+/// Lets a test confirm every K-loop in a fused function collapses to a GEMM —
+/// the prefill-readiness check — without standing up the full executor.
+pub fn count_matmul_loops(ops: &[Operation]) -> (usize, usize) {
+    let defs = def_map_all(ops);
+    let mut total = 0;
+    let mut recognized = 0;
+    for op in ops {
+        if op.op_type == "scf.for" {
+            total += 1;
+            if recognize_matmul_loop(op, &defs).is_some() {
+                recognized += 1;
+            }
+        }
+    }
+    (total, recognized)
+}
+
+/// Result-SSA (stripped of `%`) -> defining op, recursively through regions.
+/// A matmul K-loop references views/producers defined OUTSIDE the loop body and
+/// loads/slices defined INSIDE it, so recognition needs a function-wide map.
+fn def_map_all(ops: &[Operation]) -> HashMap<String, &Operation> {
+    let mut m = HashMap::new();
+    fn rec<'a>(ops: &'a [Operation], m: &mut HashMap<String, &'a Operation>) {
+        for op in ops {
+            if let Some(r) = &op.result {
+                m.insert(strip(r).to_string(), op);
+            }
+            for region in &op.regions {
+                rec(region, m);
+            }
+        }
+    }
+    rec(ops, &mut m);
+    m
+}
+
+/// Recognize an `scf.for` as a single GEMM: body accumulates
+/// `acc += A_tile @ B_tile` over the induction variable. Returns the FULL-shape
+/// GEMM (M from the A operand's full view/producer, not the per-iter tile), so a
+/// decode (M=1) and a prefill (M=8, grid/token-parallel) K-loop both collapse to
+/// one matmul. Tolerant of plumbing ops in the body (the `outs` init constant).
+fn recognize_matmul_loop(forop: &Operation, defs: &HashMap<String, &Operation>) -> Option<MatmulLoopInfo> {
+    let body = forop.regions.first()?;
+    // Exactly one matmul in the body.
+    let mut mms = body.iter().filter(|o| o.op_type == "linalg.matmul");
+    let mm = mms.next()?;
+    if mms.next().is_some() {
+        return None;
+    }
+    let mm_res = mm.result.as_deref()?;
+    // Single loop-carried accumulator.
+    let iter_args = match forop.attributes.get("iter_args") {
+        Some(Attr::StrList(v)) if v.len() == 1 => v,
+        _ => return None,
+    };
+    let acc = iter_args[0].as_str();
+    // The accumulate: addf(acc, matmul_result) (either operand order).
+    let addf = body.iter().find(|o| {
+        o.op_type == "arith.addf"
+            && o.operands.iter().any(|x| x == acc)
+            && o.operands.iter().any(|x| x == mm_res)
+    })?;
+    let addf_res = addf.result.as_deref()?;
+    // The loop yields the accumulate.
+    let yld = body.iter().find(|o| o.op_type == "scf.yield")?;
+    if yld.operands.first().map(String::as_str) != Some(addf_res) {
+        return None;
+    }
+    // A = ins[0], B = ins[1]; resolve each to its FULL tensor + resident root.
+    let (a_root, a_shape) = matmul_operand_full(mm.operands.first()?, defs)?;
+    let (b_root, b_shape) = matmul_operand_full(mm.operands.get(1)?, defs)?;
+    if a_shape.len() != 2 || b_shape.len() != 2 || a_shape[1] != b_shape[0] {
+        return None;
+    }
+    Some(MatmulLoopInfo {
+        m: a_shape[0],
+        k: a_shape[1],
+        n: b_shape[1],
+        a_root,
+        b_root,
+        out_ssa: forop.result.clone()?,
+    })
+}
+
+/// Resolve a matmul operand to (resident-root SSA/ptr name, FULL 2-D shape).
+/// A forwarded activation is `tensor.extract_slice %src[..]` -> the full src
+/// tensor; a weight is `ktdp.load` of an access tile -> its memory view's full
+/// shape. The per-iteration tile (the [1,64] slice) is intentionally ignored —
+/// we reconstruct the whole GEMM.
+fn matmul_operand_full(
+    name: &str,
+    defs: &HashMap<String, &Operation>,
+) -> Option<(String, Vec<i64>)> {
+    let d = defs.get(strip(name))?;
+    match d.op_type.as_str() {
+        "tensor.extract_slice" => {
+            let src = d.operands.first()?;
+            let shape = shape_attr_vec(defs.get(strip(src)).copied())?;
+            Some((src.clone(), shape))
+        }
+        "ktdp.load" => {
+            let tile = d.operands.first()?;
+            let view = defs.get(strip(tile))?.operands.first()?;
+            let vd = defs.get(strip(view))?;
+            let root = vd.operands.first()?.clone();
+            let shape = shape_attr_vec(Some(vd))?;
+            Some((root, shape))
+        }
+        _ => None,
+    }
 }
 
 /// Lower `func_name` to a full [`MslKernel`] (source + buffer bindings).
@@ -2887,7 +3038,95 @@ module {
     #[test]
     fn unfusable_op_forces_fallback() {
         let ops = vec![op("arith.mulf"), op("scf.for"), op("arith.addf")];
-        assert!(plan_kernels(&ops).is_err(), "scf.for must force a fallback");
+        assert!(plan_kernels(&ops).is_err(), "bare scf.for must force a fallback");
+    }
+
+    /// Build a K-loop matmul function: A is either a forwarded extract_slice of a
+    /// `[m,k]` producer (prefill/decode forwarded activation) or a load of an
+    /// `[m,k]` view; B is a load of a `[k,n]` weight view. Mirrors the real fused
+    /// K-loop so recognition is exercised end to end.
+    fn matmul_loop_fn(a_via_slice: bool, m: i64, k: i64, n: i64) -> Vec<Operation> {
+        let il = |v: Vec<i64>| Attr::IntList(v);
+        let mut top = vec![
+            // A's full source / producer, shape [m,k]. Plumbing (tensor.empty)
+            // so this focused test's plan is just the MatmulLoop; in the real
+            // fused fn the source is a preceding map/reduce region's output.
+            Operation::new(Some("%src"), "tensor.empty", &[]).with_attr("shape", il(vec![m, k])),
+            // B weight view over %wptr, shape [k,n].
+            Operation::new(Some("%vw"), "ktdp.construct_memory_view", &["%wptr"]).with_attr("shape", il(vec![k, n])),
+        ];
+        let mut body = Vec::new();
+        if a_via_slice {
+            body.push(
+                Operation::new(Some("%a"), "tensor.extract_slice", &["%src"])
+                    .with_attr("slice_sizes", Attr::StrList(vec!["1".into(), k.to_string()])),
+            );
+        } else {
+            // A via a load of a [m,k] view over %aptr.
+            top.push(Operation::new(Some("%va"), "ktdp.construct_memory_view", &["%aptr"]).with_attr("shape", il(vec![m, k])));
+            body.push(Operation::new(Some("%at"), "ktdp.construct_access_tile", &["%va", "%pid", "%kk"]).with_attr("shape", il(vec![1, k])));
+            body.push(Operation::new(Some("%a"), "ktdp.load", &["%at"]));
+        }
+        body.push(Operation::new(Some("%bt"), "ktdp.construct_access_tile", &["%vw", "%kk", "%c0"]).with_attr("shape", il(vec![k, n])));
+        body.push(Operation::new(Some("%b"), "ktdp.load", &["%bt"]));
+        body.push(Operation::new(Some("%cinit"), "arith.constant", &[]));
+        body.push(Operation::new(Some("%part"), "linalg.matmul", &["%a", "%b", "%cinit"]).with_attr("shape", il(vec![m, n])));
+        body.push(Operation::new(Some("%accnext"), "arith.addf", &["%acc", "%part"]));
+        body.push(Operation::new(None, "scf.yield", &["%accnext"]));
+        let mut forop = Operation::new(Some("%mm"), "scf.for", &["%c0", "%K", "%KB", "%azero"])
+            .with_attr("iter_var", Attr::Str("%kk".into()))
+            .with_attr("iter_args", Attr::StrList(vec!["%acc".into()]));
+        forop.regions = vec![body];
+        top.push(forop);
+        top
+    }
+
+    #[test]
+    fn recognizes_prefill_matmul_kloop_as_m8_gemm() {
+        // A = extract_slice of an [8,576] activation (the forwarded fused form);
+        // B = [576,576] weight. The grid/K-tiling collapses to one M=8 GEMM.
+        let ops = matmul_loop_fn(true, 8, 576, 576);
+        let plan = plan_kernels(&ops).unwrap();
+        assert_eq!(
+            plan,
+            vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
+                m: 8, k: 576, n: 576,
+                a_root: "%src".into(),
+                b_root: "%wptr".into(),
+                out_ssa: "%mm".into(),
+            })],
+            "prefill K-loop must collapse to a single [8,576]@[576,576] GEMM"
+        );
+    }
+
+    #[test]
+    fn recognizes_decode_matmul_kloop_as_m1_gemm() {
+        // A via a load of a [1,576] view (decode), B = [576,576]. Same recognizer,
+        // M=1 from the full view shape.
+        let ops = matmul_loop_fn(false, 1, 576, 576);
+        let plan = plan_kernels(&ops).unwrap();
+        assert_eq!(
+            plan,
+            vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
+                m: 1, k: 576, n: 576,
+                a_root: "%aptr".into(),
+                b_root: "%wptr".into(),
+                out_ssa: "%mm".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn non_matmul_scf_for_still_falls_back() {
+        // A loop whose body is not the matmul-accumulate template -> Err.
+        let mut body = vec![
+            Operation::new(Some("%t"), "arith.mulf", &["%acc", "%acc"]),
+            Operation::new(None, "scf.yield", &["%t"]),
+        ];
+        let mut forop = Operation::new(Some("%r"), "scf.for", &["%c0", "%K", "%KB", "%azero"])
+            .with_attr("iter_args", Attr::StrList(vec!["%acc".into()]));
+        forop.regions = vec![std::mem::take(&mut body)];
+        assert!(plan_kernels(&[forop]).is_err(), "non-matmul loop must fall back");
     }
 
     #[test]
