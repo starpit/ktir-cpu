@@ -162,6 +162,31 @@ impl CoreContext {
         }
     }
 
+    /// Drop a dead SSA value entirely: free its LX accounting AND remove it from
+    /// the scope so its host backing (the tile `Rc<[f32]>`) can be freed. Used by
+    /// the liveness reclaim — without removing the value, a whole-program-fused
+    /// function accumulates every intermediate tile in host memory at once, which
+    /// the per-node runner avoids via a fresh context per node.
+    pub fn forget(&mut self, name: &str) {
+        let key = name.trim_start_matches('%');
+        self.untrack_lx(key);
+        // Only evict TILES (the host-memory bloat). Pointers/scalars are tiny and
+        // may still be read after their last operand use — notably the GPU
+        // matmul-loop offload resolves a weight's base pointer at the loop op,
+        // after the top-level memory-view that "used" it. Keeping them is cheap
+        // and avoids a use-after-free of values liveness over-eagerly retires.
+        for scope in self.scope_stack.iter_mut().rev() {
+            match scope.get(key) {
+                Some(Value::Tile(_)) => {
+                    scope.remove(key);
+                    break;
+                }
+                Some(_) => break, // non-tile: keep
+                None => {}
+            }
+        }
+    }
+
     /// Return the LX for a core: local fast path, else a remote handle.
     /// Mirrors `get_lx`.
     pub fn get_lx(&self, core_id: Option<usize>) -> Rc<RefCell<LXScratchpad>> {

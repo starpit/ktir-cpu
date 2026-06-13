@@ -232,7 +232,10 @@ impl CoreRunner {
         // the interpreter loop. Skipped under a latency tracker (the model must
         // see each op). The fused whole-program function is grid [1,1].
         #[cfg(metal)]
-        let matmul_sched = if env.tracker.is_none() && env.grid.num_cores == 1 {
+        let matmul_sched = if env.tracker.is_none()
+            && env.grid.num_cores == 1
+            && std::env::var_os("KTIR_NO_GPU_GEMM").is_none()
+        {
             crate::metal_backend::matmul_loop_schedule(ops)
         } else {
             std::collections::HashMap::new()
@@ -252,7 +255,7 @@ impl CoreRunner {
             {
                 if let Some(dead) = self.dies_at.get(this_idx) {
                     for name in dead {
-                        self.ctx.untrack_lx(name);
+                        self.ctx.forget(name);
                     }
                 }
                 continue;
@@ -289,7 +292,7 @@ impl CoreRunner {
             // Reclaim LX for every value that just went dead at this op.
             if let Some(dead) = self.dies_at.get(this_idx) {
                 for name in dead {
-                    self.ctx.untrack_lx(name);
+                    self.ctx.forget(name);
                 }
             }
         }
@@ -305,10 +308,30 @@ impl CoreRunner {
 /// by region scope pop and are not tracked here.
 fn compute_dies_at(ops: &[Operation]) -> Vec<Vec<String>> {
     // Recursively record the highest TOP-LEVEL index at which each name is used.
+    // Uses come from operands AND from SSA names embedded in string attributes
+    // (e.g. tensor.extract_slice's `slice_offsets`, a dynamic `sizes_dyn`,
+    // scf.for `iter_args`/`iter_var`) — missing those frees a value too early.
+    // Over-counting (a bound name read as a use) only keeps a value alive
+    // longer, which is safe; under-counting corrupts execution.
     fn note_uses(op: &Operation, top_idx: usize, last_use: &mut HashMap<String, usize>) {
         for operand in &op.operands {
             if operand.starts_with('%') {
                 last_use.insert(operand.clone(), top_idx);
+            }
+        }
+        for attr in op.attributes.values() {
+            match attr {
+                crate::ir::Attr::Str(s) if s.starts_with('%') => {
+                    last_use.insert(s.clone(), top_idx);
+                }
+                crate::ir::Attr::StrList(xs) => {
+                    for x in xs {
+                        if x.starts_with('%') {
+                            last_use.insert(x.clone(), top_idx);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         for region in &op.regions {
@@ -491,7 +514,10 @@ mod tests {
         let dispatch = Dispatch::new();
         let env = ExecutionEnv::new(&dispatch, grid);
         let n = grid.num_cores;
-        let dies_at = Rc::new(compute_dies_at(ops));
+        // This harness reads results back as SSA values from the captured
+        // contexts (not from HBM), so it must NOT reclaim dead values — keep
+        // every value alive (empty schedule = no reclaim).
+        let dies_at = Rc::new(Vec::new());
         let mut runners: Vec<CoreRunner> = (0..n)
             .map(|core_id| {
                 let mut ctx = CoreContext::new(

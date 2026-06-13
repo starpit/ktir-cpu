@@ -16,7 +16,7 @@
 //! absent. `--ignored` because it runs a whole model.
 
 use ktir_cpu::dtypes::DType;
-use ktir_cpu::interpreter::{Arg, execute_function};
+use ktir_cpu::interpreter::{Arg, execute_function, execute_function_outputs};
 use ktir_cpu::ir::IRModule;
 use ktir_cpu::parser::parse_module;
 use ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec, fuse_program};
@@ -184,6 +184,75 @@ fn run_per_node_result(dir: &std::path::Path) -> Vec<f32> {
     buf[&manifest["result"].as_u64().unwrap()].clone()
 }
 
+/// Marshal the fused-function args for a bundle (sources from t{id}.bin, mask +
+/// results/intermediates zeroed), returning (fused module, arg list, result_id).
+fn fused_run_inputs(dir: &std::path::Path) -> (IRModule, Vec<(String, Arg)>, u64) {
+    let b = fuse_bundle(dir);
+    let fused = b.func;
+    let mut args: Vec<(String, Arg)> = Vec::new();
+    for (name, _) in &fused.arguments {
+        let id = tensor_id_of(name);
+        let (rows, cols, is_src) = b.shape[&id];
+        let data = if is_src && Some(id) != b.mask_id {
+            read_f32(&dir.join(format!("t{id}.bin")))
+        } else {
+            vec![0.0f32; rows * cols]
+        };
+        args.push((
+            name.trim_start_matches('%').to_string(),
+            Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 },
+        ));
+    }
+    let mut module = IRModule::default();
+    module.add_function(fused);
+    (module, args, b.result_id)
+}
+
+/// Median ms/pass of `execute_function` on a fused bundle over `iters` runs.
+#[cfg(metal)]
+fn time_fused(dir: &std::path::Path, iters: u32) -> f64 {
+    let (module, args, result_id) = fused_run_inputs(dir);
+    let refs: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let result_ptr = format!("t{result_id}_ptr");
+    // Warm up (pipeline compile, first-touch).
+    execute_function_outputs(&module, "fused", &refs, &[&result_ptr]).expect("warmup");
+    let mut times: Vec<f64> = Vec::with_capacity(iters as usize);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        execute_function_outputs(&module, "fused", &refs, &[&result_ptr]).expect("timed run");
+        times.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times[times.len() / 2]
+}
+
+/// PERF: decode + prefill ms/pass with the GPU GEMM offload ON vs OFF (the
+/// interpreter's Accelerate K-loop). Run ONE bench at a time (no concurrency).
+#[cfg(metal)]
+#[test]
+#[ignore = "perf bench; needs the smollm2-135m[-prefill] bundles. --ignored --nocapture"]
+fn fused_gpu_vs_cpu_mspass() {
+    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    for (model, dir_opt) in [
+        ("decode", bundle_dir()),
+        ("prefill", bundle_dir_named("smollm2-135m-prefill")),
+    ] {
+        let Some(dir) = dir_opt else {
+            eprintln!("{model} bundle absent — skipping");
+            continue;
+        };
+        // SAFETY: single-threaded test; toggling our own offload gate.
+        unsafe { std::env::set_var("KTIR_NO_GPU_GEMM", "1") };
+        let cpu = time_fused(&dir, iters);
+        unsafe { std::env::remove_var("KTIR_NO_GPU_GEMM") };
+        let gpu = time_fused(&dir, iters);
+        eprintln!(
+            "{model}: CPU K-loops {cpu:.1} ms/pass  |  GPU GEMMs {gpu:.1} ms/pass  |  speedup {:.2}x",
+            cpu / gpu
+        );
+    }
+}
+
 /// Fuse a bundle, run the fused function through the interpreter (with the
 /// matmul-loop GPU offload active under cfg(metal)), and compare the result to
 /// golden.bin. Returns max-abs-diff vs golden.
@@ -213,7 +282,9 @@ fn run_fused_golden(dir: &std::path::Path, label: &str) -> (f32, Vec<f32>) {
 
     let mut fused_module = IRModule::default();
     fused_module.add_function(fused);
-    let out = execute_function(&fused_module, "fused", &arg_refs).expect("run fused bundle");
+    let result_ptr = format!("t{result_id}_ptr");
+    let out = execute_function_outputs(&fused_module, "fused", &arg_refs, &[&result_ptr])
+        .expect("run fused bundle");
 
     let got = &out
         .get(&format!("t{result_id}_ptr"))

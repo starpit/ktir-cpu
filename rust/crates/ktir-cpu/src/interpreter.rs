@@ -304,6 +304,31 @@ pub fn execute_function(
     func_name: &str,
     args: &[(&str, Arg)],
 ) -> Result<HashMap<String, Output>, String> {
+    execute_function_filtered(module, func_name, args, None)
+}
+
+/// Like [`execute_function`] but reads back ONLY the named tensor args, skipping
+/// the (read-only) inputs. A whole-program-fused function carries hundreds of
+/// weight pointers as args; reading them all back decodes ~hundreds of MB of
+/// unchanged f16 for nothing. Pass just the real outputs (e.g. the result ptr)
+/// to cut that waste. Names may include or omit the leading `%`.
+pub fn execute_function_outputs(
+    module: &IRModule,
+    func_name: &str,
+    args: &[(&str, Arg)],
+    outputs: &[&str],
+) -> Result<HashMap<String, Output>, String> {
+    let wanted: std::collections::HashSet<String> =
+        outputs.iter().map(|s| s.trim_start_matches('%').to_string()).collect();
+    execute_function_filtered(module, func_name, args, Some(&wanted))
+}
+
+fn execute_function_filtered(
+    module: &IRModule,
+    func_name: &str,
+    args: &[(&str, Arg)],
+    wanted: Option<&std::collections::HashSet<String>>,
+) -> Result<HashMap<String, Output>, String> {
     // Fast path (NAX tensor engine): a multi-core, comm-free, straight-line SPMD
     // grid whose cores share a matmul weight runs lock-step on the GPU, combining
     // the grid's per-core matmul panels into one GEMM instead of one Accelerate
@@ -323,10 +348,14 @@ pub fn execute_function(
     let grid = GridExecutor::new(func.grid);
     let dispatch = Dispatch::shared();
 
+    let probe = std::env::var_os("KTIR_TIME_PHASES").is_some();
+    let t0 = std::time::Instant::now();
     let (input_ptrs, tensor_meta) = marshal_inputs(&mem, args);
+    let t_marshal = t0.elapsed();
 
     // Drive all cores via the comm scheduler (cores with no comm op simply run
     // to completion; ring/collective ops suspend and resume through it).
+    let t1 = std::time::Instant::now();
     crate::comm_sched::execute_with_communication(
         &grid,
         &mem,
@@ -335,8 +364,19 @@ pub fn execute_function(
         dispatch,
         None,
     )?;
+    let t_run = t1.elapsed();
 
-    read_back(&mem, tensor_meta)
+    let t2 = std::time::Instant::now();
+    let out = read_back(&mem, tensor_meta, wanted);
+    if probe {
+        eprintln!(
+            "  [phases] marshal {:.0}ms  run {:.0}ms  readback {:.0}ms",
+            t_marshal.as_secs_f64() * 1e3,
+            t_run.as_secs_f64() * 1e3,
+            t2.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+    out
 }
 
 /// Like [`execute_function`], but records per-op latency and returns the report
@@ -371,7 +411,7 @@ pub fn execute_function_with_latency(
         Some(&tracker),
     )?;
 
-    let outputs = read_back(&mem, tensor_meta)?;
+    let outputs = read_back(&mem, tensor_meta, None)?;
     let report = tracker.borrow().report();
     Ok((outputs, report))
 }
@@ -510,7 +550,7 @@ pub fn execute_function_gpu(
             execute_op(op, ctx, &env)?;
         }
     }
-    read_back(&mem, tensor_meta)
+    read_back(&mem, tensor_meta, None)
 }
 
 /// Combine `op` (a 2-operand `linalg.matmul`) across all cores when every core's
@@ -585,9 +625,15 @@ fn try_combine_matmul(
 fn read_back(
     mem: &SpyreMemoryHierarchy,
     tensor_meta: Vec<TensorMeta>,
+    wanted: Option<&std::collections::HashSet<String>>,
 ) -> Result<HashMap<String, Output>, String> {
     let mut outputs = HashMap::new();
     for (name, stick, n, shape, dtype) in tensor_meta {
+        if let Some(w) = wanted
+            && !w.contains(name.trim_start_matches('%'))
+        {
+            continue;
+        }
         let nbytes = n * dtype.bytes_per_elem();
         let bytes = mem.hbm.borrow().read_bytes(stick * STICK_BYTES, nbytes);
         let data = codec::decode(&bytes, n, dtype);
