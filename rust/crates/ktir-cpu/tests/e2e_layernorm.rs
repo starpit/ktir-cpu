@@ -14,7 +14,7 @@ use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::parser::parse_module;
 
-const SRC: &str = include_str!("../../examples/triton-ktir/layernorm_fwd_ktir.mlir");
+const SRC: &str = include_str!("../../../../examples/triton-ktir/layernorm_fwd_ktir.mlir");
 const ROWS: usize = 1151;
 const COLS: usize = 8192; // N
 const EPS: f32 = 1e-5;

@@ -1040,7 +1040,7 @@ fn distributed_view_copy_rfc() {
     // Parse the RFC example module.
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/rfc/distributed-view-copy.mlir"
+        "/../../../examples/rfc/distributed-view-copy.mlir"
     ))
     .expect("read distributed-view-copy.mlir");
     let module = ktir_cpu::parser::parse_module(&text).expect("parse module");

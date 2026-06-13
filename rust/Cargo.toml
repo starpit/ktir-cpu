@@ -1,71 +1,10 @@
-[package]
-name = "ktir-cpu"
-version = "0.1.0"
-edition = "2024"
-description = "Rust port of the KTIR CPU validation interpreter (RFC 0682)"
-
-# The default build is intentionally dependency-free: portable, instant, and the
-# parity oracle. Acceleration is opt-in via the `accelerate` feature.
-#
-# Future (not gating the default build):
-#   ndarray -> Tile storage (the tile.rs dtype fork); half -> f16; regex -> parser.
-[features]
-default = []
-
-# Experimental KTIR -> Metal Shading Language backend. The codegen is pure
-# string emission (no GPU needed); the runtime dispatch pulls the `metal` crate
-# (macOS-only) to compile the MSL and run it on a MTLDevice.
-metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
-
-# BLAS matmul for NON-macOS platforms — pick one. (macOS uses Apple Accelerate
-# automatically, with no feature flag; see the target deps below.) Linux has no
-# universally-present BLAS, so the backend is an explicit choice here.
-#   openblas-system : link system OpenBLAS (apt install libopenblas-dev)  [recommended on Linux]
-#   openblas        : build OpenBLAS from source (needs a C/Fortran toolchain)
-#   mkl             : Intel MKL (x86_64; downloaded by intel-mkl-src)
-#   blis            : portable BLIS (good on AMD)
-openblas        = ["dep:cblas-sys", "dep:blas-src", "blas-src/openblas"]
-openblas-system = ["openblas", "dep:openblas-src", "openblas-src/system"]
-mkl             = ["dep:cblas-sys", "dep:blas-src", "blas-src/intel-mkl"]
-blis            = ["dep:cblas-sys", "dep:blas-src", "blas-src/blis"]
-
-[dependencies]
-# Optional on non-macOS (pulled in by a provider feature); see the macOS target
-# section for the always-on Accelerate wiring.
-cblas-sys = { version = "0.1", optional = true }
-objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true }
-objc2-foundation = { version = "0.3", optional = true }
-blas-src = { version = "0.10", optional = true, default-features = false }
-openblas-src = { version = "0.10", optional = true, default-features = false }
-
-# macOS: Apple Accelerate AND the Metal/NAX backend ship with / target the OS,
-# so link them unconditionally and use them by default — zero feature flags.
-# build.rs emits cfg(metal) on macOS so the emulator dispatches large matmuls to
-# the NAX tensor engine automatically. (objc2-* are macOS-only; on other targets
-# the optional `metal` feature above pulls them for explicit cross builds.)
-[target.'cfg(target_os = "macos")'.dependencies]
-blas-src = { version = "0.10", default-features = false, features = ["accelerate"] }
-cblas-sys = "0.1"
-objc2 = "0.6"
-objc2-metal = "0.3"
-objc2-foundation = "0.3"
-
-[lib]
-name = "ktir_cpu"
-path = "src/lib.rs"
-
-# Test-only: the SmolLM2 bundle runner (e2e_smollm2.rs) parses the bundle's
-# manifest.json. Does not affect the dependency-free default library build.
-[dev-dependencies]
-serde_json = "1"
-
-# Profiling target for the real-model run (cargo instruments -t time --bench
-# smollm2_bench). A plain `fn main` (no libtest harness) so the profiler sees the
-# model loop directly. Skips when the bundle is absent.
-[[bench]]
-name = "smollm2_bench"
-harness = false
+# KTIR Rust workspace.
+#   ktir-core      — IR types, parser, affine, dtypes, f16 codec. Dependency-free.
+#   ktir-cpu       — the execution layer (interpreter + Metal/NAX backend).
+#   ktir-optimizer — IR→IR passes (fusion, trace packing). Depends only on core.
+[workspace]
+resolver = "2"
+members = ["crates/ktir-core", "crates/ktir-cpu", "crates/ktir-optimizer"]
 
 # Keep symbol info in the optimized bench build so cargo flamegraph / instruments
 # attribute samples to functions instead of raw addresses.

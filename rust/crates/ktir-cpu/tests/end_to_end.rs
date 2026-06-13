@@ -10,7 +10,7 @@ use ktir_cpu::parser::parse_module;
 
 #[test]
 fn vector_add_executes_end_to_end() {
-    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
     let module = parse_module(src).expect("parse vector_add");
 
     // 32 cores x BLOCK_SIZE=128 = 4096 elements, matching the kernel's views.
@@ -61,7 +61,7 @@ fn vector_add_executes_end_to_end() {
 // in) — proving the f32 round-trip is avoidable with no behavior change.
 #[test]
 fn tensor_bytes_input_matches_f32_path() {
-    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
     let module = parse_module(src).expect("parse vector_add");
     let n = 4096usize;
     let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
@@ -113,7 +113,7 @@ fn tensor_bytes_input_matches_f32_path() {
 // kernel's raw output back as another's input.
 #[test]
 fn output_raw_bytes_thread_without_roundtrip() {
-    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
     let module = parse_module(src).expect("parse vector_add");
     let n = 4096usize;
     let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
@@ -189,7 +189,7 @@ fn output_raw_bytes_thread_without_roundtrip() {
 
 #[test]
 fn vector_add_latency_report_is_populated() {
-    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
     let module = parse_module(src).expect("parse vector_add");
     let n = 4096usize;
     let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();

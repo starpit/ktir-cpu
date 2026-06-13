@@ -68,7 +68,7 @@ fn run(src: &str, func: &str, args: &[(&str, Arg)]) -> Result<(), String> {
 //   succeed, which is the behaviour the strict xfail guards.
 // ===========================================================================
 
-const PAGED_TENSOR_COPY: &str = include_str!("../../examples/rfc/paged-tensor-copy.mlir");
+const PAGED_TENSOR_COPY: &str = include_str!("../../../../examples/rfc/paged-tensor-copy.mlir");
 
 #[test]
 fn paged_tensor_indirect_access_gap() {
@@ -91,7 +91,7 @@ fn paged_tensor_indirect_access_gap() {
 //   errors on the scf.forall induction variable before reaching LX overflow.
 // ===========================================================================
 
-const PAGED_TENSOR_WRITE: &str = include_str!("../../examples/rfc/paged-tensor-write.mlir");
+const PAGED_TENSOR_WRITE: &str = include_str!("../../../../examples/rfc/paged-tensor-write.mlir");
 
 #[test]
 fn paged_tensor_indirect_scatter_gap() {
@@ -119,7 +119,7 @@ fn paged_tensor_indirect_scatter_gap() {
 // non-strict xfail tolerates an xpass, so a passing Rust run is compliant.
 // ===========================================================================
 
-const ADD_WITH_CONTROL_FLOW: &str = include_str!("../../examples/rfc/add-with-control-flow.mlir");
+const ADD_WITH_CONTROL_FLOW: &str = include_str!("../../../../examples/rfc/add-with-control-flow.mlir");
 
 #[test]
 fn linalg_add_tensor_empty_runs() {

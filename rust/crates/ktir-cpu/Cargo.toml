@@ -1,0 +1,54 @@
+[package]
+name = "ktir-cpu"
+version = "0.1.0"
+edition = "2024"
+description = "KTIR CPU validation interpreter — execution layer + Metal/NAX backend (RFC 0682)."
+build = "build.rs"
+
+# The default build is intentionally dependency-light: portable, instant, and the
+# parity oracle. Acceleration is opt-in via the feature flags below.
+[features]
+default = []
+
+# Experimental KTIR -> Metal Shading Language backend. The codegen is pure
+# string emission (no GPU needed); the runtime dispatch pulls the objc2-metal
+# crates (macOS-only) to compile the MSL and run it on a MTLDevice.
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+
+# BLAS matmul for NON-macOS platforms — pick one. (macOS uses Apple Accelerate
+# automatically; see the target deps below.)
+openblas        = ["dep:cblas-sys", "dep:blas-src", "blas-src/openblas"]
+openblas-system = ["openblas", "dep:openblas-src", "openblas-src/system"]
+mkl             = ["dep:cblas-sys", "dep:blas-src", "blas-src/intel-mkl"]
+blis            = ["dep:cblas-sys", "dep:blas-src", "blas-src/blis"]
+
+[dependencies]
+ktir-core = { path = "../ktir-core" }
+cblas-sys = { version = "0.1", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+blas-src = { version = "0.10", optional = true, default-features = false }
+openblas-src = { version = "0.10", optional = true, default-features = false }
+
+# macOS: Apple Accelerate AND the Metal/NAX backend ship with / target the OS,
+# so link them unconditionally. build.rs emits cfg(metal) on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+blas-src = { version = "0.10", default-features = false, features = ["accelerate"] }
+cblas-sys = "0.1"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+
+[lib]
+name = "ktir_cpu"
+path = "src/lib.rs"
+
+# Test-only: the SmolLM2 model runner (e2e_smollm2.rs) parses manifest.json.
+[dev-dependencies]
+serde_json = "1"
+
+# Profiling target for the real-model run. Plain `fn main` (no libtest harness).
+[[bench]]
+name = "smollm2_bench"
+harness = false

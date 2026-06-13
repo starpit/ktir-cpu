@@ -1555,12 +1555,8 @@ pub fn constant_attr_to_value(attr: &Attr) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialects::Dispatch;
-    use crate::env::{ExecutionEnv, GridExecutor};
-    use crate::interpreter::{execute_ops, single_core_context};
-    use crate::ir::Value;
 
-    const VECTOR_ADD: &str = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    const VECTOR_ADD: &str = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
 
     // RUST-ONLY (not in the Python suite): regression for the operand-dedup bug.
     // MLIR operands are positional, so a repeated operand (`%y = mulf %x, %x`,
@@ -1637,32 +1633,9 @@ mod tests {
         assert_eq!(off.operands, vec!["%core_id", "%BLOCK_SIZE"]);
     }
 
-    #[test]
-    fn parse_then_execute_arith_function() {
-        let src = r#"
-            module {
-              func.func @f() attributes {grid = [1]} {
-                %a = arith.constant 2.0 : f32
-                %b = arith.constant 3.0 : f32
-                %c = arith.addf %a, %b : f32
-                %d = arith.mulf %c, %a : f32
-                return
-              }
-            }
-        "#;
-        let module = parse_module(src).unwrap();
-        let f = module.get_function("f").unwrap();
-
-        let dispatch = Dispatch::new();
-        let grid = GridExecutor::new(f.grid);
-        let env = ExecutionEnv::new(&dispatch, &grid);
-        let mut ctx = single_core_context();
-        execute_ops(&f.operations, &mut ctx, &env).unwrap();
-        match ctx.get_value("%d").unwrap() {
-            Value::Scalar(Scalar::F32(v)) => assert_eq!(*v, 10.0), // (2+3)*2
-            other => panic!("expected F32(10.0), got {other:?}"),
-        }
-    }
+    // NOTE: the parse-then-execute test that lived here moved to the
+    // `ktir-cpu` crate (`tests/parser_exec.rs`) when the workspace was split —
+    // it needs the execution layer, which `ktir-core` must not depend on.
 
     // --- ktdp construct-op attribute parsing --------------------------------
 

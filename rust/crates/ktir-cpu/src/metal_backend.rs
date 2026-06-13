@@ -2440,7 +2440,7 @@ kernel void mpp_probe(
 
     #[test]
     fn lowers_vector_add_to_msl() {
-        let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+        let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
         let module = parse_module(src).unwrap();
         let msl = emit_msl(&module, "add_kernel").expect("emit MSL");
 
@@ -2465,7 +2465,7 @@ kernel void mpp_probe(
         use crate::interpreter::{Arg, execute_function};
         use crate::ir::Scalar;
 
-        let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+        let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
         let module = parse_module(src).unwrap();
         let kernel = emit_kernel(&module, "add_kernel").unwrap();
 
@@ -2529,7 +2529,7 @@ kernel void mpp_probe(
     #[test]
     fn rejects_non_elementwise() {
         // matmul_small has a linalg.matmul -> not lowerable in slice 1.
-        let src = include_str!("../../examples/latency/matmul_small.mlir");
+        let src = include_str!("../../../../examples/latency/matmul_small.mlir");
         if let Ok(module) = parse_module(src) {
             let name = module.functions.keys().next().unwrap().clone();
             assert!(emit_msl(&module, &name).is_err());

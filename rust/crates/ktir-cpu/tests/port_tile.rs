@@ -417,10 +417,12 @@ fn is_contiguous_3d_predicate() {
 // ===========================================================================
 
 /// Resolve the indirect-access-copy example MLIR path relative to the repo root
-/// (the crate lives at `<repo>/rust`, examples at `<repo>/examples`).
+/// (the crate lives at `<repo>/rust/crates/ktir-cpu`, examples at `<repo>/examples`).
 fn indirect_access_copy_path() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // -> repo root
+    p.pop(); // ktir-cpu -> crates
+    p.pop(); // crates    -> rust
+    p.pop(); // rust       -> repo root
     p.push("examples/rfc/indirect-access-copy.mlir");
     p
 }

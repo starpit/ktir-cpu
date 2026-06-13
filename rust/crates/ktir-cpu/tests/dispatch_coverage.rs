@@ -66,7 +66,7 @@ macro_rules! corpus {
             #[test]
             fn $name() {
                 assert_all_dispatchable(
-                    include_str!(concat!("../../examples/", $path)),
+                    include_str!(concat!("../../../../examples/", $path)),
                     $path,
                 );
             }

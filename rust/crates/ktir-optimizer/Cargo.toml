@@ -1,0 +1,12 @@
+[package]
+name = "ktir-optimizer"
+version = "0.1.0"
+edition = "2024"
+description = "KTIR IR→IR optimization passes (function fusion, trace packing). Depends only on ktir-core."
+
+[lib]
+name = "ktir_optimizer"
+path = "src/lib.rs"
+
+[dependencies]
+ktir-core = { path = "../ktir-core" }

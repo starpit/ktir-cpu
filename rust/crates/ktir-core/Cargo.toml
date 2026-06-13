@@ -1,0 +1,9 @@
+[package]
+name = "ktir-core"
+version = "0.1.0"
+edition = "2024"
+description = "KTIR IR types, parser, affine, dtypes, and f16 codec (RFC 0682). Dependency-free."
+
+[lib]
+name = "ktir_core"
+path = "src/lib.rs"

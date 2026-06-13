@@ -16,8 +16,10 @@ use crate::fxhash::FxHashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// HBM "stick" (cache block) size in bytes. Mirrors `HBMSimulator.STICK_BYTES`.
-pub const STICK_BYTES: i64 = 128;
+/// HBM "stick" (cache block) size in bytes. Defined in `ktir-core` (memref byte
+/// addressing needs it); re-exported here so `crate::memory::STICK_BYTES`
+/// resolves unchanged.
+pub use crate::memref::STICK_BYTES;
 
 /// Shared, byte-addressed HBM with stick-granular addressing.
 #[derive(Debug)]

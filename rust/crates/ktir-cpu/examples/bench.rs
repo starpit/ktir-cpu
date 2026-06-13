@@ -13,7 +13,7 @@ fn us(t: Instant, iters: u32) -> f64 {
 }
 
 fn main() {
-    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
     let module = parse_module(src).unwrap();
     let n = 4096usize;
     let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();

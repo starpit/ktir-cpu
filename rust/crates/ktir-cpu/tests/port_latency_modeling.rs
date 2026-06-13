@@ -705,7 +705,7 @@ fn test_lx_reuse_vs_hbm_reload() {
 fn test_balanced_work_distribution() {
     // With 32 cores on the real vector_add example, max(total) == min(total):
     // the model assigns equal tiles to every core, so there is no imbalance.
-    let src = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
     let module = parse_module(src).expect("parse vector_add");
     let n = 4096usize;
     let args = [

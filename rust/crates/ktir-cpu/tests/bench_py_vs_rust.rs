@@ -15,9 +15,9 @@ use ktir_cpu::interpreter::{Arg, execute_function};
 use ktir_cpu::ir::Scalar;
 use ktir_cpu::parser::parse_module;
 
-const VECTOR_ADD: &str = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
-const MATMUL: &str = include_str!("../../examples/triton-ktir/matmul_fwd_ktir.mlir");
-const LAYERNORM: &str = include_str!("../../examples/triton-ktir/layernorm_fwd_ktir.mlir");
+const VECTOR_ADD: &str = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
+const MATMUL: &str = include_str!("../../../../examples/triton-ktir/matmul_fwd_ktir.mlir");
+const LAYERNORM: &str = include_str!("../../../../examples/triton-ktir/layernorm_fwd_ktir.mlir");
 
 fn f16(x: f32) -> f32 {
     ktir_cpu::codec::f16_bits_to_f32(ktir_cpu::codec::f32_to_f16_bits(x))

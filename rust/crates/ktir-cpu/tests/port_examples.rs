@@ -116,7 +116,7 @@ fn get_output<'a>(outputs: &'a HashMap<String, Output>, name: &str) -> &'a Outpu
 // BLOCK_SIZE = 128, 32 cores -> n = 4096.
 // ===========================================================================
 
-const VECTOR_ADD: &str = include_str!("../../examples/triton-ktir/vector_add_ktir.mlir");
+const VECTOR_ADD: &str = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
 
 #[test]
 fn vector_add_single_core() {
@@ -213,7 +213,7 @@ fn vector_add_various_values() {
 // ===========================================================================
 
 const VECTOR_ADD_DYNAMIC: &str =
-    include_str!("../../examples/triton-ktir/vector_add_dynamic_ktir.mlir");
+    include_str!("../../../../examples/triton-ktir/vector_add_dynamic_ktir.mlir");
 
 #[allow(dead_code)]
 fn run_vector_add_dynamic(n: usize) {
@@ -285,7 +285,7 @@ fn vector_add_dynamic_1024() {
 // Reduce [1,2,3,4] along dim 1 -> result broadcast to [10,10,10,10].
 // ===========================================================================
 
-const REDUCE_GENERIC: &str = include_str!("../../examples/ktir/reduce_generic.mlir");
+const REDUCE_GENERIC: &str = include_str!("../../../../examples/ktir/reduce_generic.mlir");
 
 // GAP: the baseline parser DEFERS nested op regions ("DEFERRED (later slices):
 // nested regions"), so the linalg.reduce combiner block and its `dimensions =
@@ -338,7 +338,7 @@ fn reduce_explicit_region_zeros() {
 // Q, K, V, output are [32, 64] f16.
 // ===========================================================================
 
-const SDPA_2D: &str = include_str!("../../examples/triton-ktir/sdpa_2d.mlir");
+const SDPA_2D: &str = include_str!("../../../../examples/triton-ktir/sdpa_2d.mlir");
 
 // Parses fully now (transpose `permutation`, reduce regions/`dimensions`, and
 // tensor result-shape derivation all land). Remaining gap is semantic: the
@@ -441,7 +441,7 @@ fn sdpa_2d() {
 
 #[test]
 fn softmax_wide_lx_overflow() {
-    let src = include_str!("../../examples/ktir/softmax_wide.mlir");
+    let src = include_str!("../../../../examples/ktir/softmax_wide.mlir");
     let module = parse_module(src).expect("parse softmax_wide");
     let n_rows = 1usize;
     let n_cols = 262144usize;
@@ -479,6 +479,6 @@ fn softmax_wide_lx_overflow() {
 #[test]
 #[ignore = "xfail in Python: parser lacks #ktdp.reduce_kind / reduce_mode / grid_axis attrs (ktir-mlir-frontend#21)"]
 fn ring_reduce_sum() {
-    let src = include_str!("../../examples/ktir/ring_reduce.mlir");
+    let src = include_str!("../../../../examples/ktir/ring_reduce.mlir");
     let _ = parse_module(src);
 }
