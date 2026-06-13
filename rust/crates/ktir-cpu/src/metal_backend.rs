@@ -345,6 +345,96 @@ pub fn plan_kernels(ops: &[Operation]) -> Result<Vec<KernelRegion>, String> {
     Ok(regions)
 }
 
+/// Map of `scf.for` result SSA (as written, with `%`) -> the GEMM it collapses
+/// to. Computed once per fused function; the interpreter consults it to offload
+/// each recognized K-loop to one GPU GEMM instead of running the loop.
+pub fn matmul_loop_schedule(ops: &[Operation]) -> HashMap<String, MatmulLoopInfo> {
+    let defs = def_map_all(ops);
+    let mut sched = HashMap::new();
+    for op in ops {
+        if op.op_type == "scf.for"
+            && let Some(info) = recognize_matmul_loop(op, &defs)
+        {
+            sched.insert(info.out_ssa.clone(), info);
+        }
+    }
+    sched
+}
+
+#[cfg(metal)]
+thread_local! {
+    /// One GEMM engine per scheduler thread (the cooperative core scheduler is
+    /// single-threaded), compiled once and reused across all K-loops.
+    static GEMM_ENGINE: std::cell::OnceCell<Option<NaxGemm>> = const { std::cell::OnceCell::new() };
+}
+
+/// Count of K-loops successfully offloaded to a GPU GEMM (test/telemetry proof
+/// that the fused path actually used Metal, not a silent interpreter fallback).
+#[cfg(metal)]
+pub static MATMUL_LOOP_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Run a recognized matmul K-loop as ONE GPU GEMM, binding the loop's result
+/// tensor in `ctx`. Operands are resolved from the value table: a forwarded
+/// activation is already a resident `Tile` (f32); a weight is an HBM pointer we
+/// decode. The interpreter then skips the loop body entirely. Returns `Err` if
+/// the GEMM can't run (no device, shape mismatch) so the caller falls back to
+/// executing the loop on the interpreter.
+#[cfg(metal)]
+pub fn run_matmul_loop_gpu(
+    info: &MatmulLoopInfo,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    let (m, k, n) = (info.m as usize, info.k as usize, info.n as usize);
+    let a = resolve_gemm_operand(&info.a_root, m, k, ctx)?;
+    let b = resolve_gemm_operand(&info.b_root, k, n, ctx)?;
+    let c = GEMM_ENGINE.with(|cell| -> Result<Vec<f32>, String> {
+        let engine = cell.get_or_init(|| NaxGemm::new().ok());
+        let engine = engine.as_ref().ok_or("metal: no NaxGemm device")?;
+        let ua = engine.unified_from(&a)?;
+        let ub = engine.unified_from(&b)?;
+        let mut uc = engine.unified(m * n)?;
+        engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+        Ok(uc.as_slice().to_vec())
+    })?;
+    // The K-loop's result tensor is f16 (matmul outs dtype); NaxGemm computes in
+    // f16 internally, so this matches the interpreter's matmul precision.
+    let tile = crate::tile::Tile::compute(c, DType::F16, vec![m, n]);
+    let bytes = tile.size_bytes() as i64;
+    ctx.set_value(&info.out_ssa, crate::ir::Value::Tile(tile));
+    ctx.track_lx(&info.out_ssa, bytes)?;
+    MATMUL_LOOP_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Resolve a GEMM operand to a flat `[rows*cols]` f32 buffer: a resident `Tile`
+/// is used directly; an HBM pointer (`Value::Index`) is decoded from f16.
+#[cfg(metal)]
+fn resolve_gemm_operand(
+    root: &str,
+    rows: usize,
+    cols: usize,
+    ctx: &crate::context::CoreContext,
+) -> Result<Vec<f32>, String> {
+    let n = rows * cols;
+    match ctx.get_value(root)? {
+        crate::ir::Value::Tile(t) => {
+            if t.data.len() != n {
+                return Err(format!(
+                    "metal: GEMM operand {root} resident tile has {} elems, need {n}",
+                    t.data.len()
+                ));
+            }
+            Ok(t.data.to_vec())
+        }
+        crate::ir::Value::Index(stick) => {
+            let addr = stick * crate::memory::STICK_BYTES;
+            Ok(ctx.hbm.borrow().read_decoded(addr, n, DType::F16))
+        }
+        other => Err(format!("metal: GEMM operand {root} is {other:?}, want tile/ptr")),
+    }
+}
+
 /// Diagnostic: `(top-level scf.for count, of which recognized as matmul K-loops)`.
 /// Lets a test confirm every K-loop in a fused function collapses to a GEMM —
 /// the prefill-readiness check — without standing up the full executor.

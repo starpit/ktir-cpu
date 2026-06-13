@@ -223,11 +223,40 @@ impl CoreRunner {
                 }
             }
         }
+        // MLX-style GPU offload: recognized matmul K-loops run as one GPU GEMM
+        // instead of the interpreter's K-tiled loop. Gated to SINGLE-CORE
+        // functions: there the K-loop's M-offset is 0 / the forwarded source
+        // gives the full M, so reconstructing the whole GEMM is correct. A
+        // multi-core grid M-tiles across cores (each core a block offset by its
+        // tile id), so the full-shape reconstruction would be wrong — those keep
+        // the interpreter loop. Skipped under a latency tracker (the model must
+        // see each op). The fused whole-program function is grid [1,1].
+        #[cfg(metal)]
+        let matmul_sched = if env.tracker.is_none() && env.grid.num_cores == 1 {
+            crate::metal_backend::matmul_loop_schedule(ops)
+        } else {
+            std::collections::HashMap::new()
+        };
+
         // Run remaining top-level ops.
         while self.op_idx < ops.len() {
             let op = &ops[self.op_idx];
             let this_idx = self.op_idx;
             self.op_idx += 1;
+            // Offload a recognized K-loop to a single GPU GEMM; on any failure
+            // fall through to the interpreter (correctness preserved).
+            #[cfg(metal)]
+            if op.op_type == "scf.for"
+                && let Some(info) = op.result.as_deref().and_then(|r| matmul_sched.get(r))
+                && crate::metal_backend::run_matmul_loop_gpu(info, &mut self.ctx).is_ok()
+            {
+                if let Some(dead) = self.dies_at.get(this_idx) {
+                    for name in dead {
+                        self.ctx.untrack_lx(name);
+                    }
+                }
+                continue;
+            }
             if is_comm_op(&op.op_type) {
                 // Charge the comm op's latency once (it doesn't go through
                 // execute_op). Cost is derived from the operand tile + grid size.
