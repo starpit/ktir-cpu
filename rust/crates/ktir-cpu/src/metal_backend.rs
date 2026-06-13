@@ -431,8 +431,30 @@ fn lower_compute_depth(
         "linalg.add" => binop("+"),
         "linalg.mul" => binop("*"),
         "linalg.sub" => binop("-"),
+        // A scalar constant folds into the expression as an MSL literal.
+        "arith.constant" => constant_literal(op),
+        // splat broadcasts a scalar to a tensor; in the per-element kernel it is
+        // transparent — every lane reads the same scalar sub-expression.
+        "tensor.splat" => operand(0),
+        // dtype casts: compute in the wider type, narrow on store. Explicit so
+        // an extf'd chain runs in float (matching the CPU oracle), not half.
+        "arith.extf" => Ok(format!("float({})", operand(0)?)),
+        "arith.truncf" => Ok(format!("half({})", operand(0)?)),
         other => Err(format!(
-            "metal: compute op {other:?} not lowerable in slice 1 (element-wise only)"
+            "metal: compute op {other:?} not lowerable (element-wise / scalar only)"
+        )),
+    }
+}
+
+/// Render an `arith.constant`'s value as an MSL float literal. Only the
+/// float/int scalar forms fold into a fused expression; anything else (a
+/// `dense<>` tensor, a bool) is rejected so the caller can fall back.
+fn constant_literal(op: &Operation) -> Result<String, String> {
+    match op.attributes.get("value") {
+        Some(crate::ir::Attr::Float(f)) => Ok(format!("{f:?}")),
+        Some(crate::ir::Attr::Int(i)) => Ok(format!("{i}.0")),
+        other => Err(format!(
+            "metal: constant value {other:?} not lowerable as a scalar literal"
         )),
     }
 }
@@ -2576,6 +2598,49 @@ module {
                 "out_ptr[gid] = (exp((a_ptr[gid] * b_ptr[gid]))) + c_ptr[gid];"
             ),
             "expected one fused expression, got:\n{}",
+            kernel.source
+        );
+    }
+
+    #[test]
+    fn fuses_constants_casts_and_splat() {
+        // half a -> float, scale by a splat constant in f32, narrow back to half:
+        //   out = half(float(a) * 2.0)
+        let src = r#"
+module {
+  func.func @scale(%a_ptr: index, %out_ptr: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %va = ktdp.construct_memory_view %a_ptr, sizes: [8], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8xf16>
+    %ta = ktdp.construct_access_tile %va[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
+    %la = ktdp.load %ta : !ktdp.access_tile<8xindex> -> tensor<8xf16>
+    %xf = arith.extf %la : tensor<8xf16> to tensor<8xf32>
+    %c2 = arith.constant 2.0 : f32
+    %s = tensor.splat %c2 : tensor<8xf32>
+    %m = arith.mulf %xf, %s : tensor<8xf32>
+    %t = arith.truncf %m : tensor<8xf32> to tensor<8xf16>
+    %vout = ktdp.construct_memory_view %out_ptr, sizes: [8], strides: [1] {
+      coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<8xf16>
+    %tout = ktdp.construct_access_tile %vout[%c0] {
+      access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 7 >= 0)>, access_tile_order = affine_map<(d0) -> (d0)>
+    } : memref<8xf16> -> !ktdp.access_tile<8xindex>
+    ktdp.store %t, %tout : tensor<8xf16>, !ktdp.access_tile<8xindex>
+    return
+  }
+}
+"#;
+        let module = parse_module(src).unwrap();
+        let kernel = emit_kernel(&module, "scale").expect("emit scale chain");
+        // Only `a` is a real buffer; the constant folded into the expression.
+        let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["a_ptr", "out_ptr"], "constant is not a buffer");
+        assert!(
+            kernel.source.contains("out_ptr[gid] = half(((float(a_ptr[gid])) * ((2.0))));"),
+            "unexpected fused body:\n{}",
             kernel.source
         );
     }
