@@ -262,6 +262,74 @@ fn run_segmented_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
     (result, n_fused, n_native)
 }
 
+/// PERF: whole-model ms/pass through the PRODUCTION segmented executor
+/// (`ktir_cpu::segmented::execute_segmented`) — the apples-to-apples Rust+Metal
+/// number for the Python per-node bench. Correct for BOTH decode and prefill
+/// (head-parallel attention runs at its native grid; fused [1,1] segments carry
+/// the K-loop GEMM + map-window + resident-weight-cache GPU offloads).
+///
+/// BUNDLE env selects the model (smollm2-135m / smollm2-135m-prefill /
+/// llama-3.2-1b / llama-3.2-1b-prefill); ITERS env sets the timed pass count
+/// (default 5). One warm-up pass is excluded; the median over ITERS is printed.
+/// Run with the GPU path ON (do NOT set KTIR_NO_GPU_*) and --test-threads=1.
+#[cfg(metal)]
+#[test]
+#[ignore = "whole-model perf bench; needs the BUNDLE bundle. --ignored --nocapture"]
+fn segmented_mspass() {
+    let bundle = std::env::var("BUNDLE").unwrap_or_else(|_| "smollm2-135m".to_string());
+    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let Some(dir) = bundle_dir_named(&bundle) else {
+        eprintln!("{bundle} bundle absent — skipping");
+        return;
+    };
+
+    // Build the module + ProgramSpec once, and marshal the source args once
+    // (weights from t{id}.bin, attn mask zeroed) — exactly the front-end of
+    // `run_segmented_result`, but reused across all timed passes so we measure
+    // execute_segmented itself, not the one-time parse/load.
+    let b = load_bundle(&dir);
+    let mut owned: Vec<(String, Arg)> = Vec::new();
+    for (&id, &(rows, cols, is_src)) in &b.shape {
+        if is_src && Some(id) != b.mask_id {
+            owned.push((
+                format!("t{id}"),
+                Arg::Tensor {
+                    data: read_f32(&dir.join(format!("t{id}.bin"))),
+                    shape: vec![rows, cols],
+                    dtype: DType::F16,
+                },
+            ));
+        }
+    }
+    if let Some(m) = b.mask_id {
+        let (rows, cols, _) = b.shape[&m];
+        owned.push((
+            format!("t{m}"),
+            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+        ));
+    }
+    let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let result_key = format!("t{}", b.result_id);
+
+    // Warm up (pipeline compile, first-touch, weight-cache fill) — excluded.
+    ktir_cpu::segmented::execute_segmented(&b.module, &b.spec, &args, &[&result_key])
+        .expect("warmup");
+
+    let mut times: Vec<f64> = Vec::with_capacity(iters as usize);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        ktir_cpu::segmented::execute_segmented(&b.module, &b.spec, &args, &[&result_key])
+            .expect("timed segmented run");
+        times.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[times.len() / 2];
+    eprintln!(
+        "{bundle} e2e (Rust+Metal segmented): {median:.1} ms/pass  ({} nodes, {iters} passes)",
+        b.n_nodes
+    );
+}
+
 /// PREFILL multi-core SPMD vs golden — the AUTHORITATIVE gate for cross-core
 /// grid execution. Runs every prefill node at its NATIVE grid ([1,1] / [8,1]
 /// token-parallel matmuls / [9,1] attention heads), threading one shared HBM
