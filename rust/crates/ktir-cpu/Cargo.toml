@@ -8,7 +8,12 @@ build = "build.rs"
 # The default build is intentionally dependency-light: portable, instant, and the
 # parity oracle. Acceleration is opt-in via the feature flags below.
 [features]
-default = []
+# `optimizer` (default ON) pulls in ktir-optimizer and enables the whole-program
+# fusion + the fused/serving execution drivers (`segmented`, `resident`) that run
+# the GPU offloads. Disable it (`--no-default-features`) for the bare per-node
+# parity oracle (`execute_function`) with no optimizer dependency.
+default = ["optimizer"]
+optimizer = ["dep:ktir-optimizer"]
 
 # Experimental KTIR -> Metal Shading Language backend. The codegen is pure
 # string emission (no GPU needed); the runtime dispatch pulls the objc2-metal
@@ -25,9 +30,10 @@ blis            = ["dep:cblas-sys", "dep:blas-src", "blas-src/blis"]
 [dependencies]
 ktir-core = { path = "../ktir-core" }
 # Partial-fusion planning (plan_segments / fuse_program) for the production
-# `segmented::execute_segmented` serving path. The optimizer stays core-only
-# (no reverse dependency on this execution crate), so this is a one-way edge.
-ktir-optimizer = { path = "../ktir-optimizer" }
+# `segmented::execute_segmented` / `resident` serving paths. Optional, behind the
+# default-on `optimizer` feature (the optimizer stays core-only — no reverse
+# dependency on this execution crate — so this is a one-way edge).
+ktir-optimizer = { path = "../ktir-optimizer", optional = true }
 cblas-sys = { version = "0.1", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true }

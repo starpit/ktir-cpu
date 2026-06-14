@@ -14,6 +14,7 @@
 //!
 //! The bundle is machine-specific and not in the repo, so the test SKIPS when
 //! absent. `--ignored` because it runs a whole model.
+#![cfg(feature = "optimizer")] // this whole suite drives the optimizer/fusion path
 
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::interpreter::{Arg, execute_function, execute_function_outputs};

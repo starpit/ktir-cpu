@@ -27,6 +27,12 @@ extern crate blas_src;
 // Re-export the core IR/parse/codec layer at this crate's root.
 pub use ktir_core::{affine, codec, dtypes, fxhash, ir, memref, parser, parser_ast, tile};
 
+// Re-export the optimizer (whole-program fusion / ProgramSpec / plan_segments)
+// when the `optimizer` feature is on, so consumers reach it through ktir-cpu
+// without a separate ktir-optimizer dependency.
+#[cfg(feature = "optimizer")]
+pub use ktir_optimizer;
+
 pub mod blas;
 pub mod comm;
 pub mod comm_sched;
@@ -39,5 +45,8 @@ pub mod memory;
 #[cfg(metal)]
 pub mod metal_backend;
 pub mod ops_memory;
+// The fused/serving execution drivers depend on the optimizer's ProgramSpec.
+#[cfg(feature = "optimizer")]
 pub mod resident;
+#[cfg(feature = "optimizer")]
 pub mod segmented;

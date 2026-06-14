@@ -17,6 +17,7 @@
 //! the intermediate to f16 in HBM and back, while the fused path keeps it as an
 //! f32 SSA value — so the fused result is the more precise of the two. We assert
 //! agreement within an f16 tolerance.
+#![cfg(feature = "optimizer")] // exercises ktir_optimizer::fusion::fuse_program
 
 use ktir_cpu::dtypes::DType;
 use ktir_cpu::interpreter::{Arg, Output, execute_function};
