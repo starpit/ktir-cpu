@@ -215,14 +215,16 @@ GPU-vs-interpreter. Small `k·n` (< 3M) runs full-M on AMX (Accelerate, no GPU
 dispatch, on the already-resident f32); large stays on NAX. M>1 is never the
 interpreter scf.for (a failed M>1 offload is now a hard error, not silent row-0).
 
-Resident E2E ms/pass (this change vs the prior resident column):
+Resident E2E ms/pass (this change vs the prior resident column). Python is the
+reference interpreter (only smollm2 decode has a Python e2e number; the prefill /
+llama configs were never run under Python — `—`):
 
-| Model/mode | RESIDENT before | RESIDENT after | note |
-|---|---:|---:|---|
-| smollm2-135m decode  | 128.8 | 129.1 | unchanged (decode routing identical) |
-| smollm2-135m prefill | 747.9 | **563.8** | 210/211 GEMMs → AMX; now beats fused-AMX 679 |
-| llama-3.2-1b decode  | 588.5 | 591.9 | unchanged (within noise) |
-| llama-3.2-1b prefill | 3991.9 | **3547.2** | GQA k/v projections → AMX |
+| Model/mode | Python | RESIDENT before | RESIDENT after | note |
+|---|---:|---:|---:|---|
+| smollm2-135m decode  | 2397 | 128.8 | 129.1 | unchanged; **18.6× vs Python** |
+| smollm2-135m prefill | — | 747.9 | **563.8** | 210/211 GEMMs → AMX; now beats fused-AMX 679 |
+| llama-3.2-1b decode  | — | 588.5 | 591.9 | unchanged (within noise) |
+| llama-3.2-1b prefill | — | 3991.9 | **3547.2** | GQA k/v projections → AMX |
 
 Headline: RESIDENT is now the **fastest path on all four configs**. Golden via
 `resident_matches_golden` stays < 0.05 (smollm2 prefill 0.0035→0.0034 better;
@@ -234,14 +236,15 @@ Per-kernel unchanged from `0017fc3` (same NAX/Accelerate primitives). The change
 is the E2E execution model: a resident GPU executor uploads weights ONCE and
 chains segments on-device, plus size gates on the GEMM / map offloads.
 
-E2E ms/pass (per-node / fused-AMX / fused-Metal / **RESIDENT**):
+E2E ms/pass (Python / per-node / fused-AMX / fused-Metal / **RESIDENT**); Python
+e2e exists only for smollm2 decode (`—` = never run under Python):
 
-| Model/mode | per-node | fused-AMX | fused-Metal | **RESIDENT** |
-|---|---:|---:|---:|---:|
-| smollm2-135m decode  | 704.9 | 245.5 | 252.8 | **128.8** |
-| smollm2-135m prefill | 1271.8 | **679.4** | 813.6 | 747.9 |
-| llama-3.2-1b decode  | 3089.2 | 8717.2 | 40303.5 | **588.5** |
-| llama-3.2-1b prefill | 29132.1 | 7976.8 | 6269.6 | **3991.9** |
+| Model/mode | Python | per-node | fused-AMX | fused-Metal | **RESIDENT** |
+|---|---:|---:|---:|---:|---:|
+| smollm2-135m decode  | 2397 | 704.9 | 245.5 | 252.8 | **128.8** |
+| smollm2-135m prefill | — | 1271.8 | **679.4** | 813.6 | 747.9 |
+| llama-3.2-1b decode  | — | 3089.2 | 8717.2 | 40303.5 | **588.5** |
+| llama-3.2-1b prefill | — | 29132.1 | 7976.8 | 6269.6 | **3991.9** |
 
 Headline: RESIDENT is fastest on 3 of 4 (within 9% on smollm2 prefill). The
 llama-1B decode regression — the old fused-Metal's per-pass ~2 GB weight marshal,
@@ -255,14 +258,15 @@ Per-kernel (Rust AMX/CPU interpreter): vector_add 630.9 µs (1.37× Py) · matmu
 428.5 ms (27.9× Py) · layernorm 695.1 ms (60.3× Py). matmul primitive
 AMX→Metal: 1.28× at 64×2048×8192, 1.91× at 512×4096×4096.
 
-E2E ms/pass (per-node / fused-AMX / fused-Metal):
+E2E ms/pass (Python / per-node / fused-AMX / fused-Metal); Python e2e exists only
+for smollm2 decode (`—` = never run under Python):
 
-| Model/mode | per-node | fused-AMX | fused-Metal |
-|---|---:|---:|---:|
-| smollm2-135m decode  | 704.9 | 245.5 | 418.6 |
-| smollm2-135m prefill | 1271.8 | 679.4 | 813.6 |
-| llama-3.2-1b decode  | 3089.2 | 8717.2 | 24918.4 |
-| llama-3.2-1b prefill | 29132.1 | 7976.8 | **6269.6** |
+| Model/mode | Python | per-node | fused-AMX | fused-Metal |
+|---|---:|---:|---:|---:|
+| smollm2-135m decode  | 2397 | 704.9 | 245.5 | 418.6 |
+| smollm2-135m prefill | — | 1271.8 | 679.4 | 813.6 |
+| llama-3.2-1b decode  | — | 3089.2 | 8717.2 | 24918.4 |
+| llama-3.2-1b prefill | — | 29132.1 | 7976.8 | **6269.6** |
 
 Headline: fused-Metal wins on llama-1B prefill (1.27× vs fused-AMX); AMX wins on
 all decode and on small-model prefill (GPU dispatch-bound at M=1 / small M).
