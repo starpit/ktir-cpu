@@ -340,19 +340,36 @@ impl CoreRunner {
                 }
                 continue;
             }
-            // Offload a recognized K-loop to a single GPU GEMM; on any failure
-            // fall through to the interpreter (correctness preserved).
+            // Offload a recognized K-loop as a full-M GEMM (NAX or AMX). On Ok the
+            // interpreter skips the loop body. On Err the fallback is the loop's
+            // own `scf.for` below — correct at grid [1,1] ONLY for m==1 (decode: it
+            // computes the single row). For m>1 (prefill) that body would compute
+            // ONLY row 0 and silently drop the rest, so a failed offload is FATAL —
+            // fail loud rather than emit a row-0-only result.
             #[cfg(metal)]
             if op.op_type == "scf.for"
                 && let Some(info) = op.result.as_deref().and_then(|r| matmul_sched.get(r))
-                && crate::metal_backend::run_matmul_loop_gpu(info, &mut self.ctx).is_ok()
             {
-                if let Some(dead) = self.dies_at.get(this_idx) {
-                    for name in dead {
-                        self.ctx.forget(name);
+                match crate::metal_backend::run_matmul_loop_gpu(info, &mut self.ctx) {
+                    Ok(()) => {
+                        if let Some(dead) = self.dies_at.get(this_idx) {
+                            for name in dead {
+                                self.ctx.forget(name);
+                            }
+                        }
+                        continue;
                     }
+                    Err(e) if info.m > 1 => {
+                        return Err(format!(
+                            "metal: full-M GEMM offload failed for m={} ({}): {e}; \
+                             refusing the row-0-only interpreter fallback",
+                            info.m, info.out_ssa
+                        ));
+                    }
+                    // m == 1: the interpreter scf.for below computes the single row
+                    // correctly, so fall through to it.
+                    Err(_) => {}
                 }
-                continue;
             }
             // Map-window GPU fusion: at a window's TRIGGER op, run the whole window
             // as one fused kernel (its loads/plumbing already ran, populating the

@@ -478,10 +478,20 @@ fn weight_fingerprint(
     h.finish()
 }
 
-/// Count of K-loops successfully offloaded to a GPU GEMM (test/telemetry proof
-/// that the fused path actually used Metal, not a silent interpreter fallback).
+/// Count of K-loops offloaded to a **NAX** (GPU) GEMM — test/telemetry proof the
+/// fused path used the tensor engine, not a silent interpreter fallback.
 #[cfg(metal)]
 pub static MATMUL_LOOP_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Count of recognized full-M K-loops run on the **AMX** (Accelerate) backend
+/// instead of NAX — the size-gated alternative for small GEMMs (low `k·n`) that
+/// would only underfill the GPU. These are still full-M resident offloads (NOT
+/// the interpreter scf.for fallback); they read the SAME resident f32 operands as
+/// the NAX path. Decode small GEMMs (m==1) still use the interpreter K-loop and
+/// are counted in neither.
+#[cfg(metal)]
+pub static MATMUL_LOOP_AMX_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Number of resident-weight-cache HITS — a weight operand served from a cached
@@ -504,74 +514,101 @@ pub fn clear_weight_cache() {
     WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
 }
 
-/// Default minimum GEMM WEIGHT size (`k·n` elements) to route a recognized K-loop
-/// to the GPU instead of the interpreter's Accelerate K-loop.
+/// Default minimum GEMM WEIGHT size (`k·n` elements) to run a recognized full-M
+/// K-loop on **NAX** (the GPU tensor engine) rather than **AMX** (Accelerate).
 ///
-/// The gate is on `k·n` (the weight footprint) rather than `m·k·n` (total MACs)
-/// because the cost the GPU offload SAVES is the interpreter's tiled K-loop, whose
-/// tile count scales with `k·n` (it tiles the K×N weight into ~`(k/128)·(n/512)`
-/// Accelerate blocks), while the activation upload it ADDS is `m·k` and the GPU
-/// dispatch is fixed. So `k·n` is the true predictor of when the single GPU
-/// dispatch beats the many-tile interpreter loop — and it cleanly separates the
-/// measured models, which `m·k·n` could not (smollm2-prefill's M=8 layer GEMM and
-/// llama-decode's M=1 layer GEMM have similar MAC counts but very different
+/// Both backends compute the SAME reconstructed full-M GEMM over the SAME resident
+/// f32 operands — this is purely a per-GEMM speed choice, not a correctness one.
+/// The gate is on `k·n` (the weight footprint) rather than `m·k·n` (total MACs):
+/// NAX pays a fixed ~300 µs command-buffer dispatch, so it only wins once the
+/// weight is big enough to amortize it; below that the GEMM underfills the tensor
+/// engine and AMX (no dispatch, runs on the already-resident f32) is faster. `k·n`
+/// cleanly separates the measured models (which `m·k·n` could not — smollm2's M=8
+/// prefill GEMM and llama's M=1 decode GEMM have similar MACs but very different
 /// weights):
-///   * smollm2 layer GEMMs: `k·n` ≈ 576·1536 .. 1536·1536 ≈ 0.9–2.4M  → AMX
-///   * llama  layer GEMMs: `k·n` ≈ 2048·2048 .. 2048·8192 ≈ 4.2–16.8M → GPU
-///   * both lm_heads:       `k·n` ≫ 28M                                 → GPU
+///   * smollm2 layer GEMMs: `k·n` ≈ 576·576 .. 1536·576 ≈ 0.3–0.9M  → AMX
+///   * llama  layer GEMMs: `k·n` ≈ 2048·2048 .. 2048·8192 ≈ 4.2–16.8M → NAX
+///     (llama's GQA k/v projections ≈ 2048·512 ≈ 1.0M land on AMX)
+///   * both lm_heads:       `k·n` ≫ 28M                                 → NAX
 ///
-/// 3M splits them. Override with `KTIR_GEMM_GPU_MIN_KN` (0 = always GPU).
+/// 3M splits them. Override with `KTIR_GEMM_GPU_MIN_KN` (0 = always NAX).
 #[cfg(metal)]
 pub const GEMM_GPU_MIN_KN: u64 = 3_000_000;
 
-/// Whether a reconstructed `m×k×n` K-loop GEMM should run on the GPU.
-///
-/// CORRECTNESS FIRST: the fallback when this returns `false` is the interpreter
-/// running the loop's `scf.for` at the fused segment's grid `[1,1]`. That body
-/// correctly reconstructs the GEMM ONLY when `m == 1` (decode): the Spyre SPMD
-/// K-loop tiles its output across the grid, so at `[1,1]` it computes exactly the
-/// single M-row that grid position 0 owns. For `m > 1` (prefill, token-parallel
-/// M=8/M=32), the full-M reconstruction lives ONLY in the GPU offload — running
-/// the `[1,1]` loop would compute just row 0 and silently drop the rest (it broke
-/// prefill golden by ~0.05 in testing). So `m > 1` ALWAYS goes to the GPU.
-///
-/// For `m == 1` we then apply the size gate: route to the GPU only if the weight
-/// `k·n` clears [`GEMM_GPU_MIN_KN`] (env `KTIR_GEMM_GPU_MIN_KN`, 0 = always GPU);
-/// smaller decode GEMMs run on the interpreter's Accelerate K-loop, faster at
-/// that scale and golden-faithful (the per-node oracle uses the same path).
+/// The NAX-vs-AMX `k·n` threshold (env `KTIR_GEMM_GPU_MIN_KN`, else
+/// [`GEMM_GPU_MIN_KN`]). Read once per call by [`matmul_loop_offload`] /
+/// [`matmul_loop_use_nax`].
 #[cfg(metal)]
-pub fn gemm_loop_wants_gpu(m: usize, k: usize, n: usize) -> bool {
-    if m > 1 {
-        return true; // only the GPU reconstructs the full-M prefill GEMM correctly
-    }
-    let min_kn = std::env::var("KTIR_GEMM_GPU_MIN_KN")
+pub fn matmul_min_kn() -> u64 {
+    std::env::var("KTIR_GEMM_GPU_MIN_KN")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(GEMM_GPU_MIN_KN);
-    (k as u64) * (n as u64) >= min_kn
+        .unwrap_or(GEMM_GPU_MIN_KN)
 }
 
-/// Run a recognized matmul K-loop as ONE GPU GEMM, binding the loop's result
-/// tensor in `ctx`. Operands are resolved from the value table: a forwarded
-/// activation is already a resident `Tile` (f32) and is re-uploaded each pass; a
-/// constant weight is an HBM pointer decoded+uploaded ONCE and then served from
-/// the resident [`WEIGHT_CACHE`]. The interpreter then skips the loop body
-/// entirely. Returns `Err` if the GEMM can't run (no device, shape mismatch, or
-/// below the GPU work gate) so the caller falls back to the interpreter K-loop.
+/// Whether a recognized `m×k×n` K-loop should be OFFLOADED here as a full-M GEMM
+/// (on NAX or AMX — see [`matmul_loop_use_nax`]) rather than fall through to the
+/// interpreter running the loop's `scf.for`.
+///
+/// CORRECTNESS FIRST: the interpreter fallback runs the body at the fused
+/// segment's grid `[1,1]`, which reconstructs the GEMM ONLY when `m == 1` (decode):
+/// the Spyre SPMD K-loop tiles its output across the grid, so at `[1,1]` it
+/// computes exactly the single M-row grid position 0 owns. For `m > 1` (prefill,
+/// token-parallel M=8/M=32) the full-M reconstruction lives ONLY in the offload —
+/// the `[1,1]` loop would compute just row 0 and silently drop the rest (it broke
+/// prefill golden by ~0.05 in testing). So `m > 1` is ALWAYS offloaded here.
+///
+/// For `m == 1` we offload only when the weight `k·n` clears [`GEMM_GPU_MIN_KN`];
+/// smaller decode GEMMs run on the interpreter's tiled Accelerate K-loop (faster
+/// at that scale, and the per-node golden oracle uses the same path).
+#[cfg(metal)]
+pub fn matmul_loop_offload(m: usize, k: usize, n: usize) -> bool {
+    m > 1 || (k as u64) * (n as u64) >= matmul_min_kn()
+}
+
+/// Of the OFFLOADED full-M GEMMs ([`matmul_loop_offload`]), whether to run this one
+/// on NAX (`k·n` ≥ the gate) or AMX (below it). Both are full-M-correct and read
+/// the same resident operands; this only picks the faster engine for the shape.
+#[cfg(metal)]
+pub fn matmul_loop_use_nax(k: usize, n: usize) -> bool {
+    (k as u64) * (n as u64) >= matmul_min_kn()
+}
+
+/// Run a recognized matmul K-loop as ONE full-M GEMM (on NAX or AMX), binding the
+/// loop's result tensor in `ctx`. Operands are resolved from the value table: a
+/// forwarded activation is already a resident `Tile` (f32) and is re-uploaded each
+/// pass; a constant weight is an HBM pointer decoded+uploaded ONCE and then served
+/// from the resident [`WEIGHT_CACHE`]. The interpreter then skips the loop body
+/// entirely.
+///
+/// Backend ([`matmul_loop_use_nax`]): both branches compute the SAME full-M GEMM
+/// over the SAME resident host-visible f32 operands — large `k·n` runs on NAX (the
+/// dispatch amortizes), small `k·n` runs on AMX (`blas::sgemm_rowmajor`, no GPU
+/// dispatch, reads the resident buffers in place; this is what wins small-M prefill
+/// while staying resident). AMX is f32-multiply (NAX is f16-operand); both round to
+/// f16 at write-back, so golden parity holds and AMX is if anything more accurate.
+///
+/// Returns `Err` only when the loop should NOT be offloaded here (an `m == 1`
+/// decode GEMM below the gate — the caller's interpreter K-loop is correct and
+/// faster) or when a genuine resource is missing (no device, shape mismatch). For
+/// `m > 1` the caller MUST treat `Err` as fatal, never the row-0 interpreter loop.
 #[cfg(metal)]
 pub fn run_matmul_loop_gpu(
     info: &MatmulLoopInfo,
     ctx: &mut crate::context::CoreContext,
 ) -> Result<(), String> {
     let (m, k, n) = (info.m as usize, info.k as usize, info.n as usize);
-    // SIZE GATE: route only GEMMs whose weight (`k·n`) is big enough that the
-    // single GPU dispatch beats the interpreter's tiled Accelerate K-loop; smaller
-    // ones fall through (Err) to that K-loop, which is faster on tiny weights. See
-    // [`gemm_loop_wants_gpu`] / [`GEMM_GPU_MIN_KN`] for the calibration (it splits
-    // smollm2's small layer GEMMs from llama's large ones + both lm_heads).
-    if !gemm_loop_wants_gpu(m, k, n) {
-        return Err("metal: GEMM below the GPU work gate — interpreter K-loop".into());
+    // OFFLOAD GATE: an `m == 1` decode GEMM below the work gate falls through (Err)
+    // to the interpreter's tiled Accelerate K-loop, faster on tiny weights and
+    // golden-faithful at [1,1] (m==1). `m > 1` is ALWAYS offloaded full-M here.
+    if !matmul_loop_offload(m, k, n) {
+        return Err("metal: decode GEMM below the work gate — interpreter K-loop".into());
     }
+    // BACKEND: NAX if the weight is big enough to amortize the GPU dispatch, else
+    // AMX. Decided on `k·n` alone, so it's independent of M (both branches are
+    // full-M-correct). An `m == 1` GEMM that passed the gate above is by definition
+    // large, so decode never reaches the AMX branch — decode routing is unchanged.
+    let use_nax = matmul_loop_use_nax(k, n);
     let c = GEMM_ENGINE.with(|cell| -> Result<Vec<f32>, String> {
         let engine = cell.get_or_init(|| NaxGemm::new().ok());
         let engine = engine.as_ref().ok_or("metal: no NaxGemm device")?;
@@ -589,29 +626,43 @@ pub fn run_matmul_loop_gpu(
                 &info.b_root, k, n, info.n_off, info.b_stride, ctx, engine,
             )?
         };
-        let mut uc = engine.unified(m * n)?;
-        // `&ua`/`&ub` deref-coerce `Rc<UnifiedBuffer>` -> `&UnifiedBuffer`.
-        engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
-        let out = uc.as_slice().to_vec();
-        // Diagnostic: cross-check the GPU GEMM against a CPU sgemm on the SAME
-        // operands. A diff >> f16 noise pinpoints a NaxGemm shape bug (vs a
-        // recognizer/operand bug, which would leave GPU==CPU here).
+        let out = if use_nax {
+            let mut uc = engine.unified(m * n)?;
+            // `&ua`/`&ub` deref-coerce `Rc<UnifiedBuffer>` -> `&UnifiedBuffer`.
+            engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+            uc.as_slice().to_vec()
+        } else {
+            // AMX/Accelerate over the SAME resident f32 operands — full-M, no GPU
+            // dispatch, no per-pass re-decode (ua/ub are host-visible f32 already).
+            // matmul_unified's length asserts don't run on this path, so guard the
+            // operand sizes here (they're sized m*k / k*n by the upstream resolvers).
+            debug_assert_eq!(ua.as_slice().len(), m * k, "AMX A operand length");
+            debug_assert_eq!(ub.as_slice().len(), k * n, "AMX B operand length");
+            crate::blas::sgemm_rowmajor(m, k, n, ua.as_slice(), ub.as_slice())
+        };
+        // Diagnostic: cross-check the chosen backend against a CPU sgemm on the SAME
+        // operands. For NAX a diff >> f16 noise pinpoints a NaxGemm shape bug (vs a
+        // recognizer/operand bug, which would leave GPU==CPU here); for AMX it's the
+        // same primitive, so the diff is ~0 (a useful self-check that out is real).
         if std::env::var_os("KTIR_GEMM_CHECK").is_some() {
             let cpu = crate::blas::sgemm_rowmajor(m, k, n, ua.as_slice(), ub.as_slice());
             let d = out.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             if d > 0.05 {
-                eprintln!("  [gemm-check] m={m} k={k} n={n}  GPU vs CPU max diff {d:.4}");
+                let be = if use_nax { "NAX" } else { "AMX" };
+                eprintln!("  [gemm-check] m={m} k={k} n={n}  {be} vs CPU max diff {d:.4}");
             }
         }
         Ok(out)
     })?;
-    // The K-loop's result tensor is f16 (matmul outs dtype); NaxGemm computes in
-    // f16 internally, so this matches the interpreter's matmul precision.
+    // The K-loop's result tensor is f16 (matmul outs dtype); this f16 rounding at
+    // write-back is what keeps NAX and AMX golden-equivalent (both quantize the
+    // f32 result identically), matching the interpreter's matmul precision.
     let tile = crate::tile::Tile::compute(c, DType::F16, vec![m, n]);
     let bytes = tile.size_bytes() as i64;
     ctx.set_value(&info.out_ssa, crate::ir::Value::Tile(tile));
     ctx.track_lx(&info.out_ssa, bytes)?;
-    MATMUL_LOOP_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let counter = if use_nax { &MATMUL_LOOP_GPU_COUNT } else { &MATMUL_LOOP_AMX_COUNT };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -4904,6 +4955,33 @@ module {
             choose_matmul_backend("Intel UHD Graphics 630", 4096, 4096, 4096),
             Accelerate
         );
+    }
+
+    #[test]
+    fn matmul_loop_gate_and_backend() {
+        // Default 3M k·n threshold (env KTIR_GEMM_GPU_MIN_KN unset in test).
+        assert_eq!(matmul_min_kn(), GEMM_GPU_MIN_KN);
+
+        // OFFLOAD GATE (full-M offload here vs interpreter scf.for fallback):
+        //   m == 1 (decode): offload only if k·n clears the gate.
+        assert!(!matmul_loop_offload(1, 576, 576)); // small decode GEMM -> interpreter
+        assert!(matmul_loop_offload(1, 576, 49152)); // decode lm_head (28M) -> offload
+        //   m > 1 (prefill): ALWAYS offloaded full-M, regardless of k·n — never the
+        //   row-0 interpreter loop. THIS is what the AMX change relies on.
+        assert!(matmul_loop_offload(8, 576, 576)); // small prefill GEMM still offloads
+        assert!(matmul_loop_offload(32, 2048, 8192));
+
+        // BACKEND (of the offloaded GEMMs): NAX iff k·n >= gate, else AMX.
+        // smollm2 layer GEMMs (k·n 0.33M..0.88M) -> AMX (the win at M=8).
+        assert!(!matmul_loop_use_nax(576, 576)); // 0.33M
+        assert!(!matmul_loop_use_nax(576, 1536)); // 0.88M
+        assert!(!matmul_loop_use_nax(1536, 576)); // 0.88M down_proj
+        // llama layer GEMMs (4.2M..16.8M) + GQA split + both lm_heads.
+        assert!(matmul_loop_use_nax(2048, 2048)); // 4.2M -> NAX
+        assert!(matmul_loop_use_nax(2048, 8192)); // 16.8M -> NAX
+        assert!(!matmul_loop_use_nax(2048, 512)); // 1.05M GQA k/v -> AMX
+        assert!(matmul_loop_use_nax(576, 49152)); // smollm2 lm_head 28M -> NAX
+        assert!(matmul_loop_use_nax(2048, 128256)); // llama lm_head -> NAX
     }
 
     #[test]

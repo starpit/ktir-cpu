@@ -882,25 +882,29 @@ fn smollm2_135m_prefill_fused_matches_golden() {
     let golden_diff = fused.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert_eq!(finite, fused.len(), "all result elements finite");
     let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(Relaxed);
+    let amx = ktir_cpu::metal_backend::MATMUL_LOOP_AMX_COUNT.load(Relaxed);
     let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(Relaxed);
     eprintln!(
         "  SmolLM2-135M PREFILL SEGMENTED ({n_fused} fused segments + {n_native} native attn): \
          max abs diff {golden_diff:.5}"
     );
-    eprintln!("  prefill matmul K-loops offloaded to GPU GEMM: {gpu}");
+    eprintln!("  prefill K-loops offloaded full-M: {gpu} NAX + {amx} AMX = {}", gpu + amx);
     eprintln!("  prefill map windows offloaded to fused GPU kernel: {maps}");
-    // The fused [1,1] segments carry the GPU offloads (matmul-loop GEMM + map
-    // windows); the native attention nodes run at their [9,1] head-parallel grid
-    // via the lockstep NAX executor (shared-weight matmul combine where it
-    // applies; per-core for the head-distinct Q@K^T / softmax, which are tiny
-    // tensors where per-op GPU dispatch is a net loss — see comm_sched).
-    // SIZE-GATED offload: prefill is M=8, so most per-layer GEMMs clear the work
-    // gate and run on the GPU (the lm_head + the wider projections), while the
-    // smallest ones route to AMX — so we assert "many GEMMs on GPU" (the path is
-    // live and doing real work), not the old "all of them". The M=8 map windows
-    // (≤4608 elems) are below the map size gate, so they correctly stay on the
-    // interpreter (a net win at this scale), hence maps may be 0.
-    assert!(gpu >= 100, "expected most prefill K-loops on GPU segments, only {gpu} did");
+    // The fused [1,1] segments carry the GEMM offloads (NAX or AMX) + map windows;
+    // the native attention nodes run at their [9,1] head-parallel grid via the
+    // lockstep NAX executor (shared-weight matmul combine where it applies;
+    // per-core for the head-distinct Q@K^T / softmax, tiny tensors where per-op GPU
+    // dispatch is a net loss — see comm_sched).
+    // SIZE-GATED backend: smollm2's layer GEMMs (k·n ≤ 0.9M) run full-M on AMX
+    // (resident, no GPU dispatch — the win at M=8); only the lm_head (k·n=28M)
+    // clears the NAX gate. Both are full-M resident offloads, so we assert the TOTAL
+    // (NAX + AMX) is high — the path is live and every layer GEMM is offloaded, not
+    // run on the interpreter. The M=8 map windows (≤4608 elems) are below the map
+    // size gate, so they correctly stay on the interpreter (a net win), maps may be 0.
+    assert!(
+        gpu + amx >= 100,
+        "expected most prefill K-loops offloaded full-M, only {gpu} NAX + {amx} AMX did"
+    );
     let _ = maps;
 
     // AUTHORITATIVE GATE: the segmented + GPU-GEMM run must match golden.bin.
