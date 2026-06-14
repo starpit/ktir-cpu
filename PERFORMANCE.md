@@ -9,8 +9,11 @@ the two compute backends broken out:
   fused map-window MSL kernels for elementwise, and head-parallel attention via
   the segmented executor.
 
-The Python reference interpreter numbers are carried forward verbatim (they are
-current and are not re-run here).
+The Python reference interpreter numbers are measured by the same harnesses,
+re-run when bundles change. smollm2 (decode + prefill) runs faithfully in the
+2 MB LX; **llama has no faithful Python baseline** — the reference overflows the
+2 MB LX on llama and a cap-raised run is dominated by an O(n²) address-lookup
+artifact (see footnote ⁴ under the E2E table).
 
 ## Machine
 
@@ -38,6 +41,12 @@ cargo test --release -p ktir-cpu --features metal --test bench_amx_vs_metal \
     -- --ignored --nocapture --test-threads=1
 
 # --- E2E whole-model (ms/pass) ------------------------------------------------
+# Python reference (whole-model, per-node through the Python interpreter):
+BUNDLE=smollm2-135m         SMOLLM2_ITERS=5 uv run python bench_e2e_py_vs_rust.py
+BUNDLE=smollm2-135m-prefill SMOLLM2_ITERS=5 uv run python bench_e2e_py_vs_rust.py
+#   llama is NOT faithfully measurable in Python (overflows the 2 MB LX; a
+#   cap-raise — locally bump LXScratchpad's default size_mb in ktir_cpu/memory.py,
+#   uncommitted — runs but is O(n²)-inflated, so not recorded — see footnote ⁴).
 # per-node (the optimized interpreter, no whole-program fusion):
 MODEL=smollm2-135m         SMOLLM2_ITERS=40 cargo run  --release -p ktir-cpu --bench smollm2_bench --features metal
 MODEL=smollm2-135m-prefill SMOLLM2_ITERS=20 cargo run  --release -p ktir-cpu --bench smollm2_bench --features metal
@@ -122,14 +131,30 @@ per-pass weight re-marshal**.
 | Model / mode | Python | per-node | fused-AMX | fused-Metal | **RESIDENT** | resident vs best-prior | golden |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | smollm2-135m **decode** | 2397 | 704.9 | 245.5 | 252.8 | **129.1** | **1.9× faster** | 0.0014 |
-| smollm2-135m **prefill** (M=8) | — | 1271.8 | 679.4 | 813.6³ | **563.8** | **1.20× faster** | 0.0034 |
-| llama-3.2-1b **decode** | — | 3089.2 | 8717.2 | 40303.5 | **591.9** | **5.2× faster** | 0.0014 |
-| llama-3.2-1b **prefill** (M=32) | — | 29132.1 | 7976.8 | 6269.6³ | **3547.2** | **1.77× faster** | 0.0040 |
+| smollm2-135m **prefill** (M=8) | 12207 | 1271.8 | 679.4 | 813.6³ | **563.8** | **1.20× faster** | 0.0034 |
+| llama-3.2-1b **decode** | n/a⁴ | 3089.2 | 8717.2 | 40303.5 | **591.9** | **5.2× faster** | 0.0014 |
+| llama-3.2-1b **prefill** (M=32) | n/a⁴ | 29132.1 | 7976.8 | 6269.6³ | **3547.2** | **1.77× faster** | 0.0040 |
 
 RESIDENT is now the **fastest path on all four configs** — the size-gated AMX
 backend (below) closed the last gap (smollm2 prefill, which fused-AMX previously
 edged 679 vs 748) and also shaved llama prefill (3992→3547). "best-prior" =
 fastest of the three fresh-context paths for that row.
+
+⁴ The Python reference cannot faithfully run **llama**: its LX reclaim is
+  scope-level (frees a scf.for body at `pop_scope`), coarser than the Rust
+  interpreter's per-op `dies_at` reclaim, so a llama function body holds *all* its
+  intermediates and overflows the faithful 2 MB LX (it grows past 4 MB, monotonic).
+  Raising the cap lets it run, but the reference's LX address lookup
+  (`_find_allocation`) is a **linear scan**, so the now-large allocation dict makes
+  it O(n²) — a cap-raised llama decode measured ~143 s/pass, but that is dominated
+  by this artifact, not faithful interpreter compute, so it is **not recorded** (it
+  would understate the real Rust speedup, not overstate it). smollm2 fits in 2 MB,
+  so its Python numbers are clean. A faithful llama Python number would require
+  making `_find_allocation` O(1) (and ideally porting the per-op LX reclaim) in the
+  reference oracle — deferred, since that oracle backs the Python test suite. (To
+  reproduce the cap-raised — artifact-inflated — llama run, locally bump
+  `LXScratchpad.__init__`'s default `size_mb` in `ktir_cpu/memory.py` to e.g. 256;
+  this edit is intentionally NOT committed.)
 
 ³ fused-Metal prefill not re-measured with the size gates: prefill GEMMs are M>1
   (always-GPU) and its map windows clear the 16384-elem gate, so the gates leave
@@ -138,8 +163,10 @@ fastest of the three fresh-context paths for that row.
   tiny M=1 GEMMs route to AMX; llama 24918→40303, run-to-run noise — the gates
   cannot help llama decode, see below).
 
-E2E speedups vs Python (smollm2-135m decode, the only mode with a Python e2e
-number): per-node **3.4×**, fused-AMX **9.8×**, RESIDENT **18.6×**.
+E2E speedups vs Python (the two modes with a clean Python e2e number):
+smollm2 decode — per-node **3.4×**, fused-AMX **9.8×**, RESIDENT **18.6×**;
+smollm2 prefill — per-node **9.6×**, fused-AMX **18.0×**, RESIDENT **21.7×**.
+(llama has no faithful Python baseline — see ⁴.)
 
 **Residency is the architectural fix, not the backend.** The three fresh-context
 paths rebuild HBM and re-marshal every weight per pass — on llama-1B that is
@@ -222,9 +249,9 @@ llama configs were never run under Python — `—`):
 | Model/mode | Python | RESIDENT before | RESIDENT after | note |
 |---|---:|---:|---:|---|
 | smollm2-135m decode  | 2397 | 128.8 | 129.1 | unchanged; **18.6× vs Python** |
-| smollm2-135m prefill | — | 747.9 | **563.8** | 210/211 GEMMs → AMX; now beats fused-AMX 679 |
-| llama-3.2-1b decode  | — | 588.5 | 591.9 | unchanged (within noise) |
-| llama-3.2-1b prefill | — | 3991.9 | **3547.2** | GQA k/v projections → AMX |
+| smollm2-135m prefill | 12207 | 747.9 | **563.8** | 210/211 GEMMs → AMX; now beats fused-AMX 679 |
+| llama-3.2-1b decode  | n/a | 588.5 | 591.9 | unchanged (within noise) |
+| llama-3.2-1b prefill | n/a | 3991.9 | **3547.2** | GQA k/v projections → AMX |
 
 Headline: RESIDENT is now the **fastest path on all four configs**. Golden via
 `resident_matches_golden` stays < 0.05 (smollm2 prefill 0.0035→0.0034 better;
@@ -242,9 +269,9 @@ e2e exists only for smollm2 decode (`—` = never run under Python):
 | Model/mode | Python | per-node | fused-AMX | fused-Metal | **RESIDENT** |
 |---|---:|---:|---:|---:|---:|
 | smollm2-135m decode  | 2397 | 704.9 | 245.5 | 252.8 | **128.8** |
-| smollm2-135m prefill | — | 1271.8 | **679.4** | 813.6 | 747.9 |
-| llama-3.2-1b decode  | — | 3089.2 | 8717.2 | 40303.5 | **588.5** |
-| llama-3.2-1b prefill | — | 29132.1 | 7976.8 | 6269.6 | **3991.9** |
+| smollm2-135m prefill | 12207 | 1271.8 | **679.4** | 813.6 | 747.9 |
+| llama-3.2-1b decode  | n/a | 3089.2 | 8717.2 | 40303.5 | **588.5** |
+| llama-3.2-1b prefill | n/a | 29132.1 | 7976.8 | 6269.6 | **3991.9** |
 
 Headline: RESIDENT is fastest on 3 of 4 (within 9% on smollm2 prefill). The
 llama-1B decode regression — the old fused-Metal's per-pass ~2 GB weight marshal,
@@ -264,9 +291,9 @@ for smollm2 decode (`—` = never run under Python):
 | Model/mode | Python | per-node | fused-AMX | fused-Metal |
 |---|---:|---:|---:|---:|
 | smollm2-135m decode  | 2397 | 704.9 | 245.5 | 418.6 |
-| smollm2-135m prefill | — | 1271.8 | 679.4 | 813.6 |
-| llama-3.2-1b decode  | — | 3089.2 | 8717.2 | 24918.4 |
-| llama-3.2-1b prefill | — | 29132.1 | 7976.8 | **6269.6** |
+| smollm2-135m prefill | 12207 | 1271.8 | 679.4 | 813.6 |
+| llama-3.2-1b decode  | n/a | 3089.2 | 8717.2 | 24918.4 |
+| llama-3.2-1b prefill | n/a | 29132.1 | 7976.8 | **6269.6** |
 
 Headline: fused-Metal wins on llama-1B prefill (1.27× vs fused-AMX); AMX wins on
 all decode and on small-model prefill (GPU dispatch-bound at M=1 / small M).
