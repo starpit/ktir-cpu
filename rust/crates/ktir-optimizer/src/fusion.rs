@@ -52,6 +52,217 @@ pub struct ProgramSpec {
     pub results: HashSet<u64>,
 }
 
+/// One execution unit produced by [`plan_segments`]: either a fused run of
+/// consecutive non-attention nodes (run once at grid `[1,1]`, with intra-segment
+/// HBM edges forwarded as SSA) or a single attention node kept verbatim so the
+/// executor runs it across its NATIVE head-parallel grid.
+///
+/// Why the split: an attention node selects its head with
+/// `ktdp.get_compute_tile_id` against a grid like `[32,1]`/`[9,1]`. Collapsed
+/// into a single `[1,1]` function that primitive returns 0, so only head 0's
+/// slice is computed — the rest of the output rows stay whatever the input was.
+/// Running that node SEPARATELY at its native grid drives every head's core
+/// (the per-node multi-core SPMD path, verified correct), and threading the
+/// inter-segment tensors through HBM stitches the segments back together in
+/// program order.
+#[derive(Clone, Debug)]
+pub enum Segment {
+    /// A fused function over a maximal run of consecutive non-attention nodes.
+    /// Its `func.grid` is `[1,1]`; the GPU GEMM reconstruction handles the
+    /// token-parallel (`[8,1]`) matmul nodes folded in here by ignoring the SPMD
+    /// grid and rebuilding the whole GEMM. Pointer args are named `%t<id>_ptr`.
+    Fused(FusedSegment),
+    /// A single attention node, run at its native multi-core grid. The
+    /// `bindings` carry the original arg→tensor mapping the executor marshals.
+    Native(NodeSpec),
+}
+
+/// A fused segment: the fused `[1,1]` function plus, for each pointer arg, the
+/// tensor id it binds and whether the segment WRITES it (a boundary output the
+/// caller must copy forward) or only READS it (a source / boundary input the
+/// caller must already have resident). The runner marshals from this directly
+/// instead of guessing direction from buffer presence.
+#[derive(Clone, Debug)]
+pub struct FusedSegment {
+    pub func: IRFunction,
+    /// Pointer-arg tensor ids written by this segment (boundary outputs).
+    pub outputs: HashSet<u64>,
+    /// Pointer-arg tensor ids only read by this segment (sources / inputs).
+    pub inputs: HashSet<u64>,
+}
+
+/// True when `func` is a head-parallel ATTENTION node that must run at its native
+/// grid (NOT be collapsed into a single-grid fused function).
+///
+/// Discriminator: a non-trivial grid (`> [1,1]`, so it has per-core heads) PLUS
+/// the attention op signature — a `linalg.transpose` (the K transpose) and the
+/// softmax `linalg.reduce { arith.maximumf }`. The signature excludes the
+/// `[8,1]` token-parallel pure-matmul nodes (matmul but no transpose/softmax),
+/// which the GPU GEMM reconstruction already runs correctly at grid `[1,1]`. In
+/// DECODE the attention nodes are themselves grid `[1,1]` (single token), so the
+/// grid clause keeps them fused (decode is correct single-grid).
+pub fn is_attention_node(func: &IRFunction) -> bool {
+    let (gx, gy, gz) = func.grid;
+    if gx * gy * gz <= 1 {
+        return false;
+    }
+    let mut has_transpose = false;
+    let mut has_softmax_reduce = false;
+    fn scan(ops: &[Operation], has_transpose: &mut bool, has_softmax_reduce: &mut bool) {
+        for op in ops {
+            if op.op_type == "linalg.transpose" {
+                *has_transpose = true;
+            }
+            // The softmax max-reduce: a `linalg.reduce` whose combiner is
+            // `arith.maximumf`. The parser lifts the `{ arith.maximumf }`
+            // shorthand into a `reduce_fn` attribute; the explicit form keeps
+            // the combiner as a region op. Match either.
+            if op.op_type == "linalg.reduce"
+                && (matches!(op.attributes.get("reduce_fn"), Some(Attr::Str(s)) if s == "arith.maximumf")
+                    || region_has_op(&op.regions, "arith.maximumf"))
+            {
+                *has_softmax_reduce = true;
+            }
+            for rg in &op.regions {
+                scan(rg, has_transpose, has_softmax_reduce);
+            }
+        }
+    }
+    scan(&func.operations, &mut has_transpose, &mut has_softmax_reduce);
+    has_transpose && has_softmax_reduce
+}
+
+/// Recover the tensor id from a fused pointer-arg name `%t<id>_ptr`.
+fn tensor_id_of_arg(arg: &str) -> u64 {
+    arg.trim_start_matches('%')
+        .trim_start_matches('t')
+        .trim_end_matches("_ptr")
+        .parse()
+        .unwrap_or_else(|_| panic!("unexpected fused arg name {arg:?}"))
+}
+
+/// True if any op at any region depth in `regions` has `op_type`.
+fn region_has_op(regions: &[Vec<Operation>], op_type: &str) -> bool {
+    regions.iter().any(|rg| {
+        rg.iter()
+            .any(|op| op.op_type == op_type || region_has_op(&op.regions, op_type))
+    })
+}
+
+/// Partition `spec` into ordered execution segments: maximal runs of consecutive
+/// non-attention nodes fused into one `[1,1]` function each, with every
+/// attention node kept as its own [`Segment::Native`] to run at its native grid.
+///
+/// Each fused segment is fused with a segment-LOCAL `ProgramSpec` whose
+/// `sources`/`results` are widened to pin every tensor that crosses the
+/// segment's boundary (read from another segment / a true source, or written
+/// for another segment / a true result) as an HBM pointer arg. Only edges
+/// internal to the run forward as SSA / `extract_slice`; boundary edges stay HBM
+/// so the caller can thread them between segments and the native attention nodes.
+///
+/// The returned segments execute in order; the caller marshals one HBM buffer
+/// per tensor id, runs each segment (fused via the interpreter at `[1,1]`,
+/// native at its grid), and copies every output buffer forward — exactly the
+/// proven per-node threading, just with non-attention runs collapsed.
+pub fn plan_segments(module: &IRModule, spec: &ProgramSpec) -> Result<Vec<Segment>, String> {
+    // Per-node attention classification.
+    let attn: Vec<bool> = spec
+        .nodes
+        .iter()
+        .map(|n| module.get_function(&n.func).map(is_attention_node))
+        .collect::<Result<_, _>>()?;
+
+    // For widening segment-local sources/results: which node indices produce /
+    // consume each tensor, across the WHOLE program.
+    let mut produced_at: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut consumed_at: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, node) in spec.nodes.iter().enumerate() {
+        for b in &node.bindings {
+            if b.is_output {
+                produced_at.entry(b.tensor).or_default().push(i);
+            } else {
+                consumed_at.entry(b.tensor).or_default().push(i);
+            }
+        }
+    }
+
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut i = 0;
+    while i < spec.nodes.len() {
+        if attn[i] {
+            segments.push(Segment::Native(spec.nodes[i].clone()));
+            i += 1;
+            continue;
+        }
+        // Maximal run [start, j) of consecutive non-attention nodes.
+        let start = i;
+        let mut j = i;
+        while j < spec.nodes.len() && !attn[j] {
+            j += 1;
+        }
+        let run = start..j;
+        let in_run = |k: usize| run.contains(&k);
+
+        // Segment-local sources/results: widen so any boundary-crossing edge
+        // stays an HBM pointer (never forwarded as SSA across a segment break).
+        let mut seg_sources: HashSet<u64> = HashSet::new();
+        let mut seg_results: HashSet<u64> = HashSet::new();
+        for k in run.clone() {
+            for b in &spec.nodes[k].bindings {
+                if b.is_output {
+                    let consumed_outside = consumed_at
+                        .get(&b.tensor)
+                        .is_some_and(|cs| cs.iter().any(|&c| !in_run(c)));
+                    if spec.results.contains(&b.tensor) || consumed_outside {
+                        seg_results.insert(b.tensor);
+                    }
+                } else {
+                    let produced_outside = produced_at
+                        .get(&b.tensor)
+                        .is_some_and(|ps| ps.iter().any(|&p| !in_run(p)));
+                    if spec.sources.contains(&b.tensor) || produced_outside {
+                        seg_sources.insert(b.tensor);
+                    }
+                }
+            }
+        }
+        let seg_spec = ProgramSpec {
+            nodes: spec.nodes[run.clone()].to_vec(),
+            sources: seg_sources.clone(),
+            results: seg_results.clone(),
+        };
+        let mut func = fuse_program(module, &seg_spec)?;
+        // Force the fused segment to grid [1,1] (single core). `fuse_program`
+        // stamps the grid from the run's FIRST node, which can be a token-parallel
+        // [8,1] matmul node — but the whole point of folding those in is that the
+        // GPU GEMM reconstruction (and the single-core K-loop offload it rides on)
+        // rebuilds the full M at grid [1,1], ignoring the Spyre SPMD grid. A
+        // residual [8,1] grid would (a) re-tile the GEMM across cores so the
+        // single-core offload never fires, and (b) make each core recompute the
+        // whole reconstructed GEMM. Collapsing to [1,1] is the correct + fast path.
+        func.grid = (1, 1, 1);
+        // Classify the fused function's surviving pointer args by direction
+        // against the boundary sets. A `%t<id>_ptr` is a boundary OUTPUT iff
+        // `id ∈ seg_results`, a boundary INPUT iff `id ∈ seg_sources`. Anything
+        // else is an INTERNAL SCRATCH arg — an intra-segment edge fusion could
+        // NOT forward as SSA, kept as resident HBM the fused fn writes then reads
+        // in its own body; the runner zero-inits it and never threads it.
+        let mut outputs: HashSet<u64> = HashSet::new();
+        let mut inputs: HashSet<u64> = HashSet::new();
+        for (arg, _) in &func.arguments {
+            let id = tensor_id_of_arg(arg);
+            if seg_results.contains(&id) {
+                outputs.insert(id);
+            } else if seg_sources.contains(&id) {
+                inputs.insert(id);
+            }
+        }
+        segments.push(Segment::Fused(FusedSegment { func, outputs, inputs }));
+        i = j;
+    }
+    Ok(segments)
+}
+
 /// Fuse `spec`'s nodes (functions in `module`) into a single `IRFunction`.
 ///
 /// The fused function's args are the source + result tensor pointers (one per
@@ -798,5 +1009,160 @@ mod tests {
             .filter_map(|o| o.result.as_deref())
             .collect();
         assert_eq!(exps, vec!["%n0_y", "%n1_y"], "node-prefixed, no collision");
+    }
+
+    // --- partial fusion: segment plan keeps attention nodes native ----------
+
+    /// A head-parallel attention node: a multi-head grid plus the attention op
+    /// signature (a `linalg.transpose` and the softmax `linalg.reduce {
+    /// arith.maximumf }`). Reads `in_arg`, writes `out_arg`. Mirrors the model's
+    /// `get_compute_tile_id` head select; the body is just enough to trip the
+    /// detector.
+    fn attn_node(name: &str, in_arg: &str, out_arg: &str, heads: usize) -> IRFunction {
+        IRFunction {
+            name: name.to_string(),
+            arguments: vec![
+                (in_arg.to_string(), "index".into()),
+                (out_arg.to_string(), "index".into()),
+            ],
+            grid: (heads, 1, 1),
+            return_type: None,
+            operations: vec![
+                Operation::new(Some("%hpid"), "ktdp.get_compute_tile_id", &[]),
+                Operation::new(Some("%vin"), "ktdp.construct_memory_view", &[in_arg])
+                    .with_attr("shape", Attr::IntList(vec![16]))
+                    .with_attr("dtype", Attr::Str("f16".into())),
+                Operation::new(Some("%tin"), "ktdp.construct_access_tile", &["%vin"])
+                    .with_attr("shape", Attr::IntList(vec![16])),
+                Operation::new(Some("%loaded"), "ktdp.load", &["%tin"]),
+                Operation::new(Some("%kt"), "linalg.transpose", &["%loaded"]),
+                Operation::new(Some("%mx"), "linalg.reduce", &["%kt"])
+                    .with_attr("reduce_fn", Attr::Str("arith.maximumf".into())),
+                Operation::new(Some("%vout"), "ktdp.construct_memory_view", &[out_arg])
+                    .with_attr("shape", Attr::IntList(vec![16]))
+                    .with_attr("dtype", Attr::Str("f16".into())),
+                Operation::new(Some("%tout"), "ktdp.construct_access_tile", &["%vout"])
+                    .with_attr("shape", Attr::IntList(vec![16])),
+                Operation::new(None, "ktdp.store", &["%mx", "%tout"]),
+                Operation::new(None, "func.return", &[]),
+            ],
+        }
+    }
+
+    /// A token-parallel matmul node: a multi-core grid but NO transpose/softmax —
+    /// the GPU GEMM reconstruction runs it correctly at grid [1,1], so it must
+    /// NOT be treated as attention.
+    fn matmul_node(name: &str, in_arg: &str, out_arg: &str, cores: usize) -> IRFunction {
+        let mut f = copy_node(name, in_arg, out_arg, 16, true);
+        f.grid = (cores, 1, 1);
+        f.operations.insert(0, Operation::new(Some("%pid"), "ktdp.get_compute_tile_id", &[]));
+        // Replace the math.exp with a linalg.matmul-shaped op (no softmax).
+        for op in &mut f.operations {
+            if op.op_type == "math.exp" {
+                op.op_type = "linalg.matmul".to_string();
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn detects_head_parallel_attention_node() {
+        // Multi-head grid + transpose + softmax reduce = attention.
+        assert!(is_attention_node(&attn_node("a", "%in", "%out", 9)));
+        // Multi-core matmul (no transpose/softmax) = NOT attention.
+        assert!(!is_attention_node(&matmul_node("m", "%in", "%out", 8)));
+        // Plain elementwise copy at grid [1,1] = NOT attention.
+        assert!(!is_attention_node(&copy_node("c", "%in", "%out", 16, true)));
+        // Even WITH the attention op signature, a [1,1] grid (decode attention,
+        // single token) stays fused — grid clause gates it out.
+        let mut decode_attn = attn_node("d", "%in", "%out", 1);
+        decode_attn.grid = (1, 1, 1);
+        assert!(!is_attention_node(&decode_attn));
+    }
+
+    /// Program: src(1) -[copy a]-> t(2) -[attn b]-> t(3) -[copy c]-> result(4).
+    /// The attention node sits between two non-attention nodes.
+    fn three_node_attn_spec() -> ProgramSpec {
+        ProgramSpec {
+            nodes: vec![
+                NodeSpec {
+                    func: "a".into(),
+                    bindings: vec![
+                        Binding { arg: "%in".into(), tensor: 1, is_output: false },
+                        Binding { arg: "%out".into(), tensor: 2, is_output: true },
+                    ],
+                },
+                NodeSpec {
+                    func: "b".into(),
+                    bindings: vec![
+                        Binding { arg: "%in".into(), tensor: 2, is_output: false },
+                        Binding { arg: "%out".into(), tensor: 3, is_output: true },
+                    ],
+                },
+                NodeSpec {
+                    func: "c".into(),
+                    bindings: vec![
+                        Binding { arg: "%in".into(), tensor: 3, is_output: false },
+                        Binding { arg: "%out".into(), tensor: 4, is_output: true },
+                    ],
+                },
+            ],
+            sources: HashSet::from([1]),
+            results: HashSet::from([4]),
+        }
+    }
+
+    #[test]
+    fn plan_isolates_attention_into_native_segment() {
+        let m = module(vec![
+            copy_node("a", "%in", "%out", 16, true),
+            attn_node("b", "%in", "%out", 9),
+            copy_node("c", "%in", "%out", 16, true),
+        ]);
+        let segs = plan_segments(&m, &three_node_attn_spec()).unwrap();
+        // Three segments: [fused a], [native b], [fused c].
+        assert_eq!(segs.len(), 3, "one fused segment per non-attention run + native attn");
+        assert!(matches!(segs[0], Segment::Fused(_)), "node a fused");
+        match &segs[1] {
+            Segment::Native(n) => assert_eq!(n.func, "b", "attention node b stays native"),
+            _ => panic!("expected native attention segment"),
+        }
+        assert!(matches!(segs[2], Segment::Fused(_)), "node c fused");
+
+        // The boundary edges (t2 into attn, t3 out of attn) must remain HBM
+        // pointer args on the adjacent fused segments — NOT forwarded as SSA.
+        let Segment::Fused(seg_a) = &segs[0] else { unreachable!() };
+        let a_args: Vec<&str> = seg_a.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(a_args.contains(&"%t2_ptr"), "t2 stays HBM out of segment a: {a_args:?}");
+        // t2 is a's boundary OUTPUT (consumed by the native attn node).
+        assert!(seg_a.outputs.contains(&2), "t2 classified as segment a output");
+        assert!(seg_a.inputs.contains(&1), "t1 classified as segment a input");
+        let Segment::Fused(seg_c) = &segs[2] else { unreachable!() };
+        let c_args: Vec<&str> = seg_c.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(c_args.contains(&"%t3_ptr"), "t3 stays HBM into segment c: {c_args:?}");
+        // t3 is c's boundary INPUT (produced by the native attn node); t4 output.
+        assert!(seg_c.inputs.contains(&3), "t3 classified as segment c input");
+        assert!(seg_c.outputs.contains(&4), "t4 classified as segment c output");
+        // Each fused segment still keeps its own load/store (no cross-segment
+        // SSA forwarding); the attention output round-trips HBM.
+        assert!(seg_c.func.grid == (1, 1, 1), "fused segment runs at grid [1,1]");
+    }
+
+    #[test]
+    fn consecutive_non_attention_nodes_fuse_into_one_segment() {
+        // a -> b -> c all non-attention: a single fused segment, with the
+        // intermediate edges forwarded as SSA (no t2/t3 HBM pointers).
+        let m = module(vec![
+            copy_node("a", "%in", "%out", 16, true),
+            copy_node("b", "%in", "%out", 16, true),
+            copy_node("c", "%in", "%out", 16, true),
+        ]);
+        let segs = plan_segments(&m, &three_node_attn_spec()).unwrap();
+        assert_eq!(segs.len(), 1, "one fused segment for the whole non-attention run");
+        let Segment::Fused(seg) = &segs[0] else { panic!("expected fused") };
+        let args: Vec<&str> = seg.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
+        // Only the true source (t1) and result (t4) survive as HBM pointers; the
+        // intra-segment edges t2/t3 forward as SSA.
+        assert_eq!(args, vec!["%t1_ptr", "%t4_ptr"], "intra-run edges forwarded: {args:?}");
     }
 }

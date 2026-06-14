@@ -265,6 +265,30 @@ The kernel optimizer would need to annotate `ktdp.load` with a
 participating-core group attribute so the latency calculator can account for
 the shared transaction cost. This is a future design question.
 
+### K4. Head-parallel attention under whole-program fusion
+
+**Status**: ✅ Fixed (partial fusion in `ktir_optimizer::fusion::plan_segments`).
+
+Whole-program function fusion (`fuse_program`) collapses a multi-node KTIR
+program into ONE function and stamps that function's grid from the first node
+(`[1,1]`). Head-parallel ATTENTION nodes select their head with
+`ktdp.get_compute_tile_id` against a multi-head grid (`[32,1]` for Llama-3.2-1B,
+`[9,1]` for SmolLM2-135M); at the collapsed `[1,1]` grid that primitive returns
+0, so only head 0's slice was computed and the prefill result diverged from
+golden (Llama-1B prefill 0.0598, over the 0.05 gate).
+
+`plan_segments` does PARTIAL fusion: it leaves each attention node (detected by
+a non-trivial grid PLUS the attention op signature — a `linalg.transpose` and
+the softmax `linalg.reduce { arith.maximumf }`) as a standalone segment run at
+its NATIVE multi-core grid (the proven-correct per-node SPMD path), and fuses
+each maximal run of consecutive non-attention nodes into a single `[1,1]`
+function, threading intermediates through HBM between segments in program order.
+The fused segments keep all GPU offloads (matmul-loop GEMM, map-window fusion,
+weight cache); the segment grid is forced to `[1,1]` so the token-parallel
+`[8,1]` matmul nodes folded in collapse to one reconstructed GEMM (the
+single-core K-loop offload). Result: Llama-1B prefill 0.00326, SmolLM2-135M
+prefill 0.00348 (both matching the per-node oracle ~0.003), decode unchanged.
+
 ### Suggested Execution Order
 
 If we want the fastest path to meaningful conformance progress:
