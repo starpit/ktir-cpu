@@ -121,6 +121,19 @@ one big GEMM instead of a tiled SPMD K-loop).
 
 ### E2E whole-model (ms/pass; lower is better)
 
+**Bottom line — Python reference vs the production Rust path (RESIDENT Metal):**
+
+| Model / mode | Python | Rust (RESIDENT) | Speedup | golden |
+|---|---:|---:|---:|---:|
+| smollm2-135m **decode** | 2,397 | 129.1 | **18.6×** | 0.0014 |
+| smollm2-135m **prefill** (M=8) | 12,207 | 563.8 | **21.7×** | 0.0034 |
+| llama-3.2-1b **decode** | 132,977 | 591.9 | **225×** | 0.0014 |
+| llama-3.2-1b **prefill** (M=32) | 1,019,096 | 3,547.2 | **287×** | 0.0040 |
+
+RESIDENT is the fastest Rust path on all four configs; golden = max-abs vs
+golden.bin (gate 0.05). The full per-path breakdown (per-node / fused-AMX /
+fused-Metal / RESIDENT) follows.
+
 Four Rust paths. The first three build a **fresh** memory hierarchy per pass:
 **per-node** (optimized interpreter, no whole-program fusion), **fused-AMX**
 (segmented executor, GPU offloads OFF), **fused-Metal** (segmented executor, GPU
