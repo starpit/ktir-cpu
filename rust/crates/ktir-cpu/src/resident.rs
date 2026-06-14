@@ -119,8 +119,10 @@ fn derive_shapes(module: &IRModule, spec: &ProgramSpec) -> Result<HashMap<u64, V
 /// Build once with [`ResidentExecutor::new`], write the source weights once with
 /// [`ResidentExecutor::set_source`] (or [`ResidentExecutor::set_sources`]), then
 /// call [`ResidentExecutor::run`] per pass. Weights are NEVER re-marshaled.
-pub struct ResidentExecutor<'m> {
-    module: &'m IRModule,
+pub struct ResidentExecutor {
+    /// OWNED (not borrowed) so the executor holds its ENTIRE `Rc` graph
+    /// exclusively — see the `unsafe impl Send` below.
+    module: IRModule,
     segments: Vec<Segment>,
     shapes: HashMap<u64, Vec<usize>>,
     /// The one persistent HBM (and per-core LX). Sticks are allocated once and
@@ -141,14 +143,29 @@ pub struct ResidentExecutor<'m> {
     dtype: DType,
 }
 
-impl<'m> ResidentExecutor<'m> {
+// SAFETY: `ResidentExecutor` owns its ENTIRE object graph exclusively. The
+// `IRModule` (with its `Rc<AffineExpr>`s) is moved in and never shared; the
+// `SpyreMemoryHierarchy`'s `Rc<RefCell<..>>`s are created and held only here; the
+// per-core contexts that clone those `Rc`s during `run()` are created AND dropped
+// inside that one call, on the calling thread. No `Rc` clone of any of these
+// allocations ever exists outside the executor, so moving the whole executor to
+// another thread transfers every `Rc` together — no non-atomic refcount is ever
+// touched from two threads at once. We impl `Send` (move between threads) but
+// deliberately NOT `Sync`: the executor is internally single-threaded
+// (`Rc`/`RefCell`) and must never be shared by `&` across threads. A serving
+// worker owns one and calls `run()` serially — exactly this contract. (This is
+// why the module is OWNED, not borrowed: a borrowed `&IRModule` shared by two
+// executors on two threads could race its `Rc<AffineExpr>` refcounts.)
+unsafe impl Send for ResidentExecutor {}
+
+impl ResidentExecutor {
     /// Plan `spec` into segments, derive every tensor's shape from the IR, and
     /// allocate ONE persistent HBM stick per tensor (stable address across
     /// passes). Sources are not yet written — call [`set_source`](Self::set_source)
     /// / [`set_sources`](Self::set_sources) before [`run`](Self::run).
-    pub fn new(module: &'m IRModule, spec: &ProgramSpec) -> Result<Self, String> {
-        let segments = plan_segments(module, spec)?;
-        let shapes = derive_shapes(module, spec)?;
+    pub fn new(module: IRModule, spec: &ProgramSpec) -> Result<Self, String> {
+        let segments = plan_segments(&module, spec)?;
+        let shapes = derive_shapes(&module, spec)?;
         let dtype = DType::F16;
         let bpe = dtype.bytes_per_elem();
 
@@ -176,7 +193,7 @@ impl<'m> ResidentExecutor<'m> {
             ids.insert(r);
         }
 
-        let mem = SpyreMemoryHierarchy::new(largest_grid(module, &segments));
+        let mem = SpyreMemoryHierarchy::new(largest_grid(&module, &segments));
         let mut stick: HashMap<u64, i64> = HashMap::new();
         let mut numel: HashMap<u64, usize> = HashMap::new();
         {
@@ -444,7 +461,7 @@ fn arg_to_f32(arg: &Arg) -> Result<Vec<f32>, String> {
 /// / bare `<id>`); `outputs` names the tensors to return (empty = the program's
 /// declared results). The returned map is keyed by `t<id>`.
 pub fn execute_resident(
-    module: &IRModule,
+    module: IRModule,
     spec: &ProgramSpec,
     args: &[(&str, Arg)],
     outputs: &[&str],

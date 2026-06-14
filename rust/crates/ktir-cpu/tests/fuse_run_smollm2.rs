@@ -297,7 +297,7 @@ fn run_resident_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
     let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
 
     let result_key = format!("t{}", b.result_id);
-    let mut exec = ktir_cpu::resident::ResidentExecutor::new(&b.module, &b.spec)
+    let mut exec = ktir_cpu::resident::ResidentExecutor::new(b.module, &b.spec)
         .expect("build resident executor");
     exec.set_sources(&args).expect("marshal weights once");
     let out = exec.run(&[&result_key]).expect("resident run");
@@ -350,7 +350,7 @@ fn resident_mspass() {
 
     // Build the executor + upload weights ONCE — outside the timed loop. This is
     // the resident contract: the multi-pass loop re-uploads NOTHING.
-    let mut exec = ktir_cpu::resident::ResidentExecutor::new(&b.module, &b.spec)
+    let mut exec = ktir_cpu::resident::ResidentExecutor::new(b.module, &b.spec)
         .expect("build resident executor");
     exec.set_sources(&args).expect("marshal weights once");
 

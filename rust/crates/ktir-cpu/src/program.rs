@@ -73,26 +73,29 @@ pub fn execute(
 /// the changing source tensors (the next token's input activation, the updated
 /// attention mask) with [`set_sources`](Session::set_sources).
 ///
-/// Build the module once with [`module_from_nodes`] and keep it alive for the
-/// session's lifetime:
+/// The session OWNS its module (moved in), so it owns its entire object graph and
+/// is therefore `Send` — a serving worker can store it and move it between threads
+/// (it is single-threaded internally, so NOT `Sync`: don't share one by `&` across
+/// threads; run it serially). Build the module with [`module_from_nodes`] and move
+/// it in:
 /// ```ignore
 /// let module = program::module_from_nodes(&node_mlir)?;
-/// let mut sess = program::Session::new(&module, &spec, &weights)?;
+/// let mut sess = program::Session::new(module, &spec, &weights)?;  // module moved in
 /// loop {
 ///     sess.set_sources(&[("t0", next_input), ("t_mask", mask)])?;
 ///     let out = sess.run(&["t_result"])?;
 /// }
 /// ```
-pub struct Session<'m> {
-    exec: crate::resident::ResidentExecutor<'m>,
+pub struct Session {
+    exec: crate::resident::ResidentExecutor,
 }
 
-impl<'m> Session<'m> {
-    /// Build the session. `module` (from [`module_from_nodes`]) must outlive it.
+impl Session {
+    /// Build the session, taking OWNERSHIP of `module` (from [`module_from_nodes`]).
     /// `weights` is the full initial source set (weights + mask + first input);
     /// it is uploaded to resident HBM once here.
     pub fn new(
-        module: &'m IRModule,
+        module: IRModule,
         spec: &ProgramSpec,
         weights: &[(&str, Arg)],
     ) -> Result<Self, String> {
@@ -110,5 +113,20 @@ impl<'m> Session<'m> {
     /// Run one forward pass and read back `outputs` (empty = the program results).
     pub fn run(&mut self, outputs: &[&str]) -> Result<HashMap<String, Output>, String> {
         self.exec.run(outputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Locks in the `unsafe impl Send for ResidentExecutor` contract: a serving
+    // worker needs `Session: Send`. If a future change reintroduces a borrow or a
+    // non-Send field, this stops compiling instead of silently regressing.
+    #[test]
+    fn session_and_executor_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Session>();
+        assert_send::<crate::resident::ResidentExecutor>();
     }
 }
