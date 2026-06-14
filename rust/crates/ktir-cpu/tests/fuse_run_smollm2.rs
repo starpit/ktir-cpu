@@ -1127,3 +1127,62 @@ fn llama_3_2_1b_gpu_vs_cpu_mspass() {
         );
     }
 }
+
+/// TURNKEY entrypoint smoke test: drive the whole program through
+/// `ktir_cpu::program::execute` (per-node MLIR + ProgramSpec -> one optimized
+/// run) and check it matches golden. Proves `module_from_nodes` merges the
+/// per-node functions into one module that the optimized path runs correctly —
+/// the single-call path scratchy would use instead of looping execute_function.
+#[cfg(metal)]
+#[test]
+#[ignore = "turnkey program::execute smoke; needs the smollm2 bundle. --ignored --nocapture"]
+fn program_execute_matches_golden() {
+    let Some(dir) = bundle_dir() else {
+        eprintln!("SmolLM2 bundle absent — skipping");
+        return;
+    };
+    let b = load_bundle(&dir);
+    // The turnkey entrypoint takes the per-node MLIR as &[&str].
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    let texts: Vec<String> = manifest["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| std::fs::read_to_string(dir.join(n["mlir"].as_str().unwrap())).unwrap())
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+    // Source args from t<id>.bin (+ zeroed attn mask) — same as run_segmented_result.
+    let mut owned: Vec<(String, Arg)> = Vec::new();
+    for (&id, &(rows, cols, is_src)) in &b.shape {
+        if is_src && Some(id) != b.mask_id {
+            owned.push((
+                format!("t{id}"),
+                Arg::Tensor {
+                    data: read_f32(&dir.join(format!("t{id}.bin"))),
+                    shape: vec![rows, cols],
+                    dtype: DType::F16,
+                },
+            ));
+        }
+    }
+    if let Some(m) = b.mask_id {
+        let (rows, cols, _) = b.shape[&m];
+        owned.push((
+            format!("t{m}"),
+            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+        ));
+    }
+    let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let result_key = format!("t{}", b.result_id);
+
+    let out = ktir_cpu::program::execute(&refs, &b.spec, &args, &[&result_key])
+        .expect("program::execute");
+    let result = &out[&result_key].data;
+    let golden = read_f32(&dir.join("golden.bin"));
+    assert_eq!(result.len(), golden.len(), "result length");
+    let diff = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    eprintln!("  program::execute ({} nodes) vs golden: max abs diff {diff:.5}", refs.len());
+    assert!(diff < 0.05, "turnkey program::execute diverges from golden by {diff}");
+}

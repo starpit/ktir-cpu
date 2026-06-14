@@ -50,3 +50,6 @@ pub mod ops_memory;
 pub mod resident;
 #[cfg(feature = "optimizer")]
 pub mod segmented;
+// Turnkey entrypoints (program::execute / Session) over the fused + resident path.
+#[cfg(feature = "optimizer")]
+pub mod program;
