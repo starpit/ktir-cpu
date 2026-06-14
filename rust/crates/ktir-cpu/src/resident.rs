@@ -176,7 +176,7 @@ impl<'m> ResidentExecutor<'m> {
             ids.insert(r);
         }
 
-        let mut mem = SpyreMemoryHierarchy::new(largest_grid(module, &segments));
+        let mem = SpyreMemoryHierarchy::new(largest_grid(module, &segments));
         let mut stick: HashMap<u64, i64> = HashMap::new();
         let mut numel: HashMap<u64, usize> = HashMap::new();
         {

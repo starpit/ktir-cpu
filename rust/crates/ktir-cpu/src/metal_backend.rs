@@ -519,6 +519,7 @@ pub fn clear_weight_cache() {
 ///   * smollm2 layer GEMMs: `k·n` ≈ 576·1536 .. 1536·1536 ≈ 0.9–2.4M  → AMX
 ///   * llama  layer GEMMs: `k·n` ≈ 2048·2048 .. 2048·8192 ≈ 4.2–16.8M → GPU
 ///   * both lm_heads:       `k·n` ≫ 28M                                 → GPU
+///
 /// 3M splits them. Override with `KTIR_GEMM_GPU_MIN_KN` (0 = always GPU).
 #[cfg(metal)]
 pub const GEMM_GPU_MIN_KN: u64 = 3_000_000;
