@@ -605,6 +605,507 @@ pub fn count_matmul_loops(ops: &[Operation]) -> (usize, usize) {
     (total, recognized)
 }
 
+// =========================================================================
+// Attention-island offloads — move the heavy compute of the (unrolled, NO
+// scf.for) attention nodes off the interpreter onto the GPU. These are PLAIN
+// `linalg.matmul` (QK^T / A·V), `linalg.reduce dimensions=[1]` (softmax
+// row-max / row-sum), and `linalg.transpose`. Each reads its operands from the
+// value table as resident f32 Tiles, runs a GPU kernel, and binds the result
+// back — the interpreter stays the coherence medium exactly like the K-loop and
+// map-window offloads. Tiny index math / extracts / splats stay on the CPU.
+//
+// Each offload is gated by its own KTIR_NO_GPU_* toggle (for A/B measurement)
+// under the same single-core/tracker-free conditions as the existing offloads,
+// and on any failure falls through to the interpreter (correctness preserved).
+// =========================================================================
+
+/// Count of PLAIN `linalg.matmul` ops offloaded to a GPU GEMM (telemetry/proof
+/// the attention QK^T / A·V GEMMs actually ran on Metal).
+#[cfg(metal)]
+pub static PLAIN_MATMUL_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Count of `linalg.reduce` ops offloaded to a GPU reduction kernel.
+#[cfg(metal)]
+pub static REDUCE_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Count of `linalg.transpose` ops offloaded to a GPU kernel.
+#[cfg(metal)]
+pub static TRANSPOSE_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Run a PLAIN (not inside an scf.for) `linalg.matmul` as one GPU GEMM, binding
+/// its result in `ctx`. Reads A = ins[0], B = ins[1] from the value table as
+/// resident f32 Tiles, derives m/k/n from their shapes, runs the NaxGemm engine,
+/// then folds in the `outs` accumulator (ins[2], `C = A@B + C`) on the host — the
+/// attention matmuls all init `outs` to `dense<0.0>`, but folding it keeps the
+/// op's exact `C + A@B` semantics for any init. The result dtype mirrors the
+/// interpreter's `matmul`: the `outs` dtype if present, else A's dtype.
+///
+/// Returns `Err` (no device, operand not resident, shape mismatch) so the caller
+/// falls back to the interpreter — never a wrong answer.
+#[cfg(metal)]
+pub fn run_plain_matmul_gpu(
+    op: &Operation,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    let out_ssa = op
+        .result
+        .as_deref()
+        .ok_or("metal: plain matmul has no result SSA")?;
+    // A, B as resident f32 tiles (clone the shapes/data we need, drop borrows
+    // before we touch the engine / mutate ctx).
+    let a = expect_resident_tile(ctx, &op.operands[0], "plain matmul A")?;
+    let b = expect_resident_tile(ctx, &op.operands[1], "plain matmul B")?;
+    if a.shape.len() != 2 || b.shape.len() != 2 {
+        return Err(format!(
+            "metal: plain matmul wants 2-D operands, got {:?} @ {:?}",
+            a.shape, b.shape
+        ));
+    }
+    let (m, k) = (a.shape[0], a.shape[1]);
+    if b.shape[0] != k {
+        return Err(format!(
+            "metal: plain matmul inner dims disagree: {:?} @ {:?}",
+            a.shape, b.shape
+        ));
+    }
+    let n = b.shape[1];
+    // The `outs` accumulator + its dtype (the interpreter keeps `outs`'s dtype
+    // for the result when present, else A's).
+    let (acc, result_dtype) = if op.operands.len() > 2 {
+        match ctx.get_value(&op.operands[2]) {
+            Ok(crate::ir::Value::Tile(c)) if c.data.len() == m * n => {
+                (Some(c.data.to_vec()), c.dtype)
+            }
+            _ => (None, a.dtype),
+        }
+    } else {
+        (None, a.dtype)
+    };
+
+    let mut out = GEMM_ENGINE.with(|cell| -> Result<Vec<f32>, String> {
+        let engine = cell.get_or_init(|| NaxGemm::new().ok());
+        let engine = engine.as_ref().ok_or("metal: no NaxGemm device")?;
+        let ua = engine.unified_from(&a.data)?;
+        let ub = engine.unified_from(&b.data)?;
+        let mut uc = engine.unified(m * n)?;
+        engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+        Ok(uc.as_slice().to_vec())
+    })?;
+    if let Some(acc) = acc {
+        for (o, c) in out.iter_mut().zip(acc.iter()) {
+            *o += c;
+        }
+    }
+    let tile = crate::tile::Tile::compute(out, result_dtype, vec![m, n]);
+    let bytes = tile.size_bytes() as i64;
+    ctx.set_value(out_ssa, crate::ir::Value::Tile(tile));
+    ctx.track_lx(out_ssa, bytes)?;
+    PLAIN_MATMUL_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// A recognized `linalg.reduce` combiner: the per-element fold and its identity
+/// (the value a row's accumulator starts at). Only the order-insensitive sum/max
+/// the softmax uses are supported; anything else returns `None` (interpreter).
+#[cfg(metal)]
+#[derive(Clone, Copy)]
+struct ReduceCombiner {
+    /// MSL infix for `acc = acc <op> x` — `"+"` for sum, but max needs a call,
+    /// so we carry an enum-ish tag instead and render in [`run_reduce_gpu`].
+    is_max: bool,
+    identity: f32,
+}
+
+/// Recognize a `linalg.reduce`'s combiner (sum -> +, init 0; max -> max, init
+/// -inf). Reads `reduce_fn` (the shorthand the parser lifts) or the region's
+/// single non-yield op. `None` for any other combiner.
+#[cfg(metal)]
+fn recognize_reduce_combiner(op: &Operation) -> Option<ReduceCombiner> {
+    let name = match op.attributes.get("reduce_fn") {
+        Some(Attr::Str(s)) => s.clone(),
+        _ => op
+            .regions
+            .iter()
+            .flatten()
+            .find(|o| o.op_type != "linalg.yield")
+            .map(|o| o.op_type.clone())?,
+    };
+    match name.as_str() {
+        "arith.addf" => Some(ReduceCombiner { is_max: false, identity: 0.0 }),
+        "arith.maximumf" | "arith.maxf" => Some(ReduceCombiner {
+            is_max: true,
+            identity: f32::NEG_INFINITY,
+        }),
+        _ => None,
+    }
+}
+
+/// Run a `linalg.reduce ins(%x) dimensions=[1]` over the last axis of a 2-D
+/// tensor `[rows, cols]` as a GPU reduction (one threadgroup row → one output
+/// element). Binds the reduced `[rows]` tensor (or a scalar if `rows==1` AND the
+/// input was 1-D — never here) under the op's result SSA. Mirrors the
+/// interpreter's `reduce`: f16 input → f32 fold → round to the input dtype, and
+/// the result is `Tile([rows])` (shape with the reduced axis removed).
+///
+/// Returns `Err` (unsupported combiner / shape / no device) so the caller falls
+/// back to the interpreter.
+#[cfg(metal)]
+pub fn run_reduce_gpu(
+    op: &Operation,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    // Only `dimensions = [1]` over a 2-D input is handled (the softmax pattern).
+    let dims = int_list_attr_vec(op, "dimensions").unwrap_or_default();
+    if dims.as_slice() != [1] {
+        return Err(format!("metal: reduce dimensions {dims:?} != [1] — interpreter"));
+    }
+    let combiner = recognize_reduce_combiner(op)
+        .ok_or("metal: unsupported reduce combiner — interpreter")?;
+    let out_ssa = op.result.as_deref().ok_or("metal: reduce has no result SSA")?;
+    let x = expect_resident_tile(ctx, &op.operands[0], "reduce ins")?;
+    if x.shape.len() != 2 {
+        return Err(format!("metal: reduce wants 2-D input, got {:?}", x.shape));
+    }
+    let (rows, cols) = (x.shape[0], x.shape[1]);
+    if rows * cols != x.data.len() {
+        return Err("metal: reduce input shape/data mismatch".into());
+    }
+    let dtype = x.dtype;
+    let kernel = reduce_kernel(combiner, dtype);
+    // One output element per row; the kernel folds `cols` along the row.
+    let out = run_reduce_kernel(&kernel, &x.data, rows, cols, combiner.identity)?;
+    // Result shape = input shape with axis 1 removed -> [rows]. (rows>=1; the
+    // interpreter only collapses to a scalar when the remaining shape is empty,
+    // which can't happen for a 2-D input.)
+    let tile = crate::tile::Tile::compute(out, dtype, vec![rows]);
+    let bytes = tile.size_bytes() as i64;
+    ctx.set_value(out_ssa, crate::ir::Value::Tile(tile.clone()));
+    ctx.track_lx(out_ssa, bytes)?;
+    // MLIR may also reference the result by the `outs` SSA name (the interpreter
+    // binds `outs_var` too) — mirror that if present.
+    if let Some(Attr::Str(outs_var)) = op.attributes.get("outs_var") {
+        ctx.set_value(outs_var, crate::ir::Value::Tile(tile));
+    }
+    REDUCE_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// MSL for a row reduction: each thread folds one row of `cols` elements with the
+/// combiner (sum or max), seeded from `identity` (passed as a buffer so the same
+/// kernel serves both). `rows` is the dispatch width.
+#[cfg(metal)]
+fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
+    let ty = msl_type(dtype);
+    // `arith.maximumf` is NaN-propagating (see the interpreter's `reduce_combiner`),
+    // unlike MSL `max`/`fmax` which return the non-NaN argument. Match the
+    // interpreter exactly so a NaN score reduces to NaN, not the finite operand.
+    let acc_fold = if combiner.is_max {
+        "acc = (isnan(acc) || isnan(xv)) ? NAN : (acc >= xv ? acc : xv)"
+    } else {
+        "acc = acc + xv"
+    };
+    let source = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\n\
+         kernel void row_reduce(\n\
+         \x20   device const {ty}* x [[buffer(0)]],\n\
+         \x20   device {ty}* out [[buffer(1)]],\n\
+         \x20   constant uint& cols [[buffer(2)]],\n\
+         \x20   constant float& identity [[buffer(3)]],\n\
+         \x20   uint row [[thread_position_in_grid]]\n\
+         ) {{\n\
+         \x20   float acc = identity;\n\
+         \x20   for (uint c = 0; c < cols; c++) {{ float xv = float(x[row * cols + c]); {acc_fold}; }}\n\
+         \x20   out[row] = ({ty})acc;\n\
+         }}\n",
+        ty = ty,
+        acc_fold = acc_fold,
+    );
+    MslKernel {
+        source,
+        name: "row_reduce".to_string(),
+        buffers: vec![
+            BufferBinding { name: "x".into(), is_output: false, dtype },
+            BufferBinding { name: "out".into(), is_output: true, dtype },
+        ],
+    }
+}
+
+/// Dispatch the row-reduce kernel: upload `x` (rows*cols, dtype-encoded), pass
+/// `cols`/`identity` as inline bytes, dispatch `rows` threads, read back `rows`
+/// f32. Uses the shared device/queue/pipeline cache (`cached_dispatch`).
+#[cfg(metal)]
+fn run_reduce_kernel(
+    kernel: &MslKernel,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    identity: f32,
+) -> Result<Vec<f32>, String> {
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
+    };
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    let (device, queue, pipeline) = cached_dispatch(kernel)?;
+    let res = MTLResourceOptions::StorageModeShared;
+    let in_dtype = kernel.buffers[0].dtype;
+    let out_dtype = kernel.buffers[1].dtype;
+
+    let in_bytes = crate::codec::encode(x, in_dtype);
+    // SAFETY: `in_bytes` outlives the copy inside newBufferWithBytes.
+    let in_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(in_bytes.as_ptr() as *mut c_void).unwrap(),
+                in_bytes.len().max(1),
+                res,
+            )
+            .ok_or("metal: reduce input buffer alloc failed")?
+    };
+    let out_buf = device
+        .newBufferWithLength_options((rows * out_dtype.bytes_per_elem()).max(1), res)
+        .ok_or("metal: reduce output buffer alloc failed")?;
+
+    let cb = queue.commandBuffer().ok_or("metal: commandBuffer nil")?;
+    let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
+    enc.setComputePipelineState(&pipeline);
+    let cols_u = cols as u32;
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&in_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+        enc.setBytes_length_atIndex(
+            NonNull::new(&cols_u as *const u32 as *mut c_void).unwrap(),
+            std::mem::size_of::<u32>(),
+            2,
+        );
+        enc.setBytes_length_atIndex(
+            NonNull::new(&identity as *const f32 as *mut c_void).unwrap(),
+            std::mem::size_of::<f32>(),
+            3,
+        );
+    }
+    let tg = pipeline.maxTotalThreadsPerThreadgroup().min(rows).max(1);
+    enc.dispatchThreads_threadsPerThreadgroup(
+        MTLSize { width: rows, height: 1, depth: 1 },
+        MTLSize { width: tg, height: 1, depth: 1 },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    let nbytes = rows * out_dtype.bytes_per_elem();
+    let raw =
+        unsafe { std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u8, nbytes) }
+            .to_vec();
+    Ok(crate::codec::decode(&raw, rows, out_dtype))
+}
+
+/// Run a `linalg.transpose ins(%x) permutation=[...]` on the GPU as a gather:
+/// one thread per output element, `out[o] = in[ source(o) ]` with the source
+/// index computed from the permutation and the row-major strides. Binds the
+/// transposed tensor under the op's result SSA. Mirrors the interpreter's
+/// `transpose` exactly (same dtype, same index mapping). Supports any rank.
+///
+/// Returns `Err` (no permutation, rank mismatch, no device) → interpreter.
+#[cfg(metal)]
+pub fn run_transpose_gpu(
+    op: &Operation,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    let perm = int_list_attr_vec(op, "permutation")
+        .ok_or("metal: transpose missing permutation — interpreter")?;
+    let out_ssa = op
+        .result
+        .as_deref()
+        .ok_or("metal: transpose has no result SSA")?;
+    let x = expect_resident_tile(ctx, &op.operands[0], "transpose ins")?;
+    if perm.len() != x.shape.len() {
+        return Err(format!(
+            "metal: transpose permutation rank {} != input rank {}",
+            perm.len(),
+            x.shape.len()
+        ));
+    }
+    let perm: Vec<usize> = perm.iter().map(|&p| p as usize).collect();
+    if perm.iter().any(|&p| p >= x.shape.len()) {
+        return Err("metal: transpose permutation out of range".into());
+    }
+    let out_shape: Vec<usize> = perm.iter().map(|&p| x.shape[p]).collect();
+    let in_strides = {
+        // row-major strides of the input shape
+        let mut s = vec![1usize; x.shape.len()];
+        for i in (0..x.shape.len().saturating_sub(1)).rev() {
+            s[i] = s[i + 1] * x.shape[i + 1];
+        }
+        s
+    };
+    let out_strides = {
+        let mut s = vec![1usize; out_shape.len()];
+        for i in (0..out_shape.len().saturating_sub(1)).rev() {
+            s[i] = s[i + 1] * out_shape[i + 1];
+        }
+        s
+    };
+    let out_len: usize = out_shape.iter().product();
+    let dtype = x.dtype;
+    let kernel = transpose_kernel(dtype);
+    // Per-output-element source index, computed from out_strides/in_strides/perm
+    // on the GPU. We pass the rank and the three index arrays as buffers.
+    let src_in_strides: Vec<u32> = perm.iter().map(|&p| in_strides[p] as u32).collect();
+    let out_strides_u: Vec<u32> = out_strides.iter().map(|&s| s as u32).collect();
+    let out = run_transpose_kernel(
+        &kernel,
+        &x.data,
+        out_len,
+        &out_strides_u,
+        &src_in_strides,
+    )?;
+    let tile = crate::tile::Tile::compute(out, dtype, out_shape);
+    let bytes = tile.size_bytes() as i64;
+    ctx.set_value(out_ssa, crate::ir::Value::Tile(tile));
+    ctx.track_lx(out_ssa, bytes)?;
+    TRANSPOSE_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// MSL for a permutation gather: thread `o` decomposes its linear output index
+/// into per-axis coordinates via `out_strides`, then recombines through
+/// `src_in_strides[axis] = in_strides[perm[axis]]` to read the source element.
+/// `rank` and the two stride arrays are passed as buffers.
+#[cfg(metal)]
+fn transpose_kernel(dtype: DType) -> MslKernel {
+    let ty = msl_type(dtype);
+    let source = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n\n\
+         kernel void transpose_gather(\n\
+         \x20   device const {ty}* x [[buffer(0)]],\n\
+         \x20   device {ty}* out [[buffer(1)]],\n\
+         \x20   constant uint& rank [[buffer(2)]],\n\
+         \x20   device const uint* out_strides [[buffer(3)]],\n\
+         \x20   device const uint* src_in_strides [[buffer(4)]],\n\
+         \x20   uint o [[thread_position_in_grid]]\n\
+         ) {{\n\
+         \x20   uint rem = o;\n\
+         \x20   uint src = 0;\n\
+         \x20   for (uint d = 0; d < rank; d++) {{\n\
+         \x20       uint coord = rem / out_strides[d];\n\
+         \x20       rem = rem % out_strides[d];\n\
+         \x20       src += coord * src_in_strides[d];\n\
+         \x20   }}\n\
+         \x20   out[o] = x[src];\n\
+         }}\n",
+        ty = ty,
+    );
+    MslKernel {
+        source,
+        name: "transpose_gather".to_string(),
+        buffers: vec![
+            BufferBinding { name: "x".into(), is_output: false, dtype },
+            BufferBinding { name: "out".into(), is_output: true, dtype },
+        ],
+    }
+}
+
+/// Dispatch the transpose gather: upload `x` (dtype-encoded), the rank + two
+/// stride arrays, dispatch `out_len` threads, read back `out_len` f32.
+#[cfg(metal)]
+fn run_transpose_kernel(
+    kernel: &MslKernel,
+    x: &[f32],
+    out_len: usize,
+    out_strides: &[u32],
+    src_in_strides: &[u32],
+) -> Result<Vec<f32>, String> {
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+        MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
+    };
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    let (device, queue, pipeline) = cached_dispatch(kernel)?;
+    let res = MTLResourceOptions::StorageModeShared;
+    let in_dtype = kernel.buffers[0].dtype;
+    let out_dtype = kernel.buffers[1].dtype;
+
+    let in_bytes = crate::codec::encode(x, in_dtype);
+    // SAFETY: each `*_bytes`/array outlives the copy inside newBufferWithBytes.
+    let in_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(in_bytes.as_ptr() as *mut c_void).unwrap(),
+                in_bytes.len().max(1),
+                res,
+            )
+            .ok_or("metal: transpose input buffer alloc failed")?
+    };
+    let out_buf = device
+        .newBufferWithLength_options((out_len * out_dtype.bytes_per_elem()).max(1), res)
+        .ok_or("metal: transpose output buffer alloc failed")?;
+    let stride_buf = |arr: &[u32]| -> Result<_, String> {
+        let nbytes = std::mem::size_of_val(arr).max(4);
+        // SAFETY: `arr` outlives the copy.
+        unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    NonNull::new(arr.as_ptr() as *mut c_void).unwrap(),
+                    nbytes,
+                    res,
+                )
+                .ok_or_else(|| "metal: transpose stride buffer alloc failed".to_string())
+        }
+    };
+    let out_strides_buf = stride_buf(out_strides)?;
+    let src_in_strides_buf = stride_buf(src_in_strides)?;
+
+    let cb = queue.commandBuffer().ok_or("metal: commandBuffer nil")?;
+    let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
+    enc.setComputePipelineState(&pipeline);
+    let rank = out_strides.len() as u32;
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&in_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+        enc.setBytes_length_atIndex(
+            NonNull::new(&rank as *const u32 as *mut c_void).unwrap(),
+            std::mem::size_of::<u32>(),
+            2,
+        );
+        enc.setBuffer_offset_atIndex(Some(&out_strides_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&src_in_strides_buf), 0, 4);
+    }
+    let tg = pipeline.maxTotalThreadsPerThreadgroup().min(out_len).max(1);
+    enc.dispatchThreads_threadsPerThreadgroup(
+        MTLSize { width: out_len, height: 1, depth: 1 },
+        MTLSize { width: tg, height: 1, depth: 1 },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    let nbytes = out_len * out_dtype.bytes_per_elem();
+    let raw =
+        unsafe { std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u8, nbytes) }
+            .to_vec();
+    Ok(crate::codec::decode(&raw, out_len, out_dtype))
+}
+
+/// Resolve an operand to a resident f32 [`Tile`] (cloned), erroring if it is not
+/// a `Value::Tile` — the offloads need materialized data, not a pointer/scalar.
+#[cfg(metal)]
+fn expect_resident_tile(
+    ctx: &crate::context::CoreContext,
+    name: &str,
+    what: &str,
+) -> Result<crate::tile::Tile, String> {
+    match ctx.get_value(name)? {
+        crate::ir::Value::Tile(t) => Ok(t.clone()),
+        other => Err(format!("metal: {what} {name} is {other:?}, want a resident tile")),
+    }
+}
+
 /// Result-SSA (stripped of `%`) -> defining op, recursively through regions.
 /// A matmul K-loop references views/producers defined OUTSIDE the loop body and
 /// loads/slices defined INSIDE it, so recognition needs a function-wide map.

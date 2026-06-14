@@ -231,10 +231,31 @@ impl CoreRunner {
         // tile id), so the full-shape reconstruction would be wrong — those keep
         // the interpreter loop. Skipped under a latency tracker (the model must
         // see each op). The fused whole-program function is grid [1,1].
+        //
+        // The same single-core/tracker-free conditions also gate the (opt-in)
+        // attention-island offloads (plain matmul / reduce / transpose) below,
+        // each behind its own KTIR_GPU_* toggle for A/B measurement.
         #[cfg(metal)]
-        let gpu_offload = env.tracker.is_none()
-            && env.grid.num_cores == 1
-            && std::env::var_os("KTIR_NO_GPU_GEMM").is_none();
+        let gpu_base = env.tracker.is_none() && env.grid.num_cores == 1;
+        #[cfg(metal)]
+        let gpu_offload = gpu_base && std::env::var_os("KTIR_NO_GPU_GEMM").is_none();
+        // Attention-island offloads (plain matmul / reduce / transpose). These are
+        // OPT-IN (default OFF): measured on the SmolLM2-135M decode + 8-token
+        // prefill bundles, per-op GPU dispatch of attention's TINY tensors (M=1
+        // GEMMs, <=576-wide reduces, <=64x64 transposes) is a net LOSS — each pays
+        // ~250us of GPU dispatch+sync that swamps the few-us CPU compute (decode
+        // 0.53-0.90x, prefill 0.89-1.01x vs all-CPU). They are correct and golden-
+        // faithful, and would win for much larger attention tensors, so they ship
+        // gated behind KTIR_GPU_* env toggles (presence ENABLES) rather than
+        // regressing the default path. Plain matmul additionally honors
+        // KTIR_NO_GPU_GEMM (a clean GEMM-free baseline disables it too).
+        #[cfg(metal)]
+        let gpu_plain_matmul = gpu_offload
+            && std::env::var_os("KTIR_GPU_PLAIN_MATMUL").is_some();
+        #[cfg(metal)]
+        let gpu_reduce = gpu_base && std::env::var_os("KTIR_GPU_REDUCE").is_some();
+        #[cfg(metal)]
+        let gpu_transpose = gpu_base && std::env::var_os("KTIR_GPU_TRANSPOSE").is_some();
         #[cfg(metal)]
         let matmul_sched = if gpu_offload {
             crate::metal_backend::matmul_loop_schedule(ops)
@@ -309,6 +330,30 @@ impl CoreRunner {
             #[cfg(metal)]
             if map_skip.contains(&this_idx) {
                 pending_skip.push(this_idx);
+                continue;
+            }
+            // Attention-island offloads: a PLAIN (not scf.for-nested) matmul,
+            // a softmax row reduce, or a transpose runs on the GPU instead of the
+            // interpreter. Each falls through to `execute_op` on any failure
+            // (no device, unsupported shape) so correctness is preserved. These
+            // ops are window boundaries (never inside a fused map window), so
+            // they never collide with the map_skip/trigger handling above.
+            #[cfg(metal)]
+            if (gpu_plain_matmul
+                && op.op_type == "linalg.matmul"
+                && crate::metal_backend::run_plain_matmul_gpu(op, &mut self.ctx).is_ok())
+                || (gpu_reduce
+                    && op.op_type == "linalg.reduce"
+                    && crate::metal_backend::run_reduce_gpu(op, &mut self.ctx).is_ok())
+                || (gpu_transpose
+                    && op.op_type == "linalg.transpose"
+                    && crate::metal_backend::run_transpose_gpu(op, &mut self.ctx).is_ok())
+            {
+                if let Some(dead) = self.dies_at.get(this_idx) {
+                    for name in dead {
+                        self.ctx.forget(name);
+                    }
+                }
                 continue;
             }
             if is_comm_op(&op.op_type) {

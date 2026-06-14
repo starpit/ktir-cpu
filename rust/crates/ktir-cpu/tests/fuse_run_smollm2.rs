@@ -270,6 +270,65 @@ fn time_fused(dir: &std::path::Path, iters: u32) -> f64 {
     times[times.len() / 2]
 }
 
+/// PERF: decode + prefill ms/pass with the ATTENTION-ISLAND offloads (plain
+/// matmul + reduce + transpose) ON vs OFF. Both arms keep the K-loop GEMM and
+/// map-window offloads ON — this isolates the attention contribution. Run ONE
+/// bench at a time (no concurrency); the env toggles are process-global.
+#[cfg(metal)]
+#[test]
+#[ignore = "perf bench; needs the smollm2-135m[-prefill] bundles. --ignored --nocapture"]
+fn fused_attention_gpu_vs_cpu_mspass() {
+    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    // Opt-in attention offloads (default OFF). Presence ENABLES.
+    let all = ["KTIR_GPU_PLAIN_MATMUL", "KTIR_GPU_REDUCE", "KTIR_GPU_TRANSPOSE"];
+    let on = |k: &str| unsafe { std::env::set_var(k, "1") };
+    let off = |k: &str| unsafe { std::env::remove_var(k) };
+    for (model, dir_opt) in [
+        ("decode", bundle_dir()),
+        ("prefill", bundle_dir_named("smollm2-135m-prefill")),
+    ] {
+        let Some(dir) = dir_opt else {
+            eprintln!("{model} bundle absent — skipping");
+            continue;
+        };
+        // Baseline: every attention offload OFF (attention fully on CPU). The
+        // K-loop GEMM + map offloads stay ON in all arms (KTIR_NO_GPU_GEMM unset).
+        for k in all {
+            off(k);
+        }
+        let cpu = time_fused(&dir, iters);
+        // Sweep: enable each offload alone, then all three together.
+        let mut report = vec![(format!("{model}: attention ALL-CPU"), cpu)];
+        for combo in [
+            vec!["KTIR_GPU_PLAIN_MATMUL"],
+            vec!["KTIR_GPU_REDUCE"],
+            vec!["KTIR_GPU_TRANSPOSE"],
+            all.to_vec(),
+        ] {
+            for k in all {
+                off(k);
+            }
+            for k in &combo {
+                on(k);
+            }
+            let label = match combo.as_slice() {
+                ["KTIR_GPU_PLAIN_MATMUL"] => "GPU plain-matmul only",
+                ["KTIR_GPU_REDUCE"] => "GPU reduce only",
+                ["KTIR_GPU_TRANSPOSE"] => "GPU transpose only",
+                _ => "GPU all three",
+            };
+            let t = time_fused(&dir, iters);
+            report.push((format!("{model}: {label}"), t));
+        }
+        for k in all {
+            off(k);
+        }
+        for (label, t) in &report {
+            eprintln!("  {label}: {t:.1} ms/pass  ({:.2}x vs ALL-CPU)", cpu / t);
+        }
+    }
+}
+
 /// PERF: decode + prefill ms/pass with the GPU GEMM offload ON vs OFF (the
 /// interpreter's Accelerate K-loop). Run ONE bench at a time (no concurrency).
 #[cfg(metal)]
@@ -480,15 +539,41 @@ fn smollm2_135m_prefill_fused_matches_golden() {
         eprintln!("SmolLM2 prefill bundle absent — skipping");
         return;
     };
-    ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-    ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, Relaxed);
+    ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, Relaxed);
+    ktir_cpu::metal_backend::PLAIN_MATMUL_GPU_COUNT.store(0, Relaxed);
+    ktir_cpu::metal_backend::REDUCE_GPU_COUNT.store(0, Relaxed);
+    ktir_cpu::metal_backend::TRANSPOSE_GPU_COUNT.store(0, Relaxed);
+    // The attention-island offloads are OPT-IN (default OFF — they regress on this
+    // tiny bundle; see comm_sched). Enable them HERE so this golden gate verifies
+    // their CORRECTNESS (the prefill diff must stay within f16 noise with them on).
+    // SAFETY: serial test (--test-threads=1); process-global env toggle.
+    let attn = ["KTIR_GPU_PLAIN_MATMUL", "KTIR_GPU_REDUCE", "KTIR_GPU_TRANSPOSE"];
+    for k in attn {
+        unsafe { std::env::set_var(k, "1") };
+    }
     let (golden_diff, fused) = run_fused_golden(&dir, "SmolLM2-135M PREFILL");
-    let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-    let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    for k in attn {
+        unsafe { std::env::remove_var(k) };
+    }
+    let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(Relaxed);
+    let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(Relaxed);
+    let plain_mm = ktir_cpu::metal_backend::PLAIN_MATMUL_GPU_COUNT.load(Relaxed);
+    let reduces = ktir_cpu::metal_backend::REDUCE_GPU_COUNT.load(Relaxed);
+    let transposes = ktir_cpu::metal_backend::TRANSPOSE_GPU_COUNT.load(Relaxed);
     eprintln!("  prefill matmul K-loops offloaded to GPU GEMM: {gpu}");
     eprintln!("  prefill map windows offloaded to fused GPU kernel: {maps}");
+    eprintln!("  prefill attention PLAIN matmuls offloaded to GPU GEMM: {plain_mm}");
+    eprintln!("  prefill attention linalg.reduce offloaded to GPU: {reduces}");
+    eprintln!("  prefill attention linalg.transpose offloaded to GPU: {transposes}");
     assert!(gpu >= 200, "expected prefill K-loops on GPU, only {gpu} did");
     assert!(maps > 0, "expected prefill map windows on GPU, none did");
+    // With the opt-in attention offloads enabled above, prove each fired (so the
+    // golden gate below is actually exercising the GPU attention path).
+    assert!(plain_mm > 0, "expected attention plain matmuls on GPU, none did");
+    assert!(reduces > 0, "expected attention reduces on GPU, none did");
+    assert!(transposes > 0, "expected attention transposes on GPU, none did");
 
     // AUTHORITATIVE GATE: the fused single-grid + GPU-GEMM run must match
     // golden.bin (the reference scratchy generates). 0.05 is well above the
