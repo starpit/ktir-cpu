@@ -504,19 +504,73 @@ pub fn clear_weight_cache() {
     WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
 }
 
+/// Default minimum GEMM WEIGHT size (`k·n` elements) to route a recognized K-loop
+/// to the GPU instead of the interpreter's Accelerate K-loop.
+///
+/// The gate is on `k·n` (the weight footprint) rather than `m·k·n` (total MACs)
+/// because the cost the GPU offload SAVES is the interpreter's tiled K-loop, whose
+/// tile count scales with `k·n` (it tiles the K×N weight into ~`(k/128)·(n/512)`
+/// Accelerate blocks), while the activation upload it ADDS is `m·k` and the GPU
+/// dispatch is fixed. So `k·n` is the true predictor of when the single GPU
+/// dispatch beats the many-tile interpreter loop — and it cleanly separates the
+/// measured models, which `m·k·n` could not (smollm2-prefill's M=8 layer GEMM and
+/// llama-decode's M=1 layer GEMM have similar MAC counts but very different
+/// weights):
+///   * smollm2 layer GEMMs: `k·n` ≈ 576·1536 .. 1536·1536 ≈ 0.9–2.4M  → AMX
+///   * llama  layer GEMMs: `k·n` ≈ 2048·2048 .. 2048·8192 ≈ 4.2–16.8M → GPU
+///   * both lm_heads:       `k·n` ≫ 28M                                 → GPU
+/// 3M splits them. Override with `KTIR_GEMM_GPU_MIN_KN` (0 = always GPU).
+#[cfg(metal)]
+pub const GEMM_GPU_MIN_KN: u64 = 3_000_000;
+
+/// Whether a reconstructed `m×k×n` K-loop GEMM should run on the GPU.
+///
+/// CORRECTNESS FIRST: the fallback when this returns `false` is the interpreter
+/// running the loop's `scf.for` at the fused segment's grid `[1,1]`. That body
+/// correctly reconstructs the GEMM ONLY when `m == 1` (decode): the Spyre SPMD
+/// K-loop tiles its output across the grid, so at `[1,1]` it computes exactly the
+/// single M-row that grid position 0 owns. For `m > 1` (prefill, token-parallel
+/// M=8/M=32), the full-M reconstruction lives ONLY in the GPU offload — running
+/// the `[1,1]` loop would compute just row 0 and silently drop the rest (it broke
+/// prefill golden by ~0.05 in testing). So `m > 1` ALWAYS goes to the GPU.
+///
+/// For `m == 1` we then apply the size gate: route to the GPU only if the weight
+/// `k·n` clears [`GEMM_GPU_MIN_KN`] (env `KTIR_GEMM_GPU_MIN_KN`, 0 = always GPU);
+/// smaller decode GEMMs run on the interpreter's Accelerate K-loop, faster at
+/// that scale and golden-faithful (the per-node oracle uses the same path).
+#[cfg(metal)]
+pub fn gemm_loop_wants_gpu(m: usize, k: usize, n: usize) -> bool {
+    if m > 1 {
+        return true; // only the GPU reconstructs the full-M prefill GEMM correctly
+    }
+    let min_kn = std::env::var("KTIR_GEMM_GPU_MIN_KN")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(GEMM_GPU_MIN_KN);
+    (k as u64) * (n as u64) >= min_kn
+}
+
 /// Run a recognized matmul K-loop as ONE GPU GEMM, binding the loop's result
 /// tensor in `ctx`. Operands are resolved from the value table: a forwarded
 /// activation is already a resident `Tile` (f32) and is re-uploaded each pass; a
 /// constant weight is an HBM pointer decoded+uploaded ONCE and then served from
 /// the resident [`WEIGHT_CACHE`]. The interpreter then skips the loop body
-/// entirely. Returns `Err` if the GEMM can't run (no device, shape mismatch) so
-/// the caller falls back to executing the loop on the interpreter.
+/// entirely. Returns `Err` if the GEMM can't run (no device, shape mismatch, or
+/// below the GPU work gate) so the caller falls back to the interpreter K-loop.
 #[cfg(metal)]
 pub fn run_matmul_loop_gpu(
     info: &MatmulLoopInfo,
     ctx: &mut crate::context::CoreContext,
 ) -> Result<(), String> {
     let (m, k, n) = (info.m as usize, info.k as usize, info.n as usize);
+    // SIZE GATE: route only GEMMs whose weight (`k·n`) is big enough that the
+    // single GPU dispatch beats the interpreter's tiled Accelerate K-loop; smaller
+    // ones fall through (Err) to that K-loop, which is faster on tiny weights. See
+    // [`gemm_loop_wants_gpu`] / [`GEMM_GPU_MIN_KN`] for the calibration (it splits
+    // smollm2's small layer GEMMs from llama's large ones + both lm_heads).
+    if !gemm_loop_wants_gpu(m, k, n) {
+        return Err("metal: GEMM below the GPU work gate — interpreter K-loop".into());
+    }
     let c = GEMM_ENGINE.with(|cell| -> Result<Vec<f32>, String> {
         let engine = cell.get_or_init(|| NaxGemm::new().ok());
         let engine = engine.as_ref().ok_or("metal: no NaxGemm device")?;
@@ -1816,13 +1870,33 @@ pub fn run_map_region_gpu(
     Ok(())
 }
 
+/// Default minimum output element count to offload a fused map window to the GPU.
+/// Below this the per-window GPU dispatch+sync + live-in upload costs more than
+/// the interpreter's elementwise loop. Decode windows are M=1 (≤2048 elems) — a
+/// net loss; prefill windows are M=8/32 (up to ~64k elems) — a win. 16384 splits
+/// them. Override with `KTIR_MAP_GPU_MIN_ELEMS` (0 = offload every window, the old
+/// always-GPU behavior).
+#[cfg(metal)]
+pub const MAP_GPU_MIN_ELEMS: usize = 16_384;
+
+/// The map-window GPU offload size threshold (env-overridable). See
+/// [`MAP_GPU_MIN_ELEMS`].
+#[cfg(metal)]
+pub fn map_gpu_min_elems() -> usize {
+    std::env::var("KTIR_MAP_GPU_MIN_ELEMS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(MAP_GPU_MIN_ELEMS)
+}
+
 /// Plan a fused function's Map windows for runtime GPU offload. Walks the op
 /// stream with the SAME classification `plan_kernels` uses — Map ops accumulate
 /// into a window; a Reduce / Matmul / Boundary / `scf.for` flushes it; plumbing
 /// doesn't break a window — and for each window TRIES [`emit_map_region_kernel`].
-/// On success the window registers its TRIGGER (the last op index — run the
-/// kernel there) and all its op indices in the SKIP set; on failure the window's
-/// ops are left to the interpreter. Returns `(trigger -> kernel, skip set)`.
+/// On success (and if the window's output clears the [`MAP_GPU_MIN_ELEMS`] size
+/// gate) the window registers its TRIGGER (the last op index — run the kernel
+/// there) and all its op indices in the SKIP set; otherwise the window's ops are
+/// left to the interpreter. Returns `(trigger -> kernel, skip set)`.
 pub fn map_fusion_plan(
     ops: &[Operation],
 ) -> (HashMap<usize, MapRegionKernel>, HashSet<usize>) {
@@ -1834,6 +1908,7 @@ pub fn map_fusion_plan(
     let mut triggers: HashMap<usize, MapRegionKernel> = HashMap::new();
     let mut skip: HashSet<usize> = HashSet::new();
     let mut window: Vec<usize> = Vec::new();
+    let min_elems = map_gpu_min_elems();
     let try_flush = |window: &mut Vec<usize>,
                      triggers: &mut HashMap<usize, MapRegionKernel>,
                      skip: &mut HashSet<usize>| {
@@ -1842,11 +1917,19 @@ pub fn map_fusion_plan(
         }
         let w = std::mem::take(window);
         if let Ok(mrk) = emit_map_region_kernel_with(ops, &w, &defs, &uses) {
-            let trigger = *w.last().unwrap();
-            for &i in &w {
-                skip.insert(i);
+            // SIZE GATE: a fused map kernel pays a GPU dispatch+sync round-trip
+            // and uploads each live-in tile; below `min_elems` output elements the
+            // interpreter's elementwise loop is faster (decode's M=1 windows are
+            // ≤2048 elems — a net loss on GPU). Leaving the window OUT of the skip
+            // set means the interpreter runs its ops normally (no fatal trigger).
+            let out_len: usize = mrk.out_shape.iter().product();
+            if out_len >= min_elems {
+                let trigger = *w.last().unwrap();
+                for &i in &w {
+                    skip.insert(i);
+                }
+                triggers.insert(trigger, mrk);
             }
-            triggers.insert(trigger, mrk);
         }
     };
     for (i, op) in ops.iter().enumerate() {

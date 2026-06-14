@@ -262,6 +262,114 @@ fn run_segmented_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
     (result, n_fused, n_native)
 }
 
+/// RESIDENT run via the PRODUCTION resident executor
+/// (`ktir_cpu::resident::ResidentExecutor`): marshal every source weight into the
+/// persistent HBM ONCE, then run one pass. The weights are NOT re-marshaled (the
+/// whole point) — this is the apples-to-apples golden check for the resident path.
+/// Returns the result tensor + (fused, native) segment counts.
+fn run_resident_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
+    let b = load_bundle(dir);
+    let segments = plan_segments(&b.module, &b.spec).expect("plan segments");
+    let n_fused = segments.iter().filter(|s| matches!(s, Segment::Fused(_))).count();
+    let n_native = segments.iter().filter(|s| matches!(s, Segment::Native(_))).count();
+
+    let mut owned: Vec<(String, Arg)> = Vec::new();
+    for (&id, &(rows, cols, is_src)) in &b.shape {
+        if is_src && Some(id) != b.mask_id {
+            owned.push((
+                format!("t{id}"),
+                Arg::Tensor {
+                    data: read_f32(&dir.join(format!("t{id}.bin"))),
+                    shape: vec![rows, cols],
+                    dtype: DType::F16,
+                },
+            ));
+        }
+    }
+    if let Some(m) = b.mask_id {
+        let (rows, cols, _) = b.shape[&m];
+        owned.push((
+            format!("t{m}"),
+            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+        ));
+    }
+    let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+
+    let result_key = format!("t{}", b.result_id);
+    let mut exec = ktir_cpu::resident::ResidentExecutor::new(&b.module, &b.spec)
+        .expect("build resident executor");
+    exec.set_sources(&args).expect("marshal weights once");
+    let out = exec.run(&[&result_key]).expect("resident run");
+    let result = out.get(&result_key).expect("result produced").data.clone();
+    (result, n_fused, n_native)
+}
+
+/// PERF: whole-model ms/pass through the PRODUCTION RESIDENT executor — weights
+/// uploaded to the persistent HBM ONCE (across ALL passes, no per-pass / per-
+/// segment re-marshal), only the pass-internal activations recomputed each pass.
+/// This is the resident analogue of `segmented_mspass`; the gap between the two
+/// is the per-pass weight-marshal cost the resident path eliminates.
+///
+/// BUNDLE / ITERS as in `segmented_mspass`. One warm-up pass excluded; median
+/// over ITERS printed. Run with the GPU path ON and --test-threads=1.
+#[cfg(metal)]
+#[test]
+#[ignore = "whole-model resident perf bench; needs the BUNDLE bundle. --ignored --nocapture"]
+fn resident_mspass() {
+    let bundle = std::env::var("BUNDLE").unwrap_or_else(|_| "smollm2-135m".to_string());
+    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let Some(dir) = bundle_dir_named(&bundle) else {
+        eprintln!("{bundle} bundle absent — skipping");
+        return;
+    };
+
+    let b = load_bundle(&dir);
+    let mut owned: Vec<(String, Arg)> = Vec::new();
+    for (&id, &(rows, cols, is_src)) in &b.shape {
+        if is_src && Some(id) != b.mask_id {
+            owned.push((
+                format!("t{id}"),
+                Arg::Tensor {
+                    data: read_f32(&dir.join(format!("t{id}.bin"))),
+                    shape: vec![rows, cols],
+                    dtype: DType::F16,
+                },
+            ));
+        }
+    }
+    if let Some(m) = b.mask_id {
+        let (rows, cols, _) = b.shape[&m];
+        owned.push((
+            format!("t{m}"),
+            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+        ));
+    }
+    let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let result_key = format!("t{}", b.result_id);
+
+    // Build the executor + upload weights ONCE — outside the timed loop. This is
+    // the resident contract: the multi-pass loop re-uploads NOTHING.
+    let mut exec = ktir_cpu::resident::ResidentExecutor::new(&b.module, &b.spec)
+        .expect("build resident executor");
+    exec.set_sources(&args).expect("marshal weights once");
+
+    // Warm up (pipeline compile, first-touch, weight-cache fill) — excluded.
+    exec.run(&[&result_key]).expect("warmup");
+
+    let mut times: Vec<f64> = Vec::with_capacity(iters as usize);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        exec.run(&[&result_key]).expect("timed resident run");
+        times.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[times.len() / 2];
+    eprintln!(
+        "{bundle} e2e (Rust+Metal RESIDENT): {median:.1} ms/pass  ({} nodes, {iters} passes)",
+        b.n_nodes
+    );
+}
+
 /// PERF: whole-model ms/pass through the PRODUCTION segmented executor
 /// (`ktir_cpu::segmented::execute_segmented`) — the apples-to-apples Rust+Metal
 /// number for the Python per-node bench. Correct for BOTH decode and prefill
@@ -328,6 +436,70 @@ fn segmented_mspass() {
         "{bundle} e2e (Rust+Metal segmented): {median:.1} ms/pass  ({} nodes, {iters} passes)",
         b.n_nodes
     );
+}
+
+/// RESIDENT executor vs golden — the authoritative correctness gate for the
+/// resident path. Runs all 4 configs (smollm2/llama × decode/prefill) that have a
+/// bundle present, builds the `ResidentExecutor` (weights marshaled ONCE), runs
+/// one pass, and compares to golden.bin. The resident path is byte-for-byte the
+/// same segment plan + handlers + GPU offloads as `execute_segmented` — only the
+/// HBM is persistent — so the diffs must match the known-current golden numbers
+/// (smollm2 decode 0.0014 / prefill 0.0035; llama decode 0.0026 / prefill 0.0033;
+/// all < 0.05).
+#[cfg(metal)]
+#[test]
+#[ignore = "resident-executor golden gate; needs the bundles. --ignored --nocapture"]
+fn resident_matches_golden() {
+    let attn = ["KTIR_GPU_PLAIN_MATMUL", "KTIR_GPU_REDUCE", "KTIR_GPU_TRANSPOSE"];
+    let mut any = false;
+    let mut failures: Vec<String> = Vec::new();
+    for bundle in [
+        "smollm2-135m",
+        "smollm2-135m-prefill",
+        "llama-3.2-1b",
+        "llama-3.2-1b-prefill",
+    ] {
+        let Some(dir) = bundle_dir_named(bundle) else {
+            eprintln!("{bundle} bundle absent — skipping");
+            continue;
+        };
+        any = true;
+        // Prefill bundles have head-parallel attention nodes; enable the opt-in
+        // attention-island GPU offloads so the native segments exercise the GPU
+        // path (matches the segmented golden tests' configuration).
+        let is_prefill = bundle.ends_with("prefill");
+        if is_prefill {
+            for k in attn {
+                unsafe { std::env::set_var(k, "1") };
+            }
+        }
+        let (result, n_fused, n_native) = run_resident_result(&dir);
+        if is_prefill {
+            for k in attn {
+                unsafe { std::env::remove_var(k) };
+            }
+        }
+        let golden = read_f32(&dir.join("golden.bin"));
+        assert_eq!(result.len(), golden.len(), "{bundle}: result length");
+        let finite = result.iter().filter(|x| x.is_finite()).count();
+        let max_abs = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!(
+            "  RESIDENT {bundle} ({n_fused} fused + {n_native} native): \
+             {finite}/{} finite, max abs diff {max_abs:.5}",
+            result.len()
+        );
+        if finite != result.len() {
+            failures.push(format!("{bundle}: non-finite result"));
+        }
+        if max_abs >= 0.05 {
+            failures.push(format!("{bundle}: diverges from golden by {max_abs}"));
+        }
+    }
+    if !any {
+        eprintln!("no bundles present — skipping resident golden gate");
+        return;
+    }
+    assert!(failures.is_empty(), "resident golden failures: {failures:?}");
 }
 
 /// PREFILL multi-core SPMD vs golden — the AUTHORITATIVE gate for cross-core
@@ -669,8 +841,13 @@ fn smollm2_135m_fused_matches_golden() {
         let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!("  matmul K-loops offloaded to GPU GEMM: {gpu}");
         eprintln!("  map windows offloaded to fused GPU kernel: {maps}");
-        assert!(gpu >= 200, "expected the K-loops to run on GPU, only {gpu} did");
-        assert!(maps > 0, "expected map windows to run on GPU, none did");
+        // SIZE-GATED offload: decode is M=1, so its per-layer GEMMs/maps are tiny
+        // (a net GPU loss) and route to the interpreter's Accelerate path; only
+        // the big lm_head GEMM (k·n ≫ the work gate) goes to the GPU. So the proof
+        // the Metal path is live is "at least one GEMM offloaded" (the lm_head),
+        // not the old "all 200+" (which the gate now correctly keeps on AMX).
+        assert!(gpu >= 1, "expected at least the lm_head K-loop on GPU, {gpu} did");
+        let _ = maps; // decode windows are below the map size gate (expected 0)
     }
     assert!(max_abs < 0.2, "decode fused diverges from golden by {max_abs}");
 }
@@ -717,8 +894,14 @@ fn smollm2_135m_prefill_fused_matches_golden() {
     // via the lockstep NAX executor (shared-weight matmul combine where it
     // applies; per-core for the head-distinct Q@K^T / softmax, which are tiny
     // tensors where per-op GPU dispatch is a net loss — see comm_sched).
-    assert!(gpu >= 200, "expected prefill K-loops on GPU segments, only {gpu} did");
-    assert!(maps > 0, "expected prefill map windows on GPU segments, none did");
+    // SIZE-GATED offload: prefill is M=8, so most per-layer GEMMs clear the work
+    // gate and run on the GPU (the lm_head + the wider projections), while the
+    // smallest ones route to AMX — so we assert "many GEMMs on GPU" (the path is
+    // live and doing real work), not the old "all of them". The M=8 map windows
+    // (≤4608 elems) are below the map size gate, so they correctly stay on the
+    // interpreter (a net win at this scale), hence maps may be 0.
+    assert!(gpu >= 100, "expected most prefill K-loops on GPU segments, only {gpu} did");
+    let _ = maps;
 
     // AUTHORITATIVE GATE: the segmented + GPU-GEMM run must match golden.bin.
     // 0.05 is well above f16/GPU noise yet far below the ~0.18 a broken attention

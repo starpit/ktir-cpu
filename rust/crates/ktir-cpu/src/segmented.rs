@@ -173,7 +173,13 @@ pub fn execute_segmented(
         Ok((vec![0.0f32; shape.iter().product()], DType::F16, shape))
     };
 
+    let diag = std::env::var_os("KTIR_SEG_DIAG").is_some();
+    let mut t_fused = 0.0f64;
+    let mut t_native = 0.0f64;
+    let mut n_fused = 0usize;
+    let mut n_native = 0usize;
     for seg in &segments {
+        let seg_t0 = std::time::Instant::now();
         match seg {
             // A fused segment: marshal every surviving pointer arg, run the
             // `[1,1]` fused function, and copy back every boundary OUTPUT.
@@ -252,6 +258,24 @@ pub fn execute_segmented(
                 }
             }
         }
+        if diag {
+            let dt = seg_t0.elapsed().as_secs_f64() * 1e3;
+            match seg {
+                Segment::Fused(_) => {
+                    t_fused += dt;
+                    n_fused += 1;
+                }
+                Segment::Native(_) => {
+                    t_native += dt;
+                    n_native += 1;
+                }
+            }
+        }
+    }
+    if diag {
+        eprintln!(
+            "  [seg-diag] {n_fused} fused {t_fused:.1}ms | {n_native} native {t_native:.1}ms"
+        );
     }
 
     // Return the requested outputs, keyed by canonical `t<id>`.

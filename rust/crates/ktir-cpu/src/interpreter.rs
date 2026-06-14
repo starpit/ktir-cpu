@@ -379,6 +379,39 @@ fn execute_function_filtered(
     out
 }
 
+/// Run `func` against an EXTERNALLY-OWNED, already-populated memory hierarchy —
+/// the resident-executor seam. The caller has placed every pointer arg's data in
+/// `mem`'s HBM ONCE (weights stay across passes; the per-pass input activation is
+/// rewritten in place) and supplies `input_ptrs` (arg name -> its HBM stick /
+/// scalar) so the function's args resolve to the resident sticks WITHOUT a fresh
+/// marshal. `read` lists `(out_name, stick, n_elems, shape, dtype)` for the
+/// tensors to read back. No `SpyreMemoryHierarchy::new`, no `marshal_inputs` —
+/// this is the path that eliminates the per-pass / per-segment weight re-marshal
+/// the fresh-context `execute_function` pays.
+///
+/// `grid` is the function's grid (the caller threads native attention at its own
+/// grid, fused segments at `[1,1]`). The GPU offloads (K-loop GEMM, map windows,
+/// resident weight cache) ride along exactly as in `execute_function`.
+pub fn execute_function_in(
+    mem: &SpyreMemoryHierarchy,
+    ops: &[Operation],
+    grid: (usize, usize, usize),
+    input_ptrs: &[(String, Value)],
+    read: &[TensorMeta],
+) -> Result<HashMap<String, Output>, String> {
+    let grid_exec = GridExecutor::new(grid);
+    let dispatch = Dispatch::shared();
+    crate::comm_sched::execute_with_communication(
+        &grid_exec,
+        mem,
+        ops,
+        input_ptrs,
+        dispatch,
+        None,
+    )?;
+    read_back(mem, read.to_vec(), None)
+}
+
 /// Like [`execute_function`], but records per-op latency and returns the report
 /// alongside the outputs. Port of running `KTIRInterpreter` with a
 /// `latency_config`. Every op (including region-nested ops, via the shared
@@ -417,7 +450,7 @@ pub fn execute_function_with_latency(
 }
 
 /// Tensor read-back metadata: `(name, stick, n_elements, shape, dtype)`.
-type TensorMeta = (String, i64, usize, Vec<usize>, DType);
+pub type TensorMeta = (String, i64, usize, Vec<usize>, DType);
 
 /// Marshal tensor args into HBM and return `(input_ptrs, tensor_meta)`.
 /// Shared by the plain and latency-tracked execution paths.
