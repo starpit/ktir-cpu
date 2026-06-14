@@ -21,7 +21,7 @@ use ktir_cpu::interpreter::{Arg, execute_function, execute_function_outputs};
 use ktir_cpu::ir::IRModule;
 use ktir_cpu::parser::parse_module;
 use ktir_optimizer::fusion::{
-    Binding, NodeSpec, ProgramSpec, Segment, fuse_program, plan_segments,
+    Binding, NodeSpec, ProgramSpec, Segment, fuse_program, plan_segments, plan_segments_budgeted,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -1126,6 +1126,44 @@ fn llama_3_2_1b_gpu_vs_cpu_mspass() {
             cpu / gpu
         );
     }
+}
+
+/// LX-BUDGETED SEGMENTATION: a tiny `KTIR_LX_FUSION_BUDGET` must (a) split the
+/// non-attention runs into MORE fused segments than the unbudgeted plan, and
+/// (b) still match golden — proving the split (which routes the broken edges
+/// through HBM) preserves correctness. This is the fix for the llama m=32 MLP
+/// overflow: at the real budget an m=8 MLP run stays one segment (it fits), so a
+/// tiny budget is how we exercise the splitter + its HBM boundary edges here.
+/// (The fusion budget gates SEGMENTATION only; the runtime LX is still 2 MB, so
+/// the more-split program executes fine and must reproduce golden.)
+#[cfg(metal)]
+#[test]
+#[ignore = "LX-split golden; needs the smollm2 prefill bundle. --ignored --nocapture"]
+fn lx_budget_split_preserves_golden() {
+    let Some(dir) = bundle_dir_named("smollm2-135m-prefill") else {
+        eprintln!("SmolLM2 prefill bundle absent — skipping");
+        return;
+    };
+    let b = load_bundle(&dir);
+    let tensor_bytes: HashMap<u64, usize> =
+        b.shape.iter().map(|(&id, &(r, c, _))| (id, r * c * 2)).collect(); // f16
+    let base = plan_segments(&b.module, &b.spec).expect("plan").len();
+    let tiny = 40_000usize;
+    let split = plan_segments_budgeted(&b.module, &b.spec, tiny, &tensor_bytes)
+        .expect("plan budgeted")
+        .len();
+    eprintln!("  segments: {base} (no budget) -> {split} (budget {tiny}B)");
+    assert!(split > base, "a tiny LX budget should split runs into MORE segments");
+
+    // Execute under the tiny budget (env-overridden) and confirm golden holds.
+    unsafe { std::env::set_var("KTIR_LX_FUSION_BUDGET", tiny.to_string()) };
+    let (result, _nf, _nn) = run_segmented_result(&dir);
+    unsafe { std::env::remove_var("KTIR_LX_FUSION_BUDGET") };
+    let golden = read_f32(&dir.join("golden.bin"));
+    assert_eq!(result.len(), golden.len(), "result length");
+    let diff = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    eprintln!("  split-budget execute vs golden: max abs diff {diff:.5}");
+    assert!(diff < 0.05, "LX-split execution diverged from golden by {diff}");
 }
 
 /// TURNKEY entrypoint smoke test: drive the whole program through

@@ -34,7 +34,7 @@
 use crate::dtypes::DType;
 use crate::interpreter::{Arg, Output, execute_function, execute_function_outputs};
 use crate::ir::{Attr, IRModule, Operation};
-use ktir_optimizer::fusion::{ProgramSpec, Segment, plan_segments};
+use ktir_optimizer::fusion::{ProgramSpec, Segment, plan_segments_budgeted};
 use std::collections::HashMap;
 
 /// Recover the logical tensor id from a fused pointer-arg name `%t<id>_ptr`.
@@ -141,8 +141,19 @@ pub fn execute_segmented(
     args: &[(&str, Arg)],
     outputs: &[&str],
 ) -> Result<HashMap<String, Output>, String> {
-    let segments = plan_segments(module, spec)?;
     let shapes = derive_shapes(module, spec)?;
+    // LX-budgeted segmentation (see `plan_segments_budgeted`): keep each fused
+    // segment's co-resident `[m, *]` intermediates within the per-core LX.
+    let tensor_bytes: HashMap<u64, usize> = shapes
+        .iter()
+        .map(|(&id, shp)| (id, shp.iter().product::<usize>() * DType::F16.bytes_per_elem()))
+        .collect();
+    let segments = plan_segments_budgeted(
+        module,
+        spec,
+        crate::memory::lx_fusion_budget(),
+        &tensor_bytes,
+    )?;
 
     // One shared host buffer per logical tensor (the emulated HBM). Sources are
     // seeded from `args`; intermediates / results / scratch are written as the

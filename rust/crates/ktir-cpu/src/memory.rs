@@ -83,6 +83,24 @@ impl HBMSimulator {
     }
 }
 
+/// LX live-set budget for fused-segment planning: 7/8 of the 2 MB per-core LX,
+/// leaving headroom for a node's transient temporaries. Passed to
+/// `ktir_optimizer::fusion::plan_segments_budgeted` so a fused segment's
+/// co-resident `[m, *]` intermediates never overflow LX (without it, a whole
+/// transformer MLP fuses into one segment and overflows at larger token counts —
+/// llama m=32). 2 MB matches `LXScratchpad::new(.., 2)` below.
+pub const LX_FUSION_BUDGET_BYTES: usize = (2 * 1024 * 1024) * 7 / 8;
+
+/// The effective LX fusion budget — [`LX_FUSION_BUDGET_BYTES`] unless overridden
+/// by `KTIR_LX_FUSION_BUDGET` (bytes). The override lets a host with a different
+/// LX size tune fusion, and lets tests force splitting on small models.
+pub fn lx_fusion_budget() -> usize {
+    std::env::var("KTIR_LX_FUSION_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(LX_FUSION_BUDGET_BYTES)
+}
+
 /// Per-core local scratchpad. Plain byte addressing, no stick concept.
 #[derive(Debug)]
 pub struct LXScratchpad {

@@ -165,6 +165,27 @@ fn region_has_op(regions: &[Vec<Operation>], op_type: &str) -> bool {
 /// native at its grid), and copies every output buffer forward — exactly the
 /// proven per-node threading, just with non-attention runs collapsed.
 pub fn plan_segments(module: &IRModule, spec: &ProgramSpec) -> Result<Vec<Segment>, String> {
+    // No LX budget: maximal-fuse every non-attention run (the historical behavior;
+    // the optimizer's own unit tests use this).
+    plan_segments_budgeted(module, spec, usize::MAX, &HashMap::new())
+}
+
+/// Like [`plan_segments`], but bounds each FUSED segment's peak LX live-set to
+/// `lx_budget` bytes — splitting a maximal non-attention run into several fused
+/// segments when its co-resident `[m, *]` intermediates would overflow LX.
+/// `tensor_bytes[id]` is a tensor's LX footprint (numel × storage-dtype bytes).
+///
+/// Without this a whole transformer MLP (gate/up/silu·up/down + norms) fuses into
+/// one `[1,1]` segment whose wide intermediates are live at once — llama m=32:
+/// gate+up+product = 3×[32,8192] + residual > 2 MB LX. The per-op `dies_at`
+/// reclaim cannot free genuinely-live tensors, so the fix is to not over-group
+/// them. Edges the split introduces fall back to HBM, like any segment boundary.
+pub fn plan_segments_budgeted(
+    module: &IRModule,
+    spec: &ProgramSpec,
+    lx_budget: usize,
+    tensor_bytes: &HashMap<u64, usize>,
+) -> Result<Vec<Segment>, String> {
     // Per-node attention classification.
     let attn: Vec<bool> = spec
         .nodes
@@ -185,6 +206,14 @@ pub fn plan_segments(module: &IRModule, spec: &ProgramSpec) -> Result<Vec<Segmen
             }
         }
     }
+    // Whole-program last-touch index per tensor — the LX split uses it to tell
+    // when a tensor crosses a sub-run boundary (and so must persist to it).
+    let mut global_last: HashMap<u64, usize> = HashMap::new();
+    for (i, node) in spec.nodes.iter().enumerate() {
+        for b in &node.bindings {
+            global_last.insert(b.tensor, i);
+        }
+    }
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut i = 0;
@@ -200,67 +229,157 @@ pub fn plan_segments(module: &IRModule, spec: &ProgramSpec) -> Result<Vec<Segmen
         while j < spec.nodes.len() && !attn[j] {
             j += 1;
         }
-        let run = start..j;
-        let in_run = |k: usize| run.contains(&k);
-
-        // Segment-local sources/results: widen so any boundary-crossing edge
-        // stays an HBM pointer (never forwarded as SSA across a segment break).
-        let mut seg_sources: HashSet<u64> = HashSet::new();
-        let mut seg_results: HashSet<u64> = HashSet::new();
-        for k in run.clone() {
-            for b in &spec.nodes[k].bindings {
-                if b.is_output {
-                    let consumed_outside = consumed_at
-                        .get(&b.tensor)
-                        .is_some_and(|cs| cs.iter().any(|&c| !in_run(c)));
-                    if spec.results.contains(&b.tensor) || consumed_outside {
-                        seg_results.insert(b.tensor);
-                    }
-                } else {
-                    let produced_outside = produced_at
-                        .get(&b.tensor)
-                        .is_some_and(|ps| ps.iter().any(|&p| !in_run(p)));
-                    if spec.sources.contains(&b.tensor) || produced_outside {
-                        seg_sources.insert(b.tensor);
-                    }
-                }
-            }
+        // Split the maximal run into sub-runs that each fit the LX live-set
+        // budget (the whole run, unsplit, when lx_budget is usize::MAX), each
+        // becoming its own fused segment.
+        for run in split_run(&spec.nodes, start, j, tensor_bytes, &global_last, lx_budget) {
+            segments.push(build_fused_segment(
+                module,
+                spec,
+                run,
+                &produced_at,
+                &consumed_at,
+            )?);
         }
-        let seg_spec = ProgramSpec {
-            nodes: spec.nodes[run.clone()].to_vec(),
-            sources: seg_sources.clone(),
-            results: seg_results.clone(),
-        };
-        let mut func = fuse_program(module, &seg_spec)?;
-        // Force the fused segment to grid [1,1] (single core). `fuse_program`
-        // stamps the grid from the run's FIRST node, which can be a token-parallel
-        // [8,1] matmul node — but the whole point of folding those in is that the
-        // GPU GEMM reconstruction (and the single-core K-loop offload it rides on)
-        // rebuilds the full M at grid [1,1], ignoring the Spyre SPMD grid. A
-        // residual [8,1] grid would (a) re-tile the GEMM across cores so the
-        // single-core offload never fires, and (b) make each core recompute the
-        // whole reconstructed GEMM. Collapsing to [1,1] is the correct + fast path.
-        func.grid = (1, 1, 1);
-        // Classify the fused function's surviving pointer args by direction
-        // against the boundary sets. A `%t<id>_ptr` is a boundary OUTPUT iff
-        // `id ∈ seg_results`, a boundary INPUT iff `id ∈ seg_sources`. Anything
-        // else is an INTERNAL SCRATCH arg — an intra-segment edge fusion could
-        // NOT forward as SSA, kept as resident HBM the fused fn writes then reads
-        // in its own body; the runner zero-inits it and never threads it.
-        let mut outputs: HashSet<u64> = HashSet::new();
-        let mut inputs: HashSet<u64> = HashSet::new();
-        for (arg, _) in &func.arguments {
-            let id = tensor_id_of_arg(arg);
-            if seg_results.contains(&id) {
-                outputs.insert(id);
-            } else if seg_sources.contains(&id) {
-                inputs.insert(id);
-            }
-        }
-        segments.push(Segment::Fused(FusedSegment { func, outputs, inputs }));
         i = j;
     }
     Ok(segments)
+}
+
+/// Build ONE fused segment from node sub-range `run`, widening its segment-local
+/// sources/results so any boundary-crossing edge stays an HBM pointer (never
+/// forwarded as SSA across a segment break).
+fn build_fused_segment(
+    module: &IRModule,
+    spec: &ProgramSpec,
+    run: std::ops::Range<usize>,
+    produced_at: &HashMap<u64, Vec<usize>>,
+    consumed_at: &HashMap<u64, Vec<usize>>,
+) -> Result<Segment, String> {
+    let in_run = |k: usize| run.contains(&k);
+    // Segment-local sources/results: widen so any boundary-crossing edge stays an
+    // HBM pointer (never forwarded as SSA across a segment break).
+    let mut seg_sources: HashSet<u64> = HashSet::new();
+    let mut seg_results: HashSet<u64> = HashSet::new();
+    for k in run.clone() {
+        for b in &spec.nodes[k].bindings {
+            if b.is_output {
+                let consumed_outside = consumed_at
+                    .get(&b.tensor)
+                    .is_some_and(|cs| cs.iter().any(|&c| !in_run(c)));
+                if spec.results.contains(&b.tensor) || consumed_outside {
+                    seg_results.insert(b.tensor);
+                }
+            } else {
+                let produced_outside = produced_at
+                    .get(&b.tensor)
+                    .is_some_and(|ps| ps.iter().any(|&p| !in_run(p)));
+                if spec.sources.contains(&b.tensor) || produced_outside {
+                    seg_sources.insert(b.tensor);
+                }
+            }
+        }
+    }
+    let seg_spec = ProgramSpec {
+        nodes: spec.nodes[run.clone()].to_vec(),
+        sources: seg_sources.clone(),
+        results: seg_results.clone(),
+    };
+    let mut func = fuse_program(module, &seg_spec)?;
+    // Force the fused segment to grid [1,1] (single core). `fuse_program` stamps
+    // the grid from the run's FIRST node, which can be a token-parallel [8,1]
+    // matmul node — but the whole point of folding those in is that the GPU GEMM
+    // reconstruction (and the single-core K-loop offload it rides on) rebuilds the
+    // full M at grid [1,1], ignoring the Spyre SPMD grid. A residual [8,1] grid
+    // would (a) re-tile the GEMM across cores so the single-core offload never
+    // fires, and (b) make each core recompute the whole reconstructed GEMM.
+    // Collapsing to [1,1] is the correct + fast path.
+    func.grid = (1, 1, 1);
+    // Classify the fused function's surviving pointer args by direction against
+    // the boundary sets: a `%t<id>_ptr` is a boundary OUTPUT iff `id ∈ seg_results`,
+    // a boundary INPUT iff `id ∈ seg_sources`. Anything else is an INTERNAL SCRATCH
+    // arg (an intra-segment edge fusion could NOT forward as SSA — resident HBM the
+    // fused fn writes then reads in its own body; the runner zero-inits it).
+    let mut outputs: HashSet<u64> = HashSet::new();
+    let mut inputs: HashSet<u64> = HashSet::new();
+    for (arg, _) in &func.arguments {
+        let id = tensor_id_of_arg(arg);
+        if seg_results.contains(&id) {
+            outputs.insert(id);
+        } else if seg_sources.contains(&id) {
+            inputs.insert(id);
+        }
+    }
+    Ok(Segment::Fused(FusedSegment { func, outputs, inputs }))
+}
+
+/// Split node range `[start, j)` into consecutive sub-ranges whose fused LX
+/// live-set each fits `budget`. Greedy: grow a sub-run until adding the next node
+/// would push the peak co-resident bytes over budget, then start a new one. A lone
+/// node over budget is kept alone (that is node-level tiling, not fusion's job).
+/// `budget == usize::MAX` (or empty `tensor_bytes`) ⇒ the whole run, unsplit.
+fn split_run(
+    nodes: &[NodeSpec],
+    start: usize,
+    j: usize,
+    tensor_bytes: &HashMap<u64, usize>,
+    global_last: &HashMap<u64, usize>,
+    budget: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut subs: Vec<std::ops::Range<usize>> = Vec::new();
+    if budget == usize::MAX || tensor_bytes.is_empty() {
+        subs.push(start..j); // whole run, unsplit
+        return subs;
+    }
+    let mut s = start;
+    while s < j {
+        // Grow `e` (exclusive) while including node `e` keeps [s, e] within budget;
+        // always include at least node `s`.
+        let mut e = s + 1;
+        while e < j && peak_live_bytes(nodes, s, e + 1, tensor_bytes, global_last) <= budget {
+            e += 1;
+        }
+        subs.push(s..e);
+        s = e;
+    }
+    subs
+}
+
+/// Peak co-resident LX bytes over node range `[s, e)` (exclusive `e`), at
+/// NODE-output granularity: each tensor a node touches is live from its first
+/// touch in the window to its last touch in the window — or to the window end if
+/// it is also touched later in the program (it then crosses the sub-run boundary
+/// and must persist to be stored). This captures exactly the wide intermediates
+/// the per-op reclaim cannot free (e.g. an MLP's gate/up/product held at once);
+/// intra-node temporaries are GPU/scratch-side, not large LX tiles.
+fn peak_live_bytes(
+    nodes: &[NodeSpec],
+    s: usize,
+    e: usize,
+    tensor_bytes: &HashMap<u64, usize>,
+    global_last: &HashMap<u64, usize>,
+) -> usize {
+    let mut win_last: HashMap<u64, usize> = HashMap::new();
+    for (k, node) in nodes.iter().enumerate().take(e).skip(s) {
+        for b in &node.bindings {
+            win_last.insert(b.tensor, k);
+        }
+    }
+    let mut live: HashMap<u64, usize> = HashMap::new();
+    let mut peak = 0usize;
+    for (k, node) in nodes.iter().enumerate().take(e).skip(s) {
+        for b in &node.bindings {
+            live.insert(b.tensor, tensor_bytes.get(&b.tensor).copied().unwrap_or(0));
+        }
+        peak = peak.max(live.values().sum());
+        // Free tensors whose last in-window use is this node AND that are not
+        // touched after the window (those persist to the sub-run boundary).
+        live.retain(|tid, _| {
+            win_last.get(tid).copied().unwrap_or(k) > k
+                || global_last.get(tid).copied().unwrap_or(0) >= e
+        });
+    }
+    peak
 }
 
 /// Fuse `spec`'s nodes (functions in `module`) into a single `IRFunction`.

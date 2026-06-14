@@ -50,7 +50,7 @@ use crate::dtypes::DType;
 use crate::interpreter::{Arg, Output, TensorMeta, execute_function_in};
 use crate::ir::{Attr, IRModule, Operation, Value};
 use crate::memory::{STICK_BYTES, SpyreMemoryHierarchy};
-use ktir_optimizer::fusion::{ProgramSpec, Segment, plan_segments};
+use ktir_optimizer::fusion::{ProgramSpec, Segment, plan_segments_budgeted};
 use std::collections::HashMap;
 
 /// Recover the logical tensor id from a fused pointer-arg name `%t<id>_ptr`.
@@ -164,10 +164,22 @@ impl ResidentExecutor {
     /// passes). Sources are not yet written — call [`set_source`](Self::set_source)
     /// / [`set_sources`](Self::set_sources) before [`run`](Self::run).
     pub fn new(module: IRModule, spec: &ProgramSpec) -> Result<Self, String> {
-        let segments = plan_segments(&module, spec)?;
         let shapes = derive_shapes(&module, spec)?;
         let dtype = DType::F16;
         let bpe = dtype.bytes_per_elem();
+        // Plan segments under the LX live-set budget so a fused segment's
+        // co-resident intermediates never overflow the per-core LX (the MLP
+        // over-grouping that broke llama m=32). tensor_bytes = numel × f16 bytes.
+        let tensor_bytes: HashMap<u64, usize> = shapes
+            .iter()
+            .map(|(&id, shp)| (id, shp.iter().product::<usize>() * bpe))
+            .collect();
+        let segments = plan_segments_budgeted(
+            &module,
+            spec,
+            crate::memory::lx_fusion_budget(),
+            &tensor_bytes,
+        )?;
 
         // The set of every tensor id any segment references (a pointer arg of a
         // fused segment, or a binding of a native node). We allocate a stick for
