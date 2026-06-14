@@ -211,106 +211,54 @@ fn run_per_node_result(dir: &std::path::Path) -> Vec<f32> {
     buf[&manifest["result"].as_u64().unwrap()].clone()
 }
 
-/// PARTIAL-FUSION run: plan the bundle into ordered segments (fused runs of
-/// non-attention nodes + native attention nodes), then execute them threading one
-/// HBM host buffer per tensor id — the exact per-node threading, but with
-/// non-attention runs collapsed into a single fused [1,1] function (carrying all
-/// the GPU offloads) and each head-parallel attention node run at its NATIVE grid
-/// (the proven-correct multi-core SPMD path). Returns the result tensor and the
-/// number of (fused, native) segments. The fused single-grid path collapsed
-/// attention to head 0; this restores every head.
+/// PARTIAL-FUSION run via the PRODUCTION API: build the program's source args
+/// (weights/inputs from t{id}.bin, the attn mask zeroed) keyed by `t{id}`, then
+/// call `ktir_cpu::segmented::execute_segmented` — the real serving path. It
+/// plans the bundle into ordered segments (fused runs of non-attention nodes +
+/// native attention nodes), threads one HBM host buffer per tensor id, runs each
+/// fused segment at grid [1,1] (carrying the GPU offloads) and each head-parallel
+/// attention node at its NATIVE grid (the proven-correct multi-core SPMD path),
+/// and reads back the result. Returns the result tensor and the number of
+/// (fused, native) segments (counted from `plan_segments` for the diagnostics).
 fn run_segmented_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
     let b = load_bundle(dir);
+
+    // Count the segments for the diagnostics the gates print (the production API
+    // returns only the requested output tensors, not the plan shape).
     let segments = plan_segments(&b.module, &b.spec).expect("plan segments");
+    let n_fused = segments.iter().filter(|s| matches!(s, Segment::Fused(_))).count();
+    let n_native = segments.iter().filter(|s| matches!(s, Segment::Native(_))).count();
 
-    // One host buffer per tensor id (the shared HBM). Seed sources from t{id}.bin
-    // (true weights/inputs); intermediates/results are written as segments run.
-    let mut buf: HashMap<u64, Vec<f32>> = HashMap::new();
+    // The program's SOURCES, keyed by the canonical `t{id}` name the production
+    // API expects: true weights/inputs from t{id}.bin, and the attn mask as
+    // all-zero (a `source` in the spec but not a file-backed weight — golden
+    // uses a no-mask prefill mask).
+    let mut owned: Vec<(String, Arg)> = Vec::new();
     for (&id, &(rows, cols, is_src)) in &b.shape {
-        if is_src {
-            buf.insert(id, read_f32(&dir.join(format!("t{id}.bin"))));
-        } else if Some(id) == b.mask_id {
-            // The attn mask is a `source` in the spec but not a file-backed
-            // weight — golden uses an all-zero (no-mask) prefill mask.
-            buf.insert(id, vec![0.0f32; rows * cols]);
+        if is_src && Some(id) != b.mask_id {
+            owned.push((
+                format!("t{id}"),
+                Arg::Tensor {
+                    data: read_f32(&dir.join(format!("t{id}.bin"))),
+                    shape: vec![rows, cols],
+                    dtype: DType::F16,
+                },
+            ));
         }
     }
+    if let Some(m) = b.mask_id {
+        let (rows, cols, _) = b.shape[&m];
+        owned.push((
+            format!("t{m}"),
+            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+        ));
+    }
+    let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
 
-    let mut n_fused = 0usize;
-    let mut n_native = 0usize;
-    for seg in &segments {
-        match seg {
-            // A fused segment: marshal every pointer arg, run it at grid [1,1],
-            // and copy back every BOUNDARY OUTPUT it produced. A pointer arg is
-            // one of three kinds:
-            //  - boundary INPUT (`seg.inputs`): a source / earlier-segment / attn
-            //    output — fed from the live buffer (must be resident).
-            //  - boundary OUTPUT (`seg.outputs`): consumed by a later segment /
-            //    attn / the final result — zero-init, copied back.
-            //  - internal SCRATCH: an intra-segment edge fusion could NOT forward
-            //    as SSA, kept as resident HBM the fused fn writes then reads in
-            //    its own body — zero-init, NOT copied back.
-            Segment::Fused(seg) => {
-                n_fused += 1;
-                let mut args: Vec<(String, Arg)> = Vec::new();
-                let mut out_ids: Vec<(String, u64)> = Vec::new();
-                for (name, _) in &seg.func.arguments {
-                    let id = tensor_id_of(name);
-                    let (rows, cols, _) = b.shape[&id];
-                    let bare = name.trim_start_matches('%').to_string();
-                    let data = if seg.inputs.contains(&id) {
-                        buf.get(&id)
-                            .cloned()
-                            .unwrap_or_else(|| panic!("fused segment input {id} not produced"))
-                    } else {
-                        // boundary output OR internal scratch: zero-init.
-                        if seg.outputs.contains(&id) {
-                            out_ids.push((bare.clone(), id));
-                        }
-                        vec![0.0f32; rows * cols]
-                    };
-                    args.push((bare, Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 }));
-                }
-                let refs: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
-                let want: Vec<&str> = out_ids.iter().map(|(n, _)| n.as_str()).collect();
-                let mut module = IRModule::default();
-                module.add_function(seg.func.clone());
-                let out = execute_function_outputs(&module, "fused", &refs, &want)
-                    .expect("run fused segment");
-                for (name, id) in &out_ids {
-                    buf.insert(*id, out.get(name).expect("segment output").data.clone());
-                }
-            }
-            // A native attention node: run it at its OWN grid (multi-core SPMD
-            // over heads), threading buffers exactly like the per-node oracle.
-            Segment::Native(node) => {
-                n_native += 1;
-                let mut args: Vec<(String, Arg)> = Vec::new();
-                let mut out_ids: Vec<(String, u64)> = Vec::new();
-                for bind in &node.bindings {
-                    let id = bind.tensor;
-                    let (rows, cols, _) = b.shape[&id];
-                    let name = bind.arg.trim_start_matches('%').to_string();
-                    let data = if bind.is_output {
-                        out_ids.push((name.clone(), id));
-                        vec![0.0f32; rows * cols]
-                    } else {
-                        buf.get(&id)
-                            .cloned()
-                            .unwrap_or_else(|| panic!("attn input {id} not produced"))
-                    };
-                    args.push((name, Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 }));
-                }
-                let refs: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
-                let out = execute_function(&b.module, &node.func, &refs)
-                    .unwrap_or_else(|e| panic!("native attn {}: {e}", node.func));
-                for (name, id) in &out_ids {
-                    buf.insert(*id, out.get(name).expect("attn output").data.clone());
-                }
-            }
-        }
-    }
-    let result = buf.remove(&b.result_id).expect("result produced");
+    let result_key = format!("t{}", b.result_id);
+    let out = ktir_cpu::segmented::execute_segmented(&b.module, &b.spec, &args, &[&result_key])
+        .expect("execute_segmented");
+    let result = out.get(&result_key).expect("result produced").data.clone();
     (result, n_fused, n_native)
 }
 

@@ -39,3 +39,4 @@ pub mod memory;
 #[cfg(metal)]
 pub mod metal_backend;
 pub mod ops_memory;
+pub mod segmented;
