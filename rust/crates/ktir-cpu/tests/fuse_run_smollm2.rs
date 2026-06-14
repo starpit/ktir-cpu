@@ -690,3 +690,70 @@ fn map_fusion_plan_carves_windows() {
         assert!(!triggers.is_empty(), "{which}: expected fusable windows");
     }
 }
+
+// ===========================================================================
+// Llama-3.2-1B — the BIG-model target (per the project goal: prefill/big-model,
+// not the tiny 135M decode). ~8x SmolLM2; the GEMMs and attention are large
+// enough that the GPU offloads should win decisively (the 135M numbers undersell
+// them because tiny tensors are GPU-dispatch-overhead-bound).
+// ===========================================================================
+
+#[cfg(metal)]
+#[test]
+#[ignore = "big-model fuse-then-run; needs ~/.cache/cudaforge/ktir/llama-3.2-1b. --ignored --nocapture"]
+fn llama_3_2_1b_fused_matches_golden() {
+    let Some(dir) = bundle_dir_named("llama-3.2-1b") else {
+        eprintln!("llama-3.2-1b bundle absent — skipping");
+        return;
+    };
+    ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (max_abs, _) = run_fused_golden(&dir, "Llama-3.2-1B decode");
+    let gemms = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("  Llama-1B decode: {gemms} K-loop GEMMs + {maps} map windows on GPU");
+    assert!(gemms > 0, "expected GPU GEMMs on the 1B model");
+    assert!(max_abs < 0.05, "Llama-1B decode fused diverges from golden by {max_abs}");
+}
+
+#[cfg(metal)]
+#[test]
+#[ignore = "big-model prefill; needs ~/.cache/cudaforge/ktir/llama-3.2-1b-prefill. --ignored --nocapture"]
+fn llama_3_2_1b_prefill_fused_matches_golden() {
+    let Some(dir) = bundle_dir_named("llama-3.2-1b-prefill") else {
+        eprintln!("llama-3.2-1b-prefill bundle absent — skipping");
+        return;
+    };
+    let (max_abs, _) = run_fused_golden(&dir, "Llama-3.2-1B PREFILL");
+    assert!(max_abs < 0.05, "Llama-1B prefill fused diverges from golden by {max_abs}");
+}
+
+/// Big-model perf: GPU offloads ON vs OFF, on Llama-3.2-1B (where tensors are
+/// large enough that the GPU wins). Run alone (no concurrent benches).
+#[cfg(metal)]
+#[test]
+#[ignore = "big-model perf bench; needs the llama-3.2-1b[-prefill] bundles. --ignored --nocapture"]
+fn llama_3_2_1b_gpu_vs_cpu_mspass() {
+    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    for (model, dir) in [
+        ("decode", bundle_dir_named("llama-3.2-1b")),
+        ("prefill", bundle_dir_named("llama-3.2-1b-prefill")),
+    ] {
+        let Some(dir) = dir else { eprintln!("llama {model} absent — skipping"); continue };
+        // SAFETY: single-threaded test toggling our own offload gates.
+        unsafe {
+            std::env::set_var("KTIR_NO_GPU_GEMM", "1");
+            std::env::set_var("KTIR_NO_GPU_MAP", "1");
+        }
+        let cpu = time_fused(&dir, iters);
+        unsafe {
+            std::env::remove_var("KTIR_NO_GPU_GEMM");
+            std::env::remove_var("KTIR_NO_GPU_MAP");
+        }
+        let gpu = time_fused(&dir, iters);
+        eprintln!(
+            "Llama-1B {model}: all-CPU {cpu:.0} ms/pass  |  GPU fusion {gpu:.0} ms/pass  |  speedup {:.2}x",
+            cpu / gpu
+        );
+    }
+}

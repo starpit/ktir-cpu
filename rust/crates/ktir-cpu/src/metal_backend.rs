@@ -513,7 +513,18 @@ pub fn run_matmul_loop_gpu(
         let mut uc = engine.unified(m * n)?;
         // `&ua`/`&ub` deref-coerce `Rc<UnifiedBuffer>` -> `&UnifiedBuffer`.
         engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
-        Ok(uc.as_slice().to_vec())
+        let out = uc.as_slice().to_vec();
+        // Diagnostic: cross-check the GPU GEMM against a CPU sgemm on the SAME
+        // operands. A diff >> f16 noise pinpoints a NaxGemm shape bug (vs a
+        // recognizer/operand bug, which would leave GPU==CPU here).
+        if std::env::var_os("KTIR_GEMM_CHECK").is_some() {
+            let cpu = crate::blas::sgemm_rowmajor(m, k, n, ua.as_slice(), ub.as_slice());
+            let d = out.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            if d > 0.05 {
+                eprintln!("  [gemm-check] m={m} k={k} n={n}  GPU vs CPU max diff {d:.4}");
+            }
+        }
+        Ok(out)
     })?;
     // The K-loop's result tensor is f16 (matmul outs dtype); NaxGemm computes in
     // f16 internally, so this matches the interpreter's matmul precision.
@@ -558,6 +569,11 @@ fn resolve_gemm_operand_unified(
         // Constant weight in HBM: cache by (name, len, content fingerprint).
         crate::ir::Value::Index(stick) => {
             let addr = stick * crate::memory::STICK_BYTES;
+            // Diagnostic: bypass the cache entirely (always decode+upload fresh).
+            if std::env::var_os("KTIR_NO_WEIGHT_CACHE").is_some() {
+                let decoded = ctx.hbm.borrow().read_decoded(addr, n, DType::F16);
+                return Ok(std::rc::Rc::new(engine.unified_from(&decoded)?));
+            }
             let fingerprint = {
                 let hbm = ctx.hbm.borrow();
                 weight_fingerprint(&hbm, addr, n, DType::F16)
