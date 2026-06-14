@@ -85,7 +85,11 @@ def main():
         return buf
 
     iters = int(os.environ.get("SMOLLM2_ITERS", "5"))
-    one_pass()  # warm-up (cache effects, lazy init) — excluded
+    # The warm-up pass (cache effects, lazy init) is normally excluded. For very
+    # slow bundles (llama: minutes/pass) it just doubles wall-time and the run is
+    # compute-bound, so the cold pass ≈ a warm one — SKIP_WARMUP=1 drops it.
+    if not os.environ.get("SKIP_WARMUP"):
+        one_pass()  # warm-up — excluded
     t0 = time.perf_counter()
     for _ in range(iters):
         one_pass()

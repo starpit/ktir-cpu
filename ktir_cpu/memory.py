@@ -84,6 +84,7 @@ live set of SSA tensor values as the LX footprint.
 """
 
 from typing import Dict, Optional, Tuple
+import bisect
 import numpy as np
 
 
@@ -92,6 +93,12 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 from .dtypes import to_np_dtype, bytes_per_elem
+
+
+# Per-dict cache for `_find_allocation`'s O(log n) bisect: maps a memory dict to
+# (dict_ref, len, sorted_base_ptrs). The dict_ref pins the dict so its id() can't
+# be reused while cached; a len change (only adds, or an all-clear) invalidates.
+_FIND_ALLOC_CACHE: Dict[int, Tuple[dict, int, list]] = {}
 
 
 def _find_allocation(
@@ -111,20 +118,37 @@ def _find_allocation(
     """
     if ptr in memory:
         return (ptr, memory[ptr], 0)
-    for base_ptr, data in memory.items():
-        # Use the allocation's own itemsize to compute its byte span,
-        # not the caller's elem_size (which reflects the access dtype
-        # and may differ from the stored dtype).
+    if not memory:
+        return None
+    # O(log n) containing-interval lookup instead of a linear scan over every
+    # allocation. Allocations are non-overlapping, so the one that can contain
+    # `ptr` is the one with the largest base_ptr <= ptr; bisect finds it. A
+    # per-dict (id -> (len, sorted_base_ptrs)) cache keeps the sorted view; in this
+    # simulator keys are only added (writes) or all-cleared (lx.clear), never
+    # singly removed, so a len change is a sound "rebuild" signal.
+    #
+    # NOTE: the original implementation scanned `memory.items()` linearly, which is
+    # O(allocations) PER access. That is fine for the small per-node working sets of
+    # smollm2 (fits 2 MB LX) but becomes O(n^2) for llama, whose function bodies
+    # hold thousands of live allocations (the reference's reclaim is scope-level,
+    # so a raised LX cap is needed to run it at all) — that artifact, not faithful
+    # interpreter compute, dominated the first cap-raised llama timing. This lookup
+    # removes it so the measured Python time reflects the interpreter, not the scan.
+    cache = _FIND_ALLOC_CACHE.get(id(memory))
+    if cache is None or cache[0] is not memory or cache[1] != len(memory):
+        keys = sorted(memory.keys())
+        _FIND_ALLOC_CACHE[id(memory)] = (memory, len(memory), keys)
+    else:
+        keys = cache[2]
+    i = bisect.bisect_right(keys, ptr) - 1
+    if i >= 0:
+        base_ptr = keys[i]
+        data = memory[base_ptr]
+        # Use the allocation's own itemsize to compute its byte span, not the
+        # caller's elem_size (which reflects the access dtype and may differ).
         end_ptr = base_ptr + data.size * data.itemsize
-
-        # NOTE: the ptr in memory check in the first return
-        #       actually handles the ptr == base_ptr case.
-        # - therefore the strict equality base_ptr < ptr
-        #   is meant to emphasize that equality checks will
-        #   not come to this branch of logic.
         if base_ptr < ptr < end_ptr:
-            elem_offset = (ptr - base_ptr) // elem_size
-            return (base_ptr, data, elem_offset)
+            return (base_ptr, data, (ptr - base_ptr) // elem_size)
     return None
 
 
