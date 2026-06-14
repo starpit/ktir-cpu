@@ -259,6 +259,11 @@ impl<'m> ResidentExecutor<'m> {
     pub fn run(&mut self, outputs: &[&str]) -> Result<HashMap<String, Output>, String> {
         self.zero_non_sources();
 
+        // KTIR_SEG_DIAG: accumulate fused (GPU GEMM/map) vs native (CPU-interpreter
+        // attention) wall-time per pass — to see how much of e2e is the attention
+        // islands still on the interpreter.
+        let diag = std::env::var_os("KTIR_SEG_DIAG").is_some();
+        let (mut t_fused, mut t_native, mut n_fused, mut n_native) = (0.0f64, 0.0f64, 0usize, 0usize);
         for seg in &self.segments {
             // Reset every core's LX scratchpad before each segment run. The
             // persistent `mem` reuses the SAME LX across segments/passes, but each
@@ -271,6 +276,7 @@ impl<'m> ResidentExecutor<'m> {
             for lx in &self.mem.lx_scratchpads {
                 lx.borrow_mut().clear();
             }
+            let seg_t0 = std::time::Instant::now();
             match seg {
                 Segment::Fused(fs) => {
                     // Bind every pointer arg to its resident stick, and collect
@@ -328,6 +334,25 @@ impl<'m> ResidentExecutor<'m> {
                     )?;
                 }
             }
+            if diag {
+                let dt = seg_t0.elapsed().as_secs_f64() * 1e3;
+                match seg {
+                    Segment::Fused(_) => {
+                        t_fused += dt;
+                        n_fused += 1;
+                    }
+                    Segment::Native(_) => {
+                        t_native += dt;
+                        n_native += 1;
+                    }
+                }
+            }
+        }
+        if diag {
+            eprintln!(
+                "  [resident-seg-diag] {n_fused} fused {t_fused:.1}ms (GPU GEMM/map) | \
+                 {n_native} native {t_native:.1}ms (CPU-interp attention)"
+            );
         }
 
         // Read back the requested outputs (default: the program results) from the
