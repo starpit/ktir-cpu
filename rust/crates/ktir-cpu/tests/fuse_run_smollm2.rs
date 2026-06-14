@@ -297,6 +297,96 @@ fn fused_gpu_vs_cpu_mspass() {
     }
 }
 
+/// ADVERSARIAL: the resident weight cache must NEVER serve a STALE weight. We run
+/// the SAME fused function TWICE with DIFFERENT weight values bound to the SAME
+/// argument names (the exact hazard a name-keyed cache would mishandle — each run
+/// allocates HBM deterministically, so the SSA root names AND stick addresses
+/// repeat across runs; only the weight *content* differs). The content
+/// fingerprint in [`WeightKey`] must detect the changed bytes and force a refresh,
+/// so the second result reflects the NEW weights.
+///
+/// If the cache keyed by name alone (the bug the user forbids), pass 2 would reuse
+/// pass 1's resident buffers and the two results would be IDENTICAL. We assert
+/// they DIFFER (the new weights took effect) and, as a positive control, that the
+/// weight-cache MISS counter advanced on pass 2 (the fingerprint forced a
+/// re-decode+re-upload), proving it was the fingerprint — not a coincidence — that
+/// caught the change.
+#[cfg(metal)]
+#[test]
+#[ignore = "weight-cache staleness guard; needs ~/.cache/cudaforge/ktir/smollm2-135m. \
+            Run with --ignored --nocapture"]
+fn weight_cache_refreshes_on_changed_weights() {
+    use std::sync::atomic::Ordering;
+    let Some(dir) = bundle_dir() else {
+        eprintln!("SmolLM2 bundle absent — skipping");
+        return;
+    };
+    let (module, args, result_id) = fused_run_inputs(&dir);
+    let result_ptr = format!("t{result_id}_ptr");
+
+    // Start from a clean cache so this test's miss-counter assertion is isolated.
+    ktir_cpu::metal_backend::clear_weight_cache();
+
+    // Pass 1: original weights. Capture the result.
+    let refs1: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let out1 = execute_function_outputs(&module, "fused", &refs1, &[&result_ptr])
+        .expect("pass 1")
+        .get(&result_ptr)
+        .expect("pass 1 result")
+        .data
+        .clone();
+
+    // Build pass 2 args: SAME names, but every non-zero (source weight) tensor
+    // scaled by 2.0 so its HBM bytes — and thus its fingerprint — change. The mask
+    // / zeroed intermediates stay zero (scaling 0 is 0, harmless). Activations are
+    // recomputed inside the run and are never cached, so this only exercises the
+    // weight path.
+    let scaled: Vec<(String, Arg)> = args
+        .iter()
+        .map(|(name, arg)| {
+            let Arg::Tensor { data, shape, dtype } = arg else {
+                return (name.clone(), arg.clone());
+            };
+            let data: Vec<f32> = data.iter().map(|x| x * 2.0).collect();
+            (name.clone(), Arg::Tensor { data, shape: shape.clone(), dtype: *dtype })
+        })
+        .collect();
+
+    let misses_before = ktir_cpu::metal_backend::WEIGHT_CACHE_MISSES.load(Ordering::Relaxed);
+    let refs2: Vec<(&str, Arg)> = scaled.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let out2 = execute_function_outputs(&module, "fused", &refs2, &[&result_ptr])
+        .expect("pass 2")
+        .get(&result_ptr)
+        .expect("pass 2 result")
+        .data
+        .clone();
+    let misses_after = ktir_cpu::metal_backend::WEIGHT_CACHE_MISSES.load(Ordering::Relaxed);
+
+    let max_abs = out1
+        .iter()
+        .zip(&out2)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let refreshed = misses_after - misses_before;
+    eprintln!(
+        "staleness guard: pass1 vs pass2(scaled weights) max abs diff {max_abs:.5}; \
+         weight-cache misses on pass 2 = {refreshed} (fingerprint-forced re-uploads)"
+    );
+
+    assert_eq!(out1.len(), out2.len(), "result length");
+    // The new weights MUST have taken effect — a name-only cache would return
+    // pass-1's stale buffers and give an identical result (max_abs == 0).
+    assert!(
+        max_abs > 1e-3,
+        "scaled weights produced an IDENTICAL result ({max_abs}) — the cache served STALE weights"
+    );
+    // Positive control: the fingerprint detected the change and forced refreshes.
+    assert!(
+        refreshed > 0,
+        "no weight-cache misses on pass 2 — the fingerprint did NOT detect the changed weights"
+    );
+}
+
 /// Fuse a bundle, run the fused function through the interpreter (with the
 /// matmul-loop GPU offload active under cfg(metal)), and compare the result to
 /// golden.bin. Returns max-abs-diff vs golden.

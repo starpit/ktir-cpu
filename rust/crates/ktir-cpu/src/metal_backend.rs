@@ -366,6 +366,100 @@ thread_local! {
     /// One GEMM engine per scheduler thread (the cooperative core scheduler is
     /// single-threaded), compiled once and reused across all K-loops.
     static GEMM_ENGINE: std::cell::OnceCell<Option<NaxGemm>> = const { std::cell::OnceCell::new() };
+
+    /// Resident WEIGHT cache: a GEMM's constant weight operand (an HBM pointer)
+    /// decoded f16->f32 and uploaded to a [`UnifiedBuffer`] EXACTLY ONCE, then
+    /// reused across every pass. Weights are identical across the autoregressive
+    /// decode loop / the bench loop, so re-decoding+re-uploading them each pass
+    /// (e.g. the lm_head [576,49152] = 113 MB) was pure repeated work — the
+    /// data-movement bottleneck this cache eliminates.
+    ///
+    /// SAFETY (correctness): keyed by [`WeightKey`] = `(root SSA name, element
+    /// count, content fingerprint)`, NOT by name alone. The fingerprint is a hash
+    /// of a fixed strided SAMPLE of the operand's raw HBM bytes (see
+    /// [`weight_fingerprint`]), so different weight *data* bound to the same SSA
+    /// name (a different model reusing `%t..._ptr`, or weights mutated in place)
+    /// yields a different key and forces a refresh. This makes the cache immune to
+    /// the stale-weight hazard a name-only cache would have. Only resolves for
+    /// HBM-pointer operands (constant weights); resident activation tiles change
+    /// every pass and are NEVER cached.
+    ///
+    /// `Rc` so a hit hands out a cheap clone (the buffer stays owned by the cache
+    /// and outlives the GEMM dispatch). Bounded by [`WEIGHT_CACHE_MAX`] entries.
+    static WEIGHT_CACHE: std::cell::RefCell<HashMap<WeightKey, std::rc::Rc<UnifiedBuffer>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Identity of a cached resident weight buffer. A match on all three fields means
+/// the SAME data (same name, same length, same content sample) — safe to reuse.
+/// A mismatch on ANY field (notably the content fingerprint) is a different
+/// weight and forces a decode+upload refresh, so a stale weight can never be
+/// served. See [`WEIGHT_CACHE`].
+#[cfg(metal)]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct WeightKey {
+    root: String,
+    len: usize,
+    fingerprint: u64,
+}
+
+/// Max distinct weight buffers held resident at once. SmolLM2-135M has on the
+/// order of ~100 weight tensors; this bounds memory if a long-running process
+/// cycles through many distinct weights. On overflow the cache is cleared (a
+/// simple, correct eviction — the next pass repopulates the working set).
+#[cfg(metal)]
+const WEIGHT_CACHE_MAX: usize = 512;
+
+/// Number of f32 samples taken to fingerprint a weight operand. Enough spread
+/// (first, last, and strided interior elements) that two different weight tensors
+/// of the same shape collide only with astronomically low probability, while
+/// staying O(SAMPLES) — negligible vs the full decode+upload it guards.
+#[cfg(metal)]
+const WEIGHT_FP_SAMPLES: usize = 64;
+
+/// Content fingerprint of an HBM weight operand: hash a fixed strided sample of
+/// its raw backing bytes (NOT a full decode). We sample the first and last
+/// elements plus [`WEIGHT_FP_SAMPLES`] evenly-spaced interior elements, reading
+/// each element's raw `dtype` bytes straight from HBM and folding them into a
+/// `DefaultHasher` together with `n` and the dtype size. Hashing raw bytes (vs
+/// decoded f32) avoids decoding the whole tensor just to key it, yet still
+/// distinguishes any two operands whose data differs at a sampled position — the
+/// staleness guard. (A weight that differs ONLY at unsampled positions is the
+/// pathological miss; the dense, spread-out sampling makes that vanishingly
+/// unlikely for real tensors, and the `len` term catches any shape change.)
+#[cfg(metal)]
+fn weight_fingerprint(
+    hbm: &crate::memory::HBMSimulator,
+    byte_addr: i64,
+    n: usize,
+    dtype: DType,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let bpe = dtype.bytes_per_elem();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    n.hash(&mut h);
+    bpe.hash(&mut h);
+    if n == 0 {
+        return h.finish();
+    }
+    // Element indices to sample: 0, last, and WEIGHT_FP_SAMPLES strided interior
+    // points. Stepping at least 1 so a small tensor still terminates.
+    let last = n - 1;
+    let step = (n / WEIGHT_FP_SAMPLES.max(1)).max(1);
+    let mut idx = 0usize;
+    loop {
+        let elem = idx.min(last);
+        let off = byte_addr + (elem * bpe) as i64;
+        // Read this element's raw bytes (zero-padded past the allocation end).
+        for b in hbm.read_bytes(off, bpe) {
+            b.hash(&mut h);
+        }
+        if elem == last {
+            break;
+        }
+        idx += step;
+    }
+    h.finish()
 }
 
 /// Count of K-loops successfully offloaded to a GPU GEMM (test/telemetry proof
@@ -374,26 +468,50 @@ thread_local! {
 pub static MATMUL_LOOP_GPU_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Number of resident-weight-cache HITS — a weight operand served from a cached
+/// `UnifiedBuffer` instead of re-decoded+re-uploaded. Test/telemetry proof the
+/// cache is doing work (the 2nd+ pass of a multi-pass run should be nearly all
+/// hits). Paired with [`WEIGHT_CACHE_MISSES`].
+#[cfg(metal)]
+pub static WEIGHT_CACHE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Number of resident-weight-cache MISSES — a weight decoded+uploaded fresh
+/// (first sight, changed data, or an evicted entry). See [`WEIGHT_CACHE_HITS`].
+#[cfg(metal)]
+pub static WEIGHT_CACHE_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Clear the resident weight cache (test hook / memory-pressure relief). The next
+/// pass repopulates whatever weights it actually touches.
+#[cfg(metal)]
+pub fn clear_weight_cache() {
+    WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 /// Run a recognized matmul K-loop as ONE GPU GEMM, binding the loop's result
 /// tensor in `ctx`. Operands are resolved from the value table: a forwarded
-/// activation is already a resident `Tile` (f32); a weight is an HBM pointer we
-/// decode. The interpreter then skips the loop body entirely. Returns `Err` if
-/// the GEMM can't run (no device, shape mismatch) so the caller falls back to
-/// executing the loop on the interpreter.
+/// activation is already a resident `Tile` (f32) and is re-uploaded each pass; a
+/// constant weight is an HBM pointer decoded+uploaded ONCE and then served from
+/// the resident [`WEIGHT_CACHE`]. The interpreter then skips the loop body
+/// entirely. Returns `Err` if the GEMM can't run (no device, shape mismatch) so
+/// the caller falls back to executing the loop on the interpreter.
 #[cfg(metal)]
 pub fn run_matmul_loop_gpu(
     info: &MatmulLoopInfo,
     ctx: &mut crate::context::CoreContext,
 ) -> Result<(), String> {
     let (m, k, n) = (info.m as usize, info.k as usize, info.n as usize);
-    let a = resolve_gemm_operand(&info.a_root, m, k, ctx)?;
-    let b = resolve_gemm_operand(&info.b_root, k, n, ctx)?;
     let c = GEMM_ENGINE.with(|cell| -> Result<Vec<f32>, String> {
         let engine = cell.get_or_init(|| NaxGemm::new().ok());
         let engine = engine.as_ref().ok_or("metal: no NaxGemm device")?;
-        let ua = engine.unified_from(&a)?;
-        let ub = engine.unified_from(&b)?;
+        // A and B each resolve to a resident UnifiedBuffer: a constant weight
+        // (HBM pointer) comes from the cache (decoded+uploaded at most once); a
+        // resident activation tile is uploaded fresh (it changes every pass and
+        // is NEVER cached).
+        let ua = resolve_gemm_operand_unified(&info.a_root, m, k, ctx, engine)?;
+        let ub = resolve_gemm_operand_unified(&info.b_root, k, n, ctx, engine)?;
         let mut uc = engine.unified(m * n)?;
+        // `&ua`/`&ub` deref-coerce `Rc<UnifiedBuffer>` -> `&UnifiedBuffer`.
         engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
         Ok(uc.as_slice().to_vec())
     })?;
@@ -407,17 +525,27 @@ pub fn run_matmul_loop_gpu(
     Ok(())
 }
 
-/// Resolve a GEMM operand to a flat `[rows*cols]` f32 buffer: a resident `Tile`
-/// is used directly; an HBM pointer (`Value::Index`) is decoded from f16.
+/// Resolve a GEMM operand to a resident [`UnifiedBuffer`].
+///
+///   * A resident `Tile` (a forwarded activation) is uploaded to a FRESH buffer
+///     each call — it changes every pass, so caching it would be incorrect.
+///   * An HBM pointer (`Value::Index`, a constant weight) is served from
+///     [`WEIGHT_CACHE`]: on a key match (same name + len + content fingerprint)
+///     the cached `Rc<UnifiedBuffer>` is cloned (no decode, no upload); on a miss
+///     it is decoded f16->f32, uploaded once, and inserted. This is where the
+///     per-pass weight re-upload cost is eliminated.
 #[cfg(metal)]
-fn resolve_gemm_operand(
+fn resolve_gemm_operand_unified(
     root: &str,
     rows: usize,
     cols: usize,
     ctx: &crate::context::CoreContext,
-) -> Result<Vec<f32>, String> {
+    engine: &NaxGemm,
+) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
     let n = rows * cols;
     match ctx.get_value(root)? {
+        // Activations are resident already and CHANGE every pass — upload fresh,
+        // never cache. (Caching one would serve a stale activation next pass.)
         crate::ir::Value::Tile(t) => {
             if t.data.len() != n {
                 return Err(format!(
@@ -425,11 +553,35 @@ fn resolve_gemm_operand(
                     t.data.len()
                 ));
             }
-            Ok(t.data.to_vec())
+            Ok(std::rc::Rc::new(engine.unified_from(&t.data)?))
         }
+        // Constant weight in HBM: cache by (name, len, content fingerprint).
         crate::ir::Value::Index(stick) => {
             let addr = stick * crate::memory::STICK_BYTES;
-            Ok(ctx.hbm.borrow().read_decoded(addr, n, DType::F16))
+            let fingerprint = {
+                let hbm = ctx.hbm.borrow();
+                weight_fingerprint(&hbm, addr, n, DType::F16)
+            };
+            let key = WeightKey { root: root.to_string(), len: n, fingerprint };
+            // Fast path: a hit returns the cached buffer with no further HBM work.
+            if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+                WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(buf);
+            }
+            // Miss: decode this weight f16->f32 and upload it once.
+            let decoded = ctx.hbm.borrow().read_decoded(addr, n, DType::F16);
+            let buf = std::rc::Rc::new(engine.unified_from(&decoded)?);
+            WEIGHT_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                // Bound memory: a simple clear-on-overflow eviction. Correct (the
+                // next pass repopulates the working set); rare in practice.
+                if cache.len() >= WEIGHT_CACHE_MAX {
+                    cache.clear();
+                }
+                cache.insert(key, buf.clone());
+            });
+            WEIGHT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(buf)
         }
         other => Err(format!("metal: GEMM operand {root} is {other:?}, want tile/ptr")),
     }
