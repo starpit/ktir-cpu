@@ -287,6 +287,59 @@ impl CoreRunner {
             let op = &ops[self.op_idx];
             let this_idx = self.op_idx;
             self.op_idx += 1;
+            // DIAGNOSTIC (KTIR_GEMM_DIAG): the decisive check the per-GEMM
+            // KTIR_GEMM_CHECK can't do. KTIR_GEMM_CHECK compares the GPU GEMM to a
+            // CPU sgemm on the *same recognized operands*, so it can never catch a
+            // recognizer that reconstructs the WRONG (m,k,n,a_root,b_root). Here we
+            // instead run the loop's ACTUAL scf.for body on the interpreter into
+            // out_ssa, capture that result, then run the GPU offload (overwriting
+            // out_ssa), and compare the two — a divergence pinpoints a recognizer
+            // mis-derivation (the GPU computed a correct-but-WRONG A@B vs the loop's
+            // real result).
+            #[cfg(metal)]
+            if op.op_type == "scf.for"
+                && std::env::var_os("KTIR_GEMM_DIAG").is_some()
+                && let Some(info) = op.result.as_deref().and_then(|r| matmul_sched.get(r))
+            {
+                // Run the real K-loop on the interpreter, capturing its result.
+                execute_op(op, &mut self.ctx, env)?;
+                let interp = match self.ctx.get_value(&info.out_ssa) {
+                    Ok(Value::Tile(t)) => Some(t.data.clone()),
+                    _ => None,
+                };
+                // Run the GPU offload (overwrites out_ssa with the GPU result).
+                if crate::metal_backend::run_matmul_loop_gpu(info, &mut self.ctx).is_ok()
+                    && let (Some(interp), Ok(Value::Tile(gpu))) =
+                        (interp, self.ctx.get_value(&info.out_ssa))
+                {
+                    let d = interp
+                        .iter()
+                        .zip(gpu.data.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    if d > 0.05 {
+                        eprintln!(
+                            "  [gemm-diag] DIVERGENT loop {} -> GPU vs interp max diff {d:.4}  \
+                             recognized m={} k={} n={} a_root={} b_root={}  \
+                             interp_len={} gpu_len={}",
+                            info.out_ssa,
+                            info.m,
+                            info.k,
+                            info.n,
+                            info.a_root,
+                            info.b_root,
+                            interp.len(),
+                            gpu.data.len(),
+                        );
+                    }
+                }
+                if let Some(dead) = self.dies_at.get(this_idx) {
+                    for name in dead {
+                        self.ctx.forget(name);
+                    }
+                }
+                continue;
+            }
             // Offload a recognized K-loop to a single GPU GEMM; on any failure
             // fall through to the interpreter (correctness preserved).
             #[cfg(metal)]

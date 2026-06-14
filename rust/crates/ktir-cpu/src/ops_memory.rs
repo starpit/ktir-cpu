@@ -895,6 +895,54 @@ pub fn store_data(
     let space = tile_ref.memref.space;
     let stick_bytes = stick_bytes_for(space);
 
+    // GRID-M-TILED STORE (fused single-core offload). When a K-loop GEMM is
+    // offloaded as ONE full-M GEMM (the matmul-loop offload reconstructs M from
+    // the activation view, e.g. prefill's [8,k]@[k,n]), the stored tile carries
+    // ALL M rows, but the access-tile footprint is a SINGLE row `[1, w]` at
+    // `[pid, off]` (the per-core SPMD store: each of M cores writes its own row).
+    // In the fused [1,1] run pid=0, so the per-row store would write only row 0
+    // and leave rows 1..M stale. A CONTIGUOUS footprint already writes the whole
+    // tile via the fast path below (the full-width lm_head, all projections — they
+    // work); only a STRIDED footprint (an N-tiled column window, the wide lm_head
+    // split into column tiles) takes the slow path and would drop rows 1..M.
+    //
+    // Detect that case here: the stored tile has more elements than the footprint
+    // and is a 2-D `[M, w]` whose width matches the footprint's last dim. Scatter
+    // ALL M rows, mapping tile element `(r, c)` to `r * row_stride + c * col_stride`
+    // off `base_ptr` (the view's own strides), which lands each row in its place.
+    // This only fires when the stored tile is bigger than the footprint, which can
+    // only happen via the single-core offload (multi-core keeps per-row [1,w]
+    // tiles), so it never changes the multi-core SPMD scatter.
+    let foot_numel: usize = tile_ref.shape.iter().product();
+    if tile.data.len() > foot_numel
+        && coords.is_none()
+        && !is_contiguous(&tile_ref.shape, &tile_ref.strides)
+        && tile.shape.len() == 2
+        && tile_ref.shape.len() == 2
+        && tile_ref.strides.len() == 2
+        && tile.shape[1] == tile_ref.shape[1]
+        && tile.shape[0] * tile.shape[1] == tile.data.len()
+    {
+        let (rows, cols) = (tile.shape[0] as i64, tile.shape[1] as i64);
+        let (rs, cs) = (tile_ref.strides[0], tile_ref.strides[1]);
+        let mut offsets = Vec::with_capacity(tile.data.len());
+        for r in 0..rows {
+            for c in 0..cols {
+                offsets.push(r * rs + c * cs);
+            }
+        }
+        let span = offsets.iter().copied().max().map(|m| m + 1).unwrap_or(1) as usize;
+        let raw = read_raw(ctx, space, tile_ref.base_ptr, span * bpe);
+        let mut flat = decode(&raw, dtype, span);
+        for (i, &o) in offsets.iter().enumerate() {
+            flat[o as usize] = tile.data[i];
+        }
+        let new_raw = encode(&flat, dtype);
+        write_raw(ctx, space, tile_ref.base_ptr, &new_raw);
+        // Unique-stick sideband isn't needed on this single-core offload path.
+        return Ok(0);
+    }
+
     // Fast path: contiguous tile, no coord filtering.
     if coords.is_none() && is_contiguous(&tile_ref.shape, &tile_ref.strides) {
         let raw = encode(&tile.data, dtype);

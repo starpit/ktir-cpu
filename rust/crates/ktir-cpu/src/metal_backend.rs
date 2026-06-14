@@ -239,6 +239,14 @@ pub enum KernelRegion {
 /// resident-buffer SSA roots of the full A and B tensors. `a_root`/`b_root` are
 /// the SSA/pointer names the executor looks up (A is typically a forwarded
 /// `tensor.extract_slice` source — the resident activation; B a weight load).
+///
+/// `n` is the OUTPUT width this loop computes (the matmul's per-iteration N). When
+/// the program tiles the output N dimension across several sequential K-loops
+/// (Llama-1B's lm_head: `[m,2048]@[2048,128256]` split into 16384-wide column
+/// tiles), `n_off`/`b_stride` describe B as a COLUMN SLICE of a wider weight:
+/// this loop's B is `B_full[k, n_off : n_off+n]`, where `B_full` has row stride
+/// `b_stride` (the full weight width). For the common case (no N-tiling) `n_off=0`
+/// and `b_stride=n` (B is contiguous and the slice is the whole tensor).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct MatmulLoopInfo {
     pub m: i64,
@@ -247,6 +255,10 @@ pub struct MatmulLoopInfo {
     pub a_root: String,
     pub b_root: String,
     pub out_ssa: String,
+    /// Column offset of this loop's B slice within the full weight (0 = no tiling).
+    pub n_off: i64,
+    /// Row stride of the full weight B occupies (== `n` when B is contiguous).
+    pub b_stride: i64,
 }
 
 /// How an op participates in scheduling.
@@ -401,6 +413,10 @@ struct WeightKey {
     root: String,
     len: usize,
     fingerprint: u64,
+    /// Column offset of the cached slice within the full weight (0 = whole tensor /
+    /// contiguous). Distinguishes the N-tile slices of a single N-tiled weight (the
+    /// lm_head's 8 column tiles share `root` but differ here) so they cache apart.
+    col_off: i64,
 }
 
 /// Max distinct weight buffers held resident at once. SmolLM2-135M has on the
@@ -509,7 +525,15 @@ pub fn run_matmul_loop_gpu(
         // resident activation tile is uploaded fresh (it changes every pass and
         // is NEVER cached).
         let ua = resolve_gemm_operand_unified(&info.a_root, m, k, ctx, engine)?;
-        let ub = resolve_gemm_operand_unified(&info.b_root, k, n, ctx, engine)?;
+        // B is a contiguous whole tensor in the common case; for an N-tiled output
+        // (the lm_head column tiles) it is a strided COLUMN SLICE of a wider weight.
+        let ub = if info.n_off == 0 && info.b_stride == info.n {
+            resolve_gemm_operand_unified(&info.b_root, k, n, ctx, engine)?
+        } else {
+            resolve_gemm_weight_slice(
+                &info.b_root, k, n, info.n_off, info.b_stride, ctx, engine,
+            )?
+        };
         let mut uc = engine.unified(m * n)?;
         // `&ua`/`&ub` deref-coerce `Rc<UnifiedBuffer>` -> `&UnifiedBuffer`.
         engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
@@ -578,7 +602,7 @@ fn resolve_gemm_operand_unified(
                 let hbm = ctx.hbm.borrow();
                 weight_fingerprint(&hbm, addr, n, DType::F16)
             };
-            let key = WeightKey { root: root.to_string(), len: n, fingerprint };
+            let key = WeightKey { root: root.to_string(), len: n, fingerprint, col_off: 0 };
             // Fast path: a hit returns the cached buffer with no further HBM work.
             if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
                 WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -601,6 +625,73 @@ fn resolve_gemm_operand_unified(
         }
         other => Err(format!("metal: GEMM operand {root} is {other:?}, want tile/ptr")),
     }
+}
+
+/// Resolve an N-TILED GEMM weight operand B to a resident `[k, n]` [`UnifiedBuffer`]
+/// holding the COLUMN SLICE `B_full[:, col_off : col_off+n]`, where `B_full` is the
+/// HBM weight with row stride `b_stride`. Used for the lm_head's column tiles (the
+/// only N-tiled GEMMs in these bundles): the K-loop computes one 16384-wide output
+/// tile from a strided window of the [2048,128256] weight, and reconstructing that
+/// exact window (vs the whole tensor) is what makes the offload correct.
+///
+/// Only weights (HBM pointers) reach here (the recognizer rejects activation
+/// N-tiles). The slice is decoded f16->f32 row-by-row (each row is `n` contiguous
+/// elements at `col_off`) and cached by [`WeightKey`] including `col_off`, so the 8
+/// tiles of one weight cache independently and are decoded+uploaded at most once.
+#[cfg(metal)]
+fn resolve_gemm_weight_slice(
+    root: &str,
+    k: usize,
+    n: usize,
+    col_off: i64,
+    b_stride: i64,
+    ctx: &crate::context::CoreContext,
+    engine: &NaxGemm,
+) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let stick = match ctx.get_value(root)? {
+        crate::ir::Value::Index(s) => *s,
+        other => {
+            return Err(format!(
+                "metal: N-tiled GEMM weight {root} is {other:?}, want an HBM pointer"
+            ));
+        }
+    };
+    let base = stick * crate::memory::STICK_BYTES;
+    let bpe = DType::F16.bytes_per_elem() as i64;
+    // Gather the strided column window into a contiguous [k, n] row-major f32 buffer.
+    let decode_slice = |hbm: &crate::memory::HBMSimulator| -> Vec<f32> {
+        let mut out = Vec::with_capacity(k * n);
+        for r in 0..k as i64 {
+            let row_addr = base + (r * b_stride + col_off) * bpe;
+            out.extend_from_slice(&hbm.read_decoded(row_addr, n, DType::F16));
+        }
+        out
+    };
+    if std::env::var_os("KTIR_NO_WEIGHT_CACHE").is_some() {
+        let decoded = decode_slice(&ctx.hbm.borrow());
+        return Ok(std::rc::Rc::new(engine.unified_from(&decoded)?));
+    }
+    // Fingerprint the FULL weight (root identity); col_off keys the slice apart.
+    let fingerprint = {
+        let hbm = ctx.hbm.borrow();
+        weight_fingerprint(&hbm, base, k * b_stride as usize, DType::F16)
+    };
+    let key = WeightKey { root: root.to_string(), len: k * n, fingerprint, col_off };
+    if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(buf);
+    }
+    let decoded = decode_slice(&ctx.hbm.borrow());
+    let buf = std::rc::Rc::new(engine.unified_from(&decoded)?);
+    WEIGHT_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= WEIGHT_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, buf.clone());
+    });
+    WEIGHT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(buf)
 }
 
 /// Diagnostic: `(top-level scf.for count, of which recognized as matmul K-loops)`.
@@ -1179,14 +1270,83 @@ fn recognize_matmul_loop(forop: &Operation, defs: &HashMap<String, &Operation>) 
     if a_shape.len() != 2 || b_shape.len() != 2 || a_shape[1] != b_shape[0] {
         return None;
     }
+    // N-TILING. The loop tiles only the K dimension; the matmul's per-iteration
+    // output then spans this loop's OUTPUT N (its last dim). For a plain K-loop
+    // that equals B's full view width (the whole output row, summed over K-blocks).
+    // But scratchy also tiles the OUTPUT N dimension sequentially when the output
+    // is too wide for one tile: Llama-1B's lm_head `[m,2048]@[2048,128256]` is
+    // split into 16384-wide COLUMN tiles, several K-loops, each computing B's
+    // COLUMN SLICE `B_full[k, n_off : n_off+16384]` at a constant offset `n_off`
+    // carried in the B access tile's column index. `matmul_operand_full` resolves B
+    // to its FULL view ([2048,128256]) and drops that column offset, so a naive
+    // reconstruction would compute the whole [m,128256] for EVERY slice — a
+    // correct-but-WRONG A@B. We instead reconstruct the exact column SLICE:
+    //   * n   = this loop's output N (the matmul's last dim) = the tile width,
+    //   * n_off = the B access tile's column-index constant (the slice start),
+    //   * b_stride = B's full view width (the source row stride for the slice).
+    // The executor then uploads `B_full[:, n_off : n_off+n]` (strided gather) and
+    // runs an `[m,k]@[k,n]` GEMM, computing the full M for THIS column tile — so
+    // prefill (M=8) writes ALL token rows (the interpreter fallback, run at grid
+    // [1,1] in the fused function, would only write row 0). For the common case
+    // (SmolLM2's lm_head, all projections) n_off=0 and n==b_stride==full width.
+    //
+    // M is intentionally NOT cross-checked: a grid-parallel prefill K-loop
+    // (SmolLM2/Llama [8,1]) legitimately has matmul-out M=1 (one row per core)
+    // while the reconstructed M=8 comes from the full activation view — that
+    // M-from-grid reconstruction is exactly what this recognizer is for.
+    let mm_out = shape_attr_vec(Some(mm))?;
+    let n_tile = *mm_out.last()?;
+    let b_full_n = b_shape[1];
+    let (n, n_off, b_stride) = if n_tile == b_full_n {
+        // Plain (untiled) output: B is the whole contiguous tensor.
+        (b_full_n, 0, b_full_n)
+    } else {
+        // N-tiled: B is a column slice. Only reconstructible when B is a weight
+        // `ktdp.load` (an HBM pointer we can strided-decode) — read the slice
+        // offset from the B access tile's column index. A non-weight (forwarded
+        // activation) N-tile can't be strided here, so reject (interpreter).
+        let n_off = matmul_b_col_offset(mm.operands.get(1)?, defs)?;
+        if n_off < 0 || n_off + n_tile > b_full_n {
+            return None; // offset/width out of the weight — refuse to guess
+        }
+        (n_tile, n_off, b_full_n)
+    };
     Some(MatmulLoopInfo {
         m: a_shape[0],
         k: a_shape[1],
-        n: b_shape[1],
+        n,
         a_root,
         b_root,
         out_ssa: forop.result.clone()?,
+        n_off,
+        b_stride,
     })
+}
+
+/// The constant column (last-axis) offset of a matmul B operand's access tile, for
+/// an N-tiled weight load. `name` is the matmul's B operand (a `ktdp.load`); its
+/// access tile `construct_access_tile %view, %row, %col` carries the column index
+/// as its last index operand. Returns that index's `arith.constant` value, or
+/// `None` if B isn't a weight load or the column index isn't a static constant
+/// (a non-constant column index can't be reconstructed as a fixed slice).
+fn matmul_b_col_offset(name: &str, defs: &HashMap<String, &Operation>) -> Option<i64> {
+    let d = defs.get(strip(name))?;
+    if d.op_type != "ktdp.load" {
+        return None; // forwarded activation N-tile: not handled
+    }
+    let tile = d.operands.first()?;
+    let tile_op = defs.get(strip(tile))?;
+    // construct_access_tile operands: [view, idx0, idx1, ...]; the LAST is the
+    // column (innermost/N-axis) index for a 2-D weight view.
+    let col_idx = tile_op.operands.last()?;
+    let cd = defs.get(strip(col_idx))?;
+    if cd.op_type != "arith.constant" {
+        return None;
+    }
+    match cd.attributes.get("value") {
+        Some(Attr::Int(i)) => Some(*i),
+        _ => None,
+    }
 }
 
 /// Resolve a matmul operand to (resident-root SSA/ptr name, FULL 2-D shape).
@@ -4431,6 +4591,7 @@ module {
                 a_root: "%src".into(),
                 b_root: "%wptr".into(),
                 out_ssa: "%mm".into(),
+                n_off: 0, b_stride: 576,
             })],
             "prefill K-loop must collapse to a single [8,576]@[576,576] GEMM"
         );
@@ -4449,6 +4610,7 @@ module {
                 a_root: "%aptr".into(),
                 b_root: "%wptr".into(),
                 out_ssa: "%mm".into(),
+                n_off: 0, b_stride: 576,
             })]
         );
     }
