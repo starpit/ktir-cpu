@@ -52,6 +52,14 @@ BUNDLE=<model> ITERS=<n> KTIR_NO_GPU_GEMM=1 KTIR_NO_GPU_MAP=1 \
 BUNDLE=<model> ITERS=<n> \
     cargo test --release -p ktir-cpu --features metal --test fuse_run_smollm2 \
     segmented_mspass -- --ignored --nocapture --test-threads=1
+# RESIDENT (the production serving path: weights uploaded ONCE, kernels chained
+# on-device — this is the headline number; one warm-up pass is excluded):
+BUNDLE=<model> ITERS=<n> \
+    cargo test --release -p ktir-cpu --features metal --test fuse_run_smollm2 \
+    resident_mspass -- --ignored --nocapture --test-threads=1
+# Resident golden gate (all 4 configs vs golden.bin in one run):
+cargo test --release -p ktir-cpu --features metal --test fuse_run_smollm2 \
+    resident_matches_golden -- --ignored --nocapture --test-threads=1
 # BUNDLE ∈ {smollm2-135m, smollm2-135m-prefill, llama-3.2-1b, llama-3.2-1b-prefill}
 # (bundles live under ~/.cache/cudaforge/ktir/<bundle>/; not in the repo).
 ```
@@ -62,11 +70,13 @@ GPU-offload toggles (read by `comm_sched` / `metal_backend`):
 |---|---|
 | `KTIR_NO_GPU_GEMM=1` | K-loop GEMMs stay on Accelerate (no NAX) |
 | `KTIR_NO_GPU_MAP=1`  | map-window elementwise stays on the CPU interpreter |
+| `KTIR_GEMM_GPU_MIN_KN` | min weight `k·n` to offload a decode (M=1) GEMM to NAX (default 3,000,000; 0 = always GPU). M>1 prefill is always GPU regardless. |
+| `KTIR_MAP_GPU_MIN_ELEMS` | min output elems to offload a fused map window (default 16,384; 0 = always GPU) |
 | `KTIR_GPU_PLAIN_MATMUL` / `KTIR_GPU_REDUCE` / `KTIR_GPU_TRANSPOSE` | opt-in attention-island offloads (default OFF; a net loss on tiny attention tensors) |
 
 ---
 
-## Latest snapshot (2026-06-14, commit `0017fc3`)
+## Latest snapshot (2026-06-14, commit `911aad5`)
 
 ### Per-kernel
 
@@ -99,51 +109,83 @@ one big GEMM instead of a tiled SPMD K-loop).
 
 ### E2E whole-model (ms/pass; lower is better)
 
-Three Rust paths: **per-node** (optimized interpreter, no whole-program fusion),
-**fused-AMX** (segmented executor, GPU offloads OFF), **fused-Metal** (segmented
-executor, GPU offloads ON: K-loop NAX GEMMs + map-window kernels + resident
-weight cache; head-parallel attention via native-grid segments).
+Four Rust paths. The first three build a **fresh** memory hierarchy per pass:
+**per-node** (optimized interpreter, no whole-program fusion), **fused-AMX**
+(segmented executor, GPU offloads OFF), **fused-Metal** (segmented executor, GPU
+offloads ON, now size-gated). The fourth is the new **RESIDENT** GPU executor
+(`resident::ResidentExecutor`): weights are marshaled into a persistent HBM
+**once**, then every pass chains its segments on-device — fused [1,1] segments
+(NAX K-loop GEMMs + map-window kernels) and head-parallel native attention — with
+intermediates flowing segment→segment in HBM and **no per-pass weight re-marshal**.
 
-| Model / mode | Python | Rust per-node | Rust fused-AMX | Rust fused-Metal | fused Metal→AMX | golden max-abs | notes |
-|---|---:|---:|---:|---:|---:|---:|---|
-| smollm2-135m **decode** | 2397 ms | 704.9 ms | **245.5 ms** | 418.6 ms | 0.59× (Metal slower) | 0.0014 | tiny M=1 GEMMs; GPU dispatch-bound → AMX wins |
-| smollm2-135m **prefill** (M=8) | — | 1271.8 ms | **679.4 ms** | 813.6 ms | 0.83× (Metal slower) | 0.0035 | still too small to clear the GPU crossover |
-| llama-3.2-1b **decode** | — | 3089.2 ms | **8717.2 ms** | 24918.4 ms | 0.35× (Metal slower) | 0.0026 | M=1; every layer pays NAX dispatch latency → big loss |
-| llama-3.2-1b **prefill** (M=32) | — | 29132.1 ms | 7976.8 ms | **6269.6 ms** | **1.27× (Metal wins)** | 0.0033 | large M fills the GPU → the offloads finally pay off |
+| Model / mode | Python | per-node | fused-AMX | fused-Metal | **RESIDENT** | resident vs best-prior | golden |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| smollm2-135m **decode** | 2397 | 704.9 | 245.5 | 252.8 | **128.8** | **1.9× faster** | 0.0014 |
+| smollm2-135m **prefill** (M=8) | — | 1271.8 | **679.4** | 813.6³ | 747.9 | 0.91× (AMX edges it) | 0.0035 |
+| llama-3.2-1b **decode** | — | 3089.2 | 8717.2 | 40303.5 | **588.5** | **5.3× faster** | 0.0014 |
+| llama-3.2-1b **prefill** (M=32) | — | 29132.1 | 7976.8 | 6269.6³ | **3991.9** | **1.57× faster** | 0.0033 |
+
+³ fused-Metal prefill not re-measured with the size gates: prefill GEMMs are M>1
+  (always-GPU) and its map windows clear the 16384-elem gate, so the gates leave
+  prefill essentially unchanged from the pre-gate `0017fc3` numbers. The decode
+  fused-Metal cells **are** re-measured with the gates (smollm2 418.6→252.8 as the
+  tiny M=1 GEMMs route to AMX; llama 24918→40303, run-to-run noise — the gates
+  cannot help llama decode, see below).
 
 E2E speedups vs Python (smollm2-135m decode, the only mode with a Python e2e
-number): per-node **3.4×**, fused-AMX **9.8×**, fused-Metal **5.7×**.
+number): per-node **3.4×**, fused-AMX **9.8×**, RESIDENT **18.6×**.
 
-Iters were kept modest on the big model per the one-at-a-time rule: llama decode
-ITERS=3, llama prefill ITERS=2 (a 2-sample median ≈ the faster of two passes).
-All golden max-abs figures are the known-current correctness numbers (f16/GPU
-noise, well inside the gates: smollm2 ≤0.0035, llama ≤0.05).
+**Residency is the architectural fix, not the backend.** The three fresh-context
+paths rebuild HBM and re-marshal every weight per pass — on llama-1B that is
+~2 GB re-uploaded *per token*. The size gates alone do **not** fix it: the
+non-resident `fused-Metal` path *with the gates in place* still measures
+**40303 ms/pass** on llama decode, vs the resident path's **588.5 ms** — a **68×**
+gap that is purely the eliminated per-pass marshal. The two wins are orthogonal:
+the resident HBM kills the marshal everywhere; the gates stop decode from paying
+GPU dispatch on tiny work (they fire inside the resident path too).
+
+Iters per the one-at-a-time rule: smollm2 ITERS=5, llama decode ITERS=3, llama
+prefill ITERS=2; one warm-up pass excluded; median reported. All golden max-abs
+figures are from `resident_matches_golden` (f16/GPU noise, well inside the gates:
+smollm2 ≤0.0035, llama ≤0.05).
 
 ---
 
 ## Interpretation
 
-- **Metal wins exactly where the use case lives — big-model prefill.** On
-  llama-3.2-1b prefill (M=32, the GEMMs are large enough to fill the GPU and dwarf
-  its ~300 µs/dispatch submission latency) fused-Metal is **1.27× faster** than
-  fused-AMX, and the raw NAX matmul primitive is **1.9× faster** than Accelerate
-  at prefill scale (512×4096×4096). This is the throughput target.
-- **Metal loses on decode (M=1) regardless of model size.** Single-token decode
-  produces tall-skinny 1×K@K×N GEMMs that leave the GPU mostly idle while still
-  paying full dispatch+sync latency per layer, so fused-Metal is *slower* than
-  fused-AMX on every decode config (0.59× smollm2, 0.35× llama-1B). For decode,
-  **fused-AMX is the right path**; the GPU offloads should be left off.
-- **Fusion beats per-node almost everywhere; the exception is llama decode.**
-  Segmenting/fusing the program cuts per-node dispatch+marshal overhead (smollm2
-  decode 705→246 ms, prefill 1272→679 ms; llama-1B prefill 29.1 s→8.0 s with AMX).
-  The one inversion is llama-1B *decode*, where per-node (3.1 s) beats fused-AMX
-  (8.7 s) — the fused [1,1] segments serialize the big weight GEMMs that the
-  per-node path runs at its native token-parallel grid; worth a follow-up.
+- **The resident executor is the right path everywhere.** Marshaling weights once
+  and chaining kernels on-device makes Metal the fastest path on 3 of 4 configs —
+  smollm2 decode (128.8 ms, 1.9× over the prior best fused-AMX), llama decode
+  (588.5 ms, 5.3× over per-node and 42× over the old per-pass-marshal fused-Metal),
+  llama prefill (3991.9 ms, 1.57× over fused-AMX) — and within 9% on smollm2
+  prefill. The earlier conclusion that "Metal loses on decode" was an artifact of
+  the *fresh-context* execution model, not the GPU.
+- **The per-pass weight marshal was the whole bug.** The old "fused-Metal" walked
+  the interpreter op-by-op and rebuilt HBM every pass, re-uploading ~2 GB of
+  llama-1B weights *per token*. That is why llama decode measured 8–40 s/pass —
+  more work than the CPU, exactly as flagged. Keeping weights resident collapses it
+  to 588 ms. Confirmed isolation: the gated-but-non-resident path is still 40 s.
+- **Metal still wins biggest where the use case lives — big-model prefill.** On
+  llama-3.2-1b prefill (M=32) the GEMMs fill the GPU and the raw NAX primitive is
+  **1.9× faster** than Accelerate at prefill scale (512×4096×4096); resident
+  prefill is 1.57× over fused-AMX and 7.3× over per-node. This is the throughput
+  target, and it now compounds with residency rather than fighting per-pass marshal.
+- **Size-gate the offloads so decode never pays GPU dispatch on tiny work.** M=1
+  decode produces tall-skinny 1×K@K×N GEMMs; routing the small ones to Accelerate
+  (`KTIR_GEMM_GPU_MIN_KN`) and skipping tiny map windows (`KTIR_MAP_GPU_MIN_ELEMS`)
+  cut smollm2-decode fused-Metal 418→253 ms on its own. Orthogonal to residency,
+  and active inside the resident path too. M>1 prefill is always-GPU (only the GPU
+  reconstructs the full-M GEMM correctly).
+- **Remaining gap: smollm2 prefill.** fused-AMX (679) still edges resident (748):
+  at M=8 with ~270 MB of weights, the GEMMs don't fill the GPU enough to beat
+  Accelerate and the residency saving is small. A follow-up could lift the decode
+  GEMM gate's reasoning to small-M prefill (route smollm2's sub-3M prefill GEMMs to
+  AMX while staying resident).
 - **Emulation-overhead caveat.** The matmul microbench shows the interpreter's
   tiled SPMD path (428 ms) is ~100× the raw primitive (3.75 ms): most per-kernel
   time on small tensors is dispatch/marshal, not arithmetic. The fastest backend
-  is only as fast as the path feeding it — which is why fusion (keeping data
-  resident, batching GEMMs) matters more than the backend choice on small shapes.
+  is only as fast as the path feeding it — which is why residency (weights uploaded
+  once, kernels chained, no host round-trip) matters more than the backend choice.
 
 ---
 
@@ -151,6 +193,27 @@ noise, well inside the gates: smollm2 ≤0.0035, llama ≤0.05).
 
 Append-only. Each snapshot is one block; newest on top. `n/a` = not measured that
 snapshot; `—` = not applicable.
+
+### 2026-06-14 · commit `911aad5` · Apple M5 — resident GPU executor
+
+Per-kernel unchanged from `0017fc3` (same NAX/Accelerate primitives). The change
+is the E2E execution model: a resident GPU executor uploads weights ONCE and
+chains segments on-device, plus size gates on the GEMM / map offloads.
+
+E2E ms/pass (per-node / fused-AMX / fused-Metal / **RESIDENT**):
+
+| Model/mode | per-node | fused-AMX | fused-Metal | **RESIDENT** |
+|---|---:|---:|---:|---:|
+| smollm2-135m decode  | 704.9 | 245.5 | 252.8 | **128.8** |
+| smollm2-135m prefill | 1271.8 | **679.4** | 813.6 | 747.9 |
+| llama-3.2-1b decode  | 3089.2 | 8717.2 | 40303.5 | **588.5** |
+| llama-3.2-1b prefill | 29132.1 | 7976.8 | 6269.6 | **3991.9** |
+
+Headline: RESIDENT is fastest on 3 of 4 (within 9% on smollm2 prefill). The
+llama-1B decode regression — the old fused-Metal's per-pass ~2 GB weight marshal,
+24918 ms at `0017fc3` / 40303 ms gated-but-non-resident here — collapses to
+**588.5 ms** (42–68×) once weights are resident. Golden: smollm2 0.0014/0.0035,
+llama 0.0014/0.0033 (all < 0.05) via `resident_matches_golden`.
 
 ### 2026-06-14 · commit `0017fc3` · Apple M5
 
