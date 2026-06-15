@@ -63,6 +63,7 @@ pub fn module_from_nodes(node_mlir: &[&str]) -> Result<IRModule, String> {
     // single-store canonical idiom; the real nodes are unrolled multi-store →
     // only the head pass matches them, and only below the cap).
     apply_head_rewrite_pass(&mut module);
+    apply_flash_attention_pass(&mut module);
     Ok(module)
 }
 
@@ -77,6 +78,22 @@ fn apply_head_rewrite_pass(module: &mut IRModule) {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(crate::memory::lx_fusion_budget);
     ktir_optimizer::head_rewrite::apply_head_rewrite(module, |scores_bytes| {
+        attention_needs_flash(scores_bytes, budget)
+    });
+}
+
+/// Run the flash-attention rewrite over `module` using the segmenter's LX budget
+/// as the cap threshold (Contract B). `KTIR_FLASH_ATTN_SCORES_BUDGET` overrides
+/// the scores-tile budget (bytes) the predicate compares against — a tiny value
+/// FORCES the pass to fire on recognized small attention nodes (the forced-fire
+/// golden), the default is the real `KTIR_LX_FUSION_BUDGET` budget so production
+/// behavior is unchanged.
+fn apply_flash_attention_pass(module: &mut IRModule) {
+    let budget = std::env::var("KTIR_FLASH_ATTN_SCORES_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(crate::memory::lx_fusion_budget);
+    ktir_optimizer::flash_attn::apply_flash_attention(module, |scores_bytes| {
         attention_needs_flash(scores_bytes, budget)
     });
 }

@@ -289,6 +289,168 @@ weight cache); the segment grid is forced to `[1,1]` so the token-parallel
 single-core K-loop offload). Result: Llama-1B prefill 0.00326, SmolLM2-135M
 prefill 0.00348 (both matching the per-node oracle ~0.003), decode unchanged.
 
+### K5. Multi-core attention on the GPU (head-batched SPMD)
+
+**Status**: 🟡 Partial (INC-0 + INC-1; `interpreter::execute_function_batched`).
+
+K4 runs each head-parallel attention node correctly but on the CPU interpreter,
+core-by-core: ~10K tiny per-`(head, op)` executions per pass including 1024 tiny
+GEMMs (32 matmuls/head × 32 heads), which `KTIR_SEG_DIAG` measured as ≈85% of the
+Llama-3.2-1B prefill pass. `execute_function_batched` is the inverse-sense sibling
+of `execute_function_gpu`: the `[num_cores]` grid dim IS the head tiling, so it
+steps every head's core in lockstep and collapses the per-head QK^T / A·V matmul
+class into one batched `NaxGemm::run_batched` dispatch each (grid z = head), with
+the per-pid gather/scatter falling out of the unchanged per-core `ktdp.load` /
+`ktdp.store`. It INHERITS the `execute_function_gpu` region-free + comm-free gate
+(plus `num_cores > 1`), so a flash-attention `scf.for` node (K6) or any
+region-bearing body returns `Err` → transparent per-core interpreter fallback; the
+single-core fused / decode / K-loop full-M GEMM paths are untouched. Wired
+wired into the `Segment::Native` arms of `segmented.rs` and `resident.rs` behind
+the opt-in `KTIR_BATCHED_ATTN` (DEFAULT-OFF, see perf note below);
+`KTIR_NATIVE_OP_TIMER` attributes native-segment time across op classes (INC-0).
+
+RFC 0682: execution-backend choice only — no new `ktdp` ops, no
+`construct_memory_view` allocation, no op-semantic change. Bit-faithful (same
+`nax_matmul` f16-in/f32-accumulate kernel as the golden-validated per-core path):
+Llama-1B prefill golden 0.00403 with all 16 native attention nodes batched (512
+matmul collapses); resident parity 0.00403; SmolLM2-135M prefill 0.00345; decode
+unchanged.
+
+**Perf (measured). Batched Metal/NAX BEATS AMX 2–3× for attention compute — but
+two conditions gate capturing it, and INC-1 as built meets neither, so it ships
+opt-in (default-off) for now.**
+
+Compute-only measurement (`batched_attention::batched_nax_vs_amx_compute_only`;
+operands resident, output never read back, GPU hardware-timestamp kernel time vs
+best-of-N batched Accelerate sgemm — the steady-state a resident pipeline sees), 32
+heads, head_dim 64, on `starpit/rust`:
+
+| shape | NAX batched | AMX | NAX speedup |
+|---|--:|--:|--:|
+| large-layer control m=512 k=2048 n=2048 | 1.17 ms | 2.26 ms | **1.93×** |
+| ATTN QK^T row-batched (m=cap) cap=256 | 0.16 ms | 0.35 ms | **2.26×** |
+| ATTN QK^T row-batched cap=1024 | 2.30 ms | 4.76 ms | **2.07×** |
+| ATTN QK^T row-batched cap=4096 | 35.7 ms | 110 ms | **3.08×** |
+| ATTN A·V row-batched cap=1024 | 3.22 ms | 4.90 ms | **1.52×** |
+| ATTN QK^T **unrolled m=1** cap=4096 | 0.79 ms | 0.47 ms | 0.60× |
+| ATTN QK^T unrolled m=1 cap=256 | 0.26 ms | 0.016 ms | 0.06× |
+
+So head-batched NAX is the **faster compute** for attention, consistent with the
+size-gated backend / `fused_gpu_vs_cpu` 1.86× — *when* the work has GPU parallelism.
+The two conditions:
+
+1. **Row-batched (`m=cap`), not unrolled (`m=1`).** The cached bundles emit attention
+   one query row at a time (`m=1` GEMV) — the only regime where NAX loses (0.03–0.60×,
+   no row parallelism / low occupancy). A row-batched emit, or TODO #2's flash-attention
+   tiling (which produces `m=block` score GEMMs), flips it to 2–3×.
+2. **Resident operands/scores (no host round-trip).** INC-1 keeps softmax/transpose
+   per-core on the CPU, so the `[cap,cap]` scores ship host↔device between the GPU
+   matmuls; that transfer eats the compute win. The full-node A/B on llama-3.2-1b
+   prefill is **0.90×** (4368 ms per-core vs 4877 ms batched) for exactly this reason —
+   NOT because the matmul is slower (it is 2–3× faster), but because INC-1 pays the
+   round-trip and runs on the bundles' unrolled `m=1` form.
+
+(A superseded transfer-inclusive sweep, `batched_vs_percore_gemm_crossover`, showed
+0.01–0.51× — but it timed `run_batched`'s per-call upload + full-scores readback,
+i.e. data movement a resident pipeline avoids; kept only as the host-round-trip
+datapoint.) **The win is captured by INC-4** (device-resident QK^T→softmax→A·V chain:
+gather once, keep scores in a `UnifiedBuffer`, scatter once) **driven by a row-batched
+attention shape** (FA-style tiling, not per-qrow unroll). INC-1 is the correct,
+golden-faithful foundation + measurement harness for that; it stays opt-in
+(`KTIR_BATCHED_ATTN`, default-off) until INC-4 lands. (Long-context prefill —
+`[num_cores,…]` K/V > 2 MB LX — also still falls back, no `dies_at`/`forget` reclaim yet.)
+
+### K6. Long-context attention LX overflow (flash-attention IR-rewrite pass)
+
+**Status**: ✅ Implemented + fires on the REAL cached prefill nodes
+(`ktir_optimizer::flash_attn`; cap-tiles the re-rolled context block, semantics
+preserved on llama-3.2-1b-prefill + smollm2-135m-prefill node111, weight-free).
+
+The `[m, cap]` attention scores tile is an INTRA-node tile that overflows the 2 MB
+LX as the KV length (`cap`) grows; segmentation cannot help because attention is
+one node (K4/K5 tile the head dim, not the cap dim). `flash_attn` has TWO
+structural recognizers, both fail-safe (`None` on any deviation):
+* `recognize_attention` / `tile_attention` — the clean single-block canonical
+  idiom (QK^T → scale → (mask) → softmax → A·V), rewritten to an `scf.for` over KV
+  blocks with online softmax (iter-args carry running max / sum / acc, avoiding the
+  unregistered `tensor.insert_slice`). Used for synthetic / clean nodes.
+* `recognize_rerolled_attention` / `tile_rerolled_attention` — the **head_rewrite
+  OUTPUT** (the REAL model node). `head_rewrite` (K7, runs FIRST) re-rolls the
+  unrolled per-head GQA lowering into a whole-tensor two-block form: a CONTEXT
+  `[m, cap]` QK^T (the tile that overflows) + a small `[m, m]` masked DIAGONAL +
+  online-softmax combine + two A·V, all stored as one `arith.addf(ovc, ovd)`. This
+  recognizer ANCHORS on exactly that addf-of-two-matmuls store value (the hop the
+  single-block recognizer bails on), recovers cap/m/d/gqac/hdc/scale/ninf purely
+  STRUCTURALLY from the IR, and the tiler cap-tiles ONLY the CONTEXT block into KV
+  blocks (`blk = choose_block_budgeted` so the per-block `[m, blk]` tile fits LX),
+  leaving the `[m, m]` diagonal whole; both partials are re-based onto the global
+  max and combined. Grid `[H,1,1]` and the per-head `get_compute_tile_id`/`divui
+  gqac`/`muli hdc` arithmetic are preserved verbatim. ONLY RFC-0682 ops (ktdp
+  load/store + Arith/Math/LinAlg/Tensor + ONE `scf.for`); NO `tensor.insert_slice`.
+
+Both are gated by Contract (B)'s `attention_needs_flash` (`fusion.rs`):
+`ReRolledIsland::scores_bytes == HeadAttnIsland::scores_bytes` (`m*cap*bytes`,
+context tile only), so the monotone predicate routes a node to head-reroll XOR
+flash, never both. Wired in `program::module_from_nodes` before segmentation
+(covers both run paths).
+
+Golden: single-block tiled-vs-naive ≈3e-5, forced-fire through the fusion path
+2e-4. **REAL-IR weight-free semantics gate** (`flash_attn_golden.rs`,
+`flash_rerolled_equals_head_rewrite_*`, `--ignored` + `metal`): for BOTH
+llama-3.2-1b-prefill and smollm2-135m-prefill node111, after `head_rewrite` +
+forced tiny budget, `flash_attn` FIRES (count > 0 — a no-op is a FAIL), the
+flash-tiled module run through the UNCHANGED `interpreter::execute_function` equals
+the head-rewritten reference within 0.05 (worst max-abs 0.0143 llama / 0.0096
+smollm2), and the per-block context tile is strictly smaller than the full
+`[m, cap]` footprint (the real long-context fix). Below the cap (the real caps are
+tiny, 64) the pass NO-OPS, so the production `program::execute` golden is unchanged
+(0.00138). **Follow-up**: the post-merge region-aware INC that lets a cap-tiled
+node ALSO be head-batched (compose K5 + K6).
+
+### K7. Head-parallel attention RE-ROLL (below-cap head IR-rewrite pass)
+
+**Status**: ✅ Implemented + deployed (`ktir_optimizer::head_rewrite`; fires on the
+real cached prefill nodes; measured wall-clock win).
+
+The real cached prefill attention nodes (`node111.mlir`) are the head-parallel SPMD
+lowering K6's recognizer explicitly does NOT match: a `grid = [H, 1]` whose per-core
+body is `m` MANUALLY UNROLLED query rows, each a two-block (square context +
+ragged-causal diagonal) online softmax — ~100 interpreter ops per row × `m` rows.
+`head_rewrite` is the head analogue of `flash_attn` for the cap dim:
+`recognize_head_attention` matches that unrolled idiom from STRUCTURAL invariants
+only (grid `[H,1]` H>1, no top-level `scf.*`, exactly `m == view0.rows` stores, the
+two-matmul-pair QK^T/AV signature per row, and the diagonal access tile verified to
+grow EXACTLY `r+1` rows — causal growth checked, not assumed; GQA divisor / head dim
+/ scale / -inf all READ from the ops), fail-safe `None` on any deviation.
+`rewrite_head_attention` RE-ROLLS the `m` rows into ONE pass of whole-`[m,*]` tensor
+ops: one `[m,d]` Q load, a `[m,cap]` context block (masked by the broadcast per-head
+context mask), a `[m,m]` diagonal block carrying a STATIC lower-triangular -inf mask
+(0 on/below diagonal — the exact re-association of the ragged per-row diagonal),
+online softmax over the two blocks, `Wc·Vc + Wd·Vd`, one `[m,d]` store. It emits ONLY
+RFC-0682 ops (`ktdp` load/store + Arith/Math/LinAlg + tensor; no new ktdp ops, no
+`construct_memory_view` allocation) and PRESERVES the grid `[H,1]` and the per-head
+GQA column arithmetic (`get_compute_tile_id` → `divui gqac` → `muli hdc`) as SSA, so
+every core still selects its own head/KV slice. Pure re-roll → emits NO `scf.*`, so
+it stays region-free and never trips the batched-executor's region-free gate.
+
+It is the BELOW-cap arm of Contract (B): gated by the SAME `attention_needs_flash`
+predicate as `flash_attn`, it fires IFF the re-rolled `[m,cap]` scores tile FITS LX,
+returning `None` (leave naive for `flash_attn`'s cap-tiling) on a long-context
+overflow — the documented disjoint head-vs-cap partition. Wired in
+`program::module_from_nodes` before segmentation (covers both run paths), ahead of
+the `flash_attn` pass.
+
+Golden (semantics gate, `tests/head_rewrite_golden.rs`, weight-free, arbitrary
+inputs through the UNCHANGED `execute_function`): re-rolled-vs-original on the REAL
+node111 is 1e-5 (smollm2-135m-prefill) / 5e-5 (llama-3.2-1b-prefill), both ≪ 0.05;
+`program::execute` whole-model golden unchanged at 0.00138 (decode bundle, where the
+single-core grid correctly fails the H>1 gate and the pass no-ops). **Honest perf**:
+the re-roll is a real wall-clock win — best-of-20 release, `execute_function` on the
+real node WITH vs WITHOUT the pass: smollm2-135m-prefill 15.8 ms → 2.9 ms (≈5.4×),
+llama-3.2-1b-prefill 258 ms → 19 ms (≈13.3×), from amortizing interpreter dispatch /
+allocation over the `m` rows. Follow-up: the post-merge region-aware INC that lets a
+re-rolled head node ALSO be GPU head-batched (compose with K5).
+
 ### Suggested Execution Order
 
 If we want the fastest path to meaningful conformance progress:

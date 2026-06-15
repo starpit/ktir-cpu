@@ -11,5 +11,6 @@
 //! a single function where those intermediates are SSA values, eliminating the
 //! per-edge `store → HBM → load` round-trip.
 
+pub mod flash_attn;
 pub mod fusion;
 pub mod head_rewrite;
