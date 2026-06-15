@@ -12,3 +12,4 @@
 //! per-edge `store → HBM → load` round-trip.
 
 pub mod fusion;
+pub mod head_rewrite;

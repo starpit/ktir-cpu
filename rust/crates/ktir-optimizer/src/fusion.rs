@@ -136,6 +136,43 @@ pub fn is_attention_node(func: &IRFunction) -> bool {
     has_transpose && has_softmax_reduce
 }
 
+/// CONTRACT (B) — the single source of truth that partitions the cap (KV-length)
+/// axis between the project's two attention optimizations, so that **each
+/// attention node receives EXACTLY ONE transform** and the region-free
+/// batched-executor gate (`interpreter.rs`, the `!regions.is_empty()` clause in
+/// `execute_function_gpu`) is never violated:
+///
+/// * **scores tile FITS LX** (below the cap) → leave attention **naive**. The node
+///   stays a region-free [`Segment::Native`] and is eligible for **head-batching**
+///   on the GPU multi-core batched executor (the multi-core-GPU TODO). Head dim is
+///   tiled across cores.
+/// * **scores tile OVERFLOWS LX** (above the cap) → the **flash-attention pass**
+///   (the FA-rewrite TODO) rewrites the node into a tiled `scf.for` online-softmax
+///   form that fits LX. The cap/KV dim is tiled. That node is now *region-bearing*,
+///   so it runs on the generic interpreter (the batched executor's region-free gate
+///   makes it `Err` → fall back, which is the *intended* path above the cap —
+///   head-batching cannot help a node whose scores already overflow LX).
+///
+/// The two are orthogonal (head dim vs cap dim) and compose only via a later
+/// region-aware INC; **neither fleet edits the region-free gate line** (reserved
+/// for that post-merge step). Because the predicate is monotone in `scores_bytes`
+/// and exhaustively partitions the axis, there is no overlap (no double-transform)
+/// and no gap (no silently-unhandled regime).
+///
+/// `scores_bytes` is the byte footprint of the attention scores tile `[m, cap]`
+/// (numel × storage-dtype bytes), as recovered by the FA recognizer; `lx_budget`
+/// is the per-core LX byte budget the segmenter already uses
+/// (`KTIR_LX_FUSION_BUDGET`, default 7/8 of 2 MB). Threshold mirrors that 7/8
+/// convention. **Fail-safe:** callers that cannot prove the scores footprint must
+/// pass a value that keeps this `false` (stay naive) — never force an FA path we
+/// cannot prove correct.
+pub fn attention_needs_flash(scores_bytes: usize, lx_budget: usize) -> bool {
+    // scores_bytes ≥ 7/8 · lx_budget  ⟺  the scores tile would overflow the LX
+    // fusion budget and must be cap-tiled (flash attention). Saturating math so a
+    // pathological huge footprint can't wrap.
+    lx_budget != 0 && scores_bytes.saturating_mul(8) >= lx_budget.saturating_mul(7)
+}
+
 /// Recover the tensor id from a fused pointer-arg name `%t<id>_ptr`.
 fn tensor_id_of_arg(arg: &str) -> u64 {
     arg.trim_start_matches('%')
@@ -1472,5 +1509,22 @@ mod tests {
             vec!["%t1_ptr", "%t4_ptr"],
             "intra-run edges forwarded: {args:?}"
         );
+    }
+
+    // Contract (B): the shared cap-threshold predicate must exhaustively and
+    // disjointly partition the cap axis at 7/8 of the LX budget, and fail safe
+    // (stay naive) at a zero budget.
+    #[test]
+    fn attention_needs_flash_partitions_at_seven_eighths() {
+        let lx = 2 * 1024 * 1024; // 2 MB
+        let thresh = lx * 7 / 8;
+        // Below the 7/8 cap → naive (head-batchable); at/above → flash.
+        assert!(!attention_needs_flash(thresh - 1, lx), "just below cap stays naive");
+        assert!(attention_needs_flash(thresh, lx), "at cap flips to flash");
+        assert!(attention_needs_flash(thresh + 1, lx), "above cap is flash");
+        assert!(attention_needs_flash(usize::MAX, lx), "huge footprint can't wrap");
+        // Fail-safe: an unknown/zero budget never forces an FA path.
+        assert!(!attention_needs_flash(usize::MAX, 0), "zero budget fails safe to naive");
+        assert!(!attention_needs_flash(0, lx), "empty scores never flash");
     }
 }
