@@ -33,7 +33,7 @@
 //! manual scanning (regex is the production tool to adopt here).
 
 use crate::ir::{Attr, IRFunction, IRModule, Operation, Scalar, Value};
-use crate::parser_ast::{is_full_set, is_identity_map, parse_affine_map, parse_affine_set};
+use crate::parser_ast::{is_identity_map, parse_affine_map, parse_affine_set};
 
 /// Parse a full module's MLIR text into an [`IRModule`]. Mirrors `parse_module`.
 pub fn parse_module(text: &str) -> Result<IRModule, String> {
@@ -868,7 +868,12 @@ fn parse_construct_access_tile_attrs(
     // access_tile_set -> coordinate_set; dropped when full over the tile box.
     if let Some(raw) = named_attr_value(text, "access_tile_set") {
         let set = parse_affine_set(&raw)?;
-        if !is_full_set(&set, &shape) {
+        // Use the O(2^n) vertex check (the same one the runtime uses in ops_memory)
+        // — NOT the brute-force `is_full_set` box enumeration, which is O(∏shape) (a
+        // Vec alloc per integer point) and dominated whole-bundle parse time (~86%
+        // on llama prefill attention nodes; ~2500x slower on the hot 256x64 set).
+        // Equivalent for convex affine sets (all KTIR access_tile_set are convex).
+        if !set.is_full(&shape) {
             attrs.insert("coordinate_set".to_string(), Attr::AffineSet(set));
         }
     }
@@ -912,12 +917,20 @@ fn parse_extract_slice_attrs(
             groups.len()
         ));
     }
-    attrs.insert("slice_offsets".to_string(), Attr::StrList(groups[0].clone()));
+    attrs.insert(
+        "slice_offsets".to_string(),
+        Attr::StrList(groups[0].clone()),
+    );
     attrs.insert("slice_sizes".to_string(), Attr::StrList(groups[1].clone()));
-    attrs.insert("slice_strides".to_string(), Attr::StrList(groups[2].clone()));
+    attrs.insert(
+        "slice_strides".to_string(),
+        Attr::StrList(groups[2].clone()),
+    );
 
     // shape/dtype from the destination type (`... to tensor<...>`).
-    let dest = result_type.and_then(|rt| rt.rsplit(" to ").next()).or(result_type);
+    let dest = result_type
+        .and_then(|rt| rt.rsplit(" to ").next())
+        .or(result_type);
     if let Some((shape, dt)) = dest.and_then(parse_tensor_type) {
         attrs.insert("shape".to_string(), Attr::IntList(shape));
         attrs.insert("dtype".to_string(), Attr::Str(dt));
@@ -1883,12 +1896,23 @@ mod tests {
         // @a's body has one constant + return; @b's has two constants + return.
         // (The overshoot bug gave @a @b's body, or dropped @b entirely.)
         let consts = |f: &IRFunction| {
-            f.operations.iter().filter(|o| o.op_type == "arith.constant").count()
+            f.operations
+                .iter()
+                .filter(|o| o.op_type == "arith.constant")
+                .count()
         };
         assert_eq!(consts(a), 1, "@a body kept its own ops");
         assert_eq!(consts(b), 2, "@b body kept its own ops");
-        assert!(a.operations.iter().any(|o| o.result.as_deref() == Some("%va")));
-        assert!(b.operations.iter().any(|o| o.result.as_deref() == Some("%wb")));
+        assert!(
+            a.operations
+                .iter()
+                .any(|o| o.result.as_deref() == Some("%va"))
+        );
+        assert!(
+            b.operations
+                .iter()
+                .any(|o| o.result.as_deref() == Some("%wb"))
+        );
     }
 
     #[test]
@@ -1922,7 +1946,11 @@ mod tests {
         assert_eq!(a.get("shape"), Some(&Attr::IntList(vec![1, 64])));
         assert_eq!(a.get("dtype"), Some(&Attr::Str("f16".to_string())));
         // the source tile + the two dynamic offsets are the operands, in order.
-        let op = f.operations.iter().find(|o| o.result.as_deref() == Some("%slice")).unwrap();
+        let op = f
+            .operations
+            .iter()
+            .find(|o| o.result.as_deref() == Some("%slice"))
+            .unwrap();
         assert_eq!(op.operands, vec!["%tile", "%c0", "%k7"]);
     }
 
