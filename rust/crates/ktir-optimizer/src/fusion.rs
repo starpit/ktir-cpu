@@ -128,7 +128,11 @@ pub fn is_attention_node(func: &IRFunction) -> bool {
             }
         }
     }
-    scan(&func.operations, &mut has_transpose, &mut has_softmax_reduce);
+    scan(
+        &func.operations,
+        &mut has_transpose,
+        &mut has_softmax_reduce,
+    );
     has_transpose && has_softmax_reduce
 }
 
@@ -310,7 +314,11 @@ fn build_fused_segment(
             inputs.insert(id);
         }
     }
-    Ok(Segment::Fused(FusedSegment { func, outputs, inputs }))
+    Ok(Segment::Fused(FusedSegment {
+        func,
+        outputs,
+        inputs,
+    }))
 }
 
 /// Split node range `[start, j)` into consecutive sub-ranges whose fused LX
@@ -441,7 +449,9 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
             loads_by_arg.entry(ld.arg.as_str()).or_default().push(ld);
         }
         for (arg, lds) in &loads_by_arg {
-            let Some(b) = arg_to_tensor.get(*arg) else { continue };
+            let Some(b) = arg_to_tensor.get(*arg) else {
+                continue;
+            };
             if b.is_output || !is_intermediate(b.tensor) {
                 continue;
             }
@@ -459,7 +469,9 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
         // every consuming node can forward it (same full-shape + whole/sliceable).
         // Record the resident SSA so later nodes can forward off it.
         for st in &an.stores {
-            let Some(b) = arg_to_tensor.get(st.arg.as_str()) else { continue };
+            let Some(b) = arg_to_tensor.get(st.arg.as_str()) else {
+                continue;
+            };
             if b.is_output
                 && st.whole_tensor
                 && is_intermediate(b.tensor)
@@ -497,8 +509,12 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
             if !drop_results.contains(&ld.tile) {
                 continue;
             }
-            let Some(b) = arg_to_tensor.get(ld.arg.as_str()) else { continue };
-            let Some((val, _)) = produced.get(&b.tensor) else { continue };
+            let Some(b) = arg_to_tensor.get(ld.arg.as_str()) else {
+                continue;
+            };
+            let Some((val, _)) = produced.get(&b.tensor) else {
+                continue;
+            };
             if ld.whole_tensor {
                 rename.insert(ld.loaded.clone(), val.clone());
                 drop_results.insert(ld.loaded.clone());
@@ -570,7 +586,12 @@ pub fn fuse_program(module: &IRModule, spec: &ProgramSpec) -> Result<IRFunction,
         grid: spec
             .nodes
             .first()
-            .map(|n| module.get_function(&n.func).map(|f| f.grid).unwrap_or((1, 1, 1)))
+            .map(|n| {
+                module
+                    .get_function(&n.func)
+                    .map(|f| f.grid)
+                    .unwrap_or((1, 1, 1))
+            })
             .unwrap_or((1, 1, 1)),
         return_type: None,
     })
@@ -592,8 +613,11 @@ fn all_consumers_forwardable(
     for (i, node) in spec.nodes.iter().enumerate() {
         for b in &node.bindings {
             if !b.is_output && b.tensor == tensor {
-                let lds: Vec<&LoadChain> =
-                    analyses[i].loads.iter().filter(|l| l.arg == b.arg).collect();
+                let lds: Vec<&LoadChain> = analyses[i]
+                    .loads
+                    .iter()
+                    .filter(|l| l.arg == b.arg)
+                    .collect();
                 if lds.is_empty() {
                     return false; // consumed but no recognizable load -> can't forward
                 }
@@ -623,7 +647,11 @@ struct SliceForward {
 impl SliceForward {
     fn build(&self, ni: usize, rename: &HashMap<String, String>) -> Operation {
         let res = resolve(ni, &self.loaded, rename);
-        let offsets: Vec<String> = self.offsets.iter().map(|o| resolve(ni, o, rename)).collect();
+        let offsets: Vec<String> = self
+            .offsets
+            .iter()
+            .map(|o| resolve(ni, o, rename))
+            .collect();
         let sizes: Vec<String> = self.sizes.iter().map(|n| n.to_string()).collect();
         let strides: Vec<String> = self.sizes.iter().map(|_| "1".to_string()).collect();
         Operation::new(Some(&res), "tensor.extract_slice", &[self.source.as_str()])
@@ -692,7 +720,12 @@ fn analyze(func: &IRFunction) -> Analysis {
     let mut a = Analysis::default();
     collect_views_tiles(&func.operations, &mut a);
     // Borrow-split: read views/tiles while pushing into loads/stores.
-    let Analysis { views, tiles, loads, stores } = &mut a;
+    let Analysis {
+        views,
+        tiles,
+        loads,
+        stores,
+    } = &mut a;
     collect_loads_stores(&func.operations, views, tiles, loads, stores);
     a
 }
@@ -709,7 +742,8 @@ fn collect_views_tiles(ops: &[Operation], a: &mut Analysis) {
         match op.op_type.as_str() {
             "ktdp.construct_memory_view" => {
                 if let (Some(res), Some(arg)) = (&op.result, op.operands.first()) {
-                    a.views.insert(res.clone(), (arg.clone(), shape_attr_of(op)));
+                    a.views
+                        .insert(res.clone(), (arg.clone(), shape_attr_of(op)));
                 }
             }
             "ktdp.construct_access_tile" => {
@@ -891,7 +925,14 @@ fn emit_ops(
                 .regions
                 .iter()
                 .map(|rg| {
-                    emit_ops(rg, ni, rename, drop_results, drop_store_tiles, slice_at_load)
+                    emit_ops(
+                        rg,
+                        ni,
+                        rename,
+                        drop_results,
+                        drop_store_tiles,
+                        slice_at_load,
+                    )
                 })
                 .collect(),
         });
@@ -946,7 +987,13 @@ mod tests {
     /// (`construct_access_tile %vin[%c0]`, identity base_map) — the tiled edge
     /// increment 2 forwards via `tensor.extract_slice`. Produces a `tile`-sized
     /// result stored whole to `out_arg`.
-    fn tiled_consumer(name: &str, in_arg: &str, out_arg: &str, shape: i64, tile: i64) -> IRFunction {
+    fn tiled_consumer(
+        name: &str,
+        in_arg: &str,
+        out_arg: &str,
+        shape: i64,
+        tile: i64,
+    ) -> IRFunction {
         IRFunction {
             name: name.to_string(),
             arguments: vec![
@@ -995,15 +1042,31 @@ mod tests {
                 NodeSpec {
                     func: "a".into(),
                     bindings: vec![
-                        Binding { arg: "%in".into(), tensor: 1, is_output: false },
-                        Binding { arg: "%out".into(), tensor: 2, is_output: true },
+                        Binding {
+                            arg: "%in".into(),
+                            tensor: 1,
+                            is_output: false,
+                        },
+                        Binding {
+                            arg: "%out".into(),
+                            tensor: 2,
+                            is_output: true,
+                        },
                     ],
                 },
                 NodeSpec {
                     func: "b".into(),
                     bindings: vec![
-                        Binding { arg: "%in".into(), tensor: 2, is_output: false },
-                        Binding { arg: "%out".into(), tensor: 3, is_output: true },
+                        Binding {
+                            arg: "%in".into(),
+                            tensor: 2,
+                            is_output: false,
+                        },
+                        Binding {
+                            arg: "%out".into(),
+                            tensor: 3,
+                            is_output: true,
+                        },
                     ],
                 },
             ],
@@ -1021,14 +1084,26 @@ mod tests {
         let fused = fuse_program(&m, &two_node_spec()).unwrap();
 
         // The intermediate t2's store AND load are gone: no HBM round-trip.
-        let loads = fused.operations.iter().filter(|o| o.op_type == "ktdp.load").count();
-        let stores = fused.operations.iter().filter(|o| o.op_type == "ktdp.store").count();
+        let loads = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "ktdp.load")
+            .count();
+        let stores = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "ktdp.store")
+            .count();
         assert_eq!(loads, 1, "only the source load survives");
         assert_eq!(stores, 1, "only the result store survives");
 
         // The fused function only needs the source (t1) + result (t3) pointers.
         let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(arg_names, vec!["%t1_ptr", "%t3_ptr"], "no pointer for intermediate t2");
+        assert_eq!(
+            arg_names,
+            vec!["%t1_ptr", "%t3_ptr"],
+            "no pointer for intermediate t2"
+        );
 
         // b's exp consumes a's exp result directly (SSA forwarded).
         let b_exp = fused
@@ -1036,7 +1111,11 @@ mod tests {
             .iter()
             .find(|o| o.op_type == "math.exp" && o.result.as_deref() == Some("%n1_y"))
             .expect("b's exp present");
-        assert_eq!(b_exp.operands, vec!["%n0_y"], "b's exp reads a's stored SSA value");
+        assert_eq!(
+            b_exp.operands,
+            vec!["%n0_y"],
+            "b's exp reads a's stored SSA value"
+        );
     }
 
     #[test]
@@ -1048,16 +1127,34 @@ mod tests {
             copy_node("b", "%in", "%out", 16, false),
         ]);
         let fused = fuse_program(&m, &two_node_spec()).unwrap();
-        let loads = fused.operations.iter().filter(|o| o.op_type == "ktdp.load").count();
-        let stores = fused.operations.iter().filter(|o| o.op_type == "ktdp.store").count();
-        let slices = fused.operations.iter().filter(|o| o.op_type == "tensor.extract_slice").count();
+        let loads = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "ktdp.load")
+            .count();
+        let stores = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "ktdp.store")
+            .count();
+        let slices = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "tensor.extract_slice")
+            .count();
         // a still stores t2, b still loads it (resident HBM within the fused fn).
         assert_eq!(loads, 2, "source + tiled intermediate load both kept");
         assert_eq!(stores, 2, "intermediate + result stores both kept");
-        assert_eq!(slices, 0, "no extract_slice emitted for the unsliceable edge");
+        assert_eq!(
+            slices, 0,
+            "no extract_slice emitted for the unsliceable edge"
+        );
         // The intermediate pointer is still a fused-function arg.
         let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(arg_names.contains(&"%t2_ptr"), "intermediate kept as HBM arg: {arg_names:?}");
+        assert!(
+            arg_names.contains(&"%t2_ptr"),
+            "intermediate kept as HBM arg: {arg_names:?}"
+        );
     }
 
     #[test]
@@ -1072,8 +1169,16 @@ mod tests {
         let fused = fuse_program(&m, &two_node_spec()).unwrap();
 
         // Only the source load (a) and the result store (b) survive.
-        let loads = fused.operations.iter().filter(|o| o.op_type == "ktdp.load").count();
-        let stores = fused.operations.iter().filter(|o| o.op_type == "ktdp.store").count();
+        let loads = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "ktdp.load")
+            .count();
+        let stores = fused
+            .operations
+            .iter()
+            .filter(|o| o.op_type == "ktdp.store")
+            .count();
         assert_eq!(loads, 1, "intermediate load replaced by extract_slice");
         assert_eq!(stores, 1, "intermediate store dropped (producer resident)");
 
@@ -1083,7 +1188,11 @@ mod tests {
             .iter()
             .find(|o| o.op_type == "tensor.extract_slice")
             .expect("extract_slice emitted for the tiled edge");
-        assert_eq!(slice.operands, vec!["%n0_y"], "slices a's resident producer SSA");
+        assert_eq!(
+            slice.operands,
+            vec!["%n0_y"],
+            "slices a's resident producer SSA"
+        );
         assert_eq!(slice.result.as_deref(), Some("%n1_loaded"));
         assert_eq!(
             slice.attributes.get("slice_offsets"),
@@ -1109,7 +1218,11 @@ mod tests {
 
         // No HBM pointer for the forwarded intermediate t2.
         let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(arg_names, vec!["%t1_ptr", "%t3_ptr"], "no t2 pointer: {arg_names:?}");
+        assert_eq!(
+            arg_names,
+            vec!["%t1_ptr", "%t3_ptr"],
+            "no t2 pointer: {arg_names:?}"
+        );
     }
 
     #[test]
@@ -1174,7 +1287,10 @@ mod tests {
     fn matmul_node(name: &str, in_arg: &str, out_arg: &str, cores: usize) -> IRFunction {
         let mut f = copy_node(name, in_arg, out_arg, 16, true);
         f.grid = (cores, 1, 1);
-        f.operations.insert(0, Operation::new(Some("%pid"), "ktdp.get_compute_tile_id", &[]));
+        f.operations.insert(
+            0,
+            Operation::new(Some("%pid"), "ktdp.get_compute_tile_id", &[]),
+        );
         // Replace the math.exp with a linalg.matmul-shaped op (no softmax).
         for op in &mut f.operations {
             if op.op_type == "math.exp" {
@@ -1207,22 +1323,46 @@ mod tests {
                 NodeSpec {
                     func: "a".into(),
                     bindings: vec![
-                        Binding { arg: "%in".into(), tensor: 1, is_output: false },
-                        Binding { arg: "%out".into(), tensor: 2, is_output: true },
+                        Binding {
+                            arg: "%in".into(),
+                            tensor: 1,
+                            is_output: false,
+                        },
+                        Binding {
+                            arg: "%out".into(),
+                            tensor: 2,
+                            is_output: true,
+                        },
                     ],
                 },
                 NodeSpec {
                     func: "b".into(),
                     bindings: vec![
-                        Binding { arg: "%in".into(), tensor: 2, is_output: false },
-                        Binding { arg: "%out".into(), tensor: 3, is_output: true },
+                        Binding {
+                            arg: "%in".into(),
+                            tensor: 2,
+                            is_output: false,
+                        },
+                        Binding {
+                            arg: "%out".into(),
+                            tensor: 3,
+                            is_output: true,
+                        },
                     ],
                 },
                 NodeSpec {
                     func: "c".into(),
                     bindings: vec![
-                        Binding { arg: "%in".into(), tensor: 3, is_output: false },
-                        Binding { arg: "%out".into(), tensor: 4, is_output: true },
+                        Binding {
+                            arg: "%in".into(),
+                            tensor: 3,
+                            is_output: false,
+                        },
+                        Binding {
+                            arg: "%out".into(),
+                            tensor: 4,
+                            is_output: true,
+                        },
                     ],
                 },
             ],
@@ -1240,7 +1380,11 @@ mod tests {
         ]);
         let segs = plan_segments(&m, &three_node_attn_spec()).unwrap();
         // Three segments: [fused a], [native b], [fused c].
-        assert_eq!(segs.len(), 3, "one fused segment per non-attention run + native attn");
+        assert_eq!(
+            segs.len(),
+            3,
+            "one fused segment per non-attention run + native attn"
+        );
         assert!(matches!(segs[0], Segment::Fused(_)), "node a fused");
         match &segs[1] {
             Segment::Native(n) => assert_eq!(n.func, "b", "attention node b stays native"),
@@ -1250,21 +1394,56 @@ mod tests {
 
         // The boundary edges (t2 into attn, t3 out of attn) must remain HBM
         // pointer args on the adjacent fused segments — NOT forwarded as SSA.
-        let Segment::Fused(seg_a) = &segs[0] else { unreachable!() };
-        let a_args: Vec<&str> = seg_a.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(a_args.contains(&"%t2_ptr"), "t2 stays HBM out of segment a: {a_args:?}");
+        let Segment::Fused(seg_a) = &segs[0] else {
+            unreachable!()
+        };
+        let a_args: Vec<&str> = seg_a
+            .func
+            .arguments
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(
+            a_args.contains(&"%t2_ptr"),
+            "t2 stays HBM out of segment a: {a_args:?}"
+        );
         // t2 is a's boundary OUTPUT (consumed by the native attn node).
-        assert!(seg_a.outputs.contains(&2), "t2 classified as segment a output");
-        assert!(seg_a.inputs.contains(&1), "t1 classified as segment a input");
-        let Segment::Fused(seg_c) = &segs[2] else { unreachable!() };
-        let c_args: Vec<&str> = seg_c.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(c_args.contains(&"%t3_ptr"), "t3 stays HBM into segment c: {c_args:?}");
+        assert!(
+            seg_a.outputs.contains(&2),
+            "t2 classified as segment a output"
+        );
+        assert!(
+            seg_a.inputs.contains(&1),
+            "t1 classified as segment a input"
+        );
+        let Segment::Fused(seg_c) = &segs[2] else {
+            unreachable!()
+        };
+        let c_args: Vec<&str> = seg_c
+            .func
+            .arguments
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(
+            c_args.contains(&"%t3_ptr"),
+            "t3 stays HBM into segment c: {c_args:?}"
+        );
         // t3 is c's boundary INPUT (produced by the native attn node); t4 output.
-        assert!(seg_c.inputs.contains(&3), "t3 classified as segment c input");
-        assert!(seg_c.outputs.contains(&4), "t4 classified as segment c output");
+        assert!(
+            seg_c.inputs.contains(&3),
+            "t3 classified as segment c input"
+        );
+        assert!(
+            seg_c.outputs.contains(&4),
+            "t4 classified as segment c output"
+        );
         // Each fused segment still keeps its own load/store (no cross-segment
         // SSA forwarding); the attention output round-trips HBM.
-        assert!(seg_c.func.grid == (1, 1, 1), "fused segment runs at grid [1,1]");
+        assert!(
+            seg_c.func.grid == (1, 1, 1),
+            "fused segment runs at grid [1,1]"
+        );
     }
 
     #[test]
@@ -1277,11 +1456,21 @@ mod tests {
             copy_node("c", "%in", "%out", 16, true),
         ]);
         let segs = plan_segments(&m, &three_node_attn_spec()).unwrap();
-        assert_eq!(segs.len(), 1, "one fused segment for the whole non-attention run");
-        let Segment::Fused(seg) = &segs[0] else { panic!("expected fused") };
+        assert_eq!(
+            segs.len(),
+            1,
+            "one fused segment for the whole non-attention run"
+        );
+        let Segment::Fused(seg) = &segs[0] else {
+            panic!("expected fused")
+        };
         let args: Vec<&str> = seg.func.arguments.iter().map(|(n, _)| n.as_str()).collect();
         // Only the true source (t1) and result (t4) survive as HBM pointers; the
         // intra-segment edges t2/t3 forward as SSA.
-        assert_eq!(args, vec!["%t1_ptr", "%t4_ptr"], "intra-run edges forwarded: {args:?}");
+        assert_eq!(
+            args,
+            vec!["%t1_ptr", "%t4_ptr"],
+            "intra-run edges forwarded: {args:?}"
+        );
     }
 }

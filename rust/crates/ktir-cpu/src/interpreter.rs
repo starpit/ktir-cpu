@@ -277,6 +277,16 @@ pub enum Arg {
         shape: Vec<usize>,
         dtype: DType,
     },
+    /// bfloat16 host bytes, narrowed to the model dtype (f16) on the way into HBM.
+    /// bf16 is NOT a Spyre/KTIR HBM dtype (the hardware is f16) — this is a
+    /// convenience for ingesting stock bf16 checkpoints (Llama/SmolLM2) without
+    /// the caller first doing the bf16→f16 narrow. The narrowing is paid ONCE at
+    /// ingest (bf16→f32 is exact; f32→f16 rounds to nearest-even); f16 weights
+    /// should use [`Arg::TensorBytes`] (zero conversion).
+    TensorBf16 {
+        data: Vec<u8>,
+        shape: Vec<usize>,
+    },
     Scalar(Scalar),
 }
 
@@ -318,8 +328,10 @@ pub fn execute_function_outputs(
     args: &[(&str, Arg)],
     outputs: &[&str],
 ) -> Result<HashMap<String, Output>, String> {
-    let wanted: std::collections::HashSet<String> =
-        outputs.iter().map(|s| s.trim_start_matches('%').to_string()).collect();
+    let wanted: std::collections::HashSet<String> = outputs
+        .iter()
+        .map(|s| s.trim_start_matches('%').to_string())
+        .collect();
     execute_function_filtered(module, func_name, args, Some(&wanted))
 }
 
@@ -402,12 +414,7 @@ pub fn execute_function_in(
     let grid_exec = GridExecutor::new(grid);
     let dispatch = Dispatch::shared();
     crate::comm_sched::execute_with_communication(
-        &grid_exec,
-        mem,
-        ops,
-        input_ptrs,
-        dispatch,
-        None,
+        &grid_exec, mem, ops, input_ptrs, dispatch, None,
     )?;
     read_back(mem, read.to_vec(), None)
 }
@@ -506,6 +513,16 @@ fn marshal_inputs(
                 data.clone(),
                 shape,
                 *dtype,
+            ),
+            // bf16 host bytes -> f16 HBM layout in ONE fused pass (no f32 buffer).
+            Arg::TensorBf16 { data, shape } => place(
+                mem,
+                &mut input_ptrs,
+                &mut tensor_meta,
+                name,
+                codec::bf16_to_f16(data, shape.iter().product()),
+                shape,
+                DType::F16,
             ),
             Arg::Scalar(s) => input_ptrs.push((name.to_string(), Value::Scalar(*s))),
         }
@@ -641,6 +658,7 @@ fn try_combine_matmul(
         &mut uc,
         None,
         Epilogue::NONE,
+        false,
     )?;
 
     // Scatter each core's row-block back as its matmul result.

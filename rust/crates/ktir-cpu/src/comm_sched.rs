@@ -250,8 +250,7 @@ impl CoreRunner {
         // regressing the default path. Plain matmul additionally honors
         // KTIR_NO_GPU_GEMM (a clean GEMM-free baseline disables it too).
         #[cfg(metal)]
-        let gpu_plain_matmul = gpu_offload
-            && std::env::var_os("KTIR_GPU_PLAIN_MATMUL").is_some();
+        let gpu_plain_matmul = gpu_offload && std::env::var_os("KTIR_GPU_PLAIN_MATMUL").is_some();
         #[cfg(metal)]
         let gpu_reduce = gpu_base && std::env::var_os("KTIR_GPU_REDUCE").is_some();
         #[cfg(metal)]
@@ -269,13 +268,15 @@ impl CoreRunner {
         // SKIP set of all window op indices; non-trigger window ops are subsumed by
         // the fused kernel (their values come from it) and are not executed.
         #[cfg(metal)]
-        let (map_triggers, map_skip) = if gpu_offload
-            && std::env::var_os("KTIR_NO_GPU_MAP").is_none()
-        {
-            crate::metal_backend::map_fusion_plan(ops)
-        } else {
-            (std::collections::HashMap::new(), std::collections::HashSet::new())
-        };
+        let (map_triggers, map_skip) =
+            if gpu_offload && std::env::var_os("KTIR_NO_GPU_MAP").is_none() {
+                crate::metal_backend::map_fusion_plan(ops)
+            } else {
+                (
+                    std::collections::HashMap::new(),
+                    std::collections::HashSet::new(),
+                )
+            };
 
         // Window op indices whose liveness reclaim is deferred to the window's
         // trigger (so a fused kernel's live-ins survive until it has read them).

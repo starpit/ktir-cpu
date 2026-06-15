@@ -259,6 +259,13 @@ pub struct MatmulLoopInfo {
     pub n_off: i64,
     /// Row stride of the full weight B occupies (== `n` when B is contiguous).
     pub b_stride: i64,
+    /// `linalg.matmul_transpose_b`: B is stored `[n, k]` (on-disk PyTorch `Linear`
+    /// `[out, in]`), contracted over its LAST axis (`xWᵀ`). The weight binds
+    /// VERBATIM — no transpose, no gather, no copy beyond the normal weight-cache
+    /// upload. The GEMM reads `[n,k]` directly via the backend's native transpose-B
+    /// (AMX `cblas` `CblasTrans`; NAX/simdgroup via the B-staging variant), chosen
+    /// by the same `use_nax` gate. Plain `linalg.matmul` (B `[k, n]`) is `false`.
+    pub transpose_b: bool,
 }
 
 /// How an op participates in scheduling.
@@ -558,12 +565,25 @@ pub fn matmul_min_kn() -> u64 {
 /// the `[1,1]` loop would compute just row 0 and silently drop the rest (it broke
 /// prefill golden by ~0.05 in testing). So `m > 1` is ALWAYS offloaded here.
 ///
-/// For `m == 1` we offload only when the weight `k·n` clears [`GEMM_GPU_MIN_KN`];
-/// smaller decode GEMMs run on the interpreter's tiled Accelerate K-loop (faster
-/// at that scale, and the per-node golden oracle uses the same path).
+/// For a PLAIN `m == 1` GEMM we offload only when the weight `k·n` clears
+/// [`GEMM_GPU_MIN_KN`]; smaller decode GEMMs run on the interpreter's tiled
+/// Accelerate K-loop (faster at that scale for a CONTIGUOUS `[k,n]` weight, and the
+/// per-node golden oracle uses the same path).
+///
+/// `transpose_b` GEMMs (B stored on-disk `[n,k]`) ALWAYS offload, regardless of
+/// `k·n`. The interpreter K-loop is a trap for them: its per-K-step B panel is a
+/// `[n,BK]` window of the `[n,k]` weight, which fails `is_contiguous` (leftmost
+/// stride `k` ≫ `BK`) and so `ktdp.load` takes the slow strided-gather path —
+/// reading a span ≈`k/BK`× larger than the data, EVERY K-step, ×layers ×tokens
+/// (the measured decode 0.28→0.68 regression). Offloading collapses the whole
+/// K-loop to ONE backend call over B read verbatim-contiguous `[n,k]`
+/// ([`resolve_gemm_bt_operand`]) — NAX if `k·n` clears the gate, else AMX
+/// `sgemm_rowmajor_bt` (`cblas` `CblasTrans`, free-to-faster at real decode `k`).
+/// Golden-safe: `m == 1` is trivially full-M, and the AMX-bt branch does the
+/// identical contraction the `[1,1]` loop did, just in one call.
 #[cfg(metal)]
-pub fn matmul_loop_offload(m: usize, k: usize, n: usize) -> bool {
-    m > 1 || (k as u64) * (n as u64) >= matmul_min_kn()
+pub fn matmul_loop_offload(m: usize, k: usize, n: usize, transpose_b: bool) -> bool {
+    m > 1 || transpose_b || (k as u64) * (n as u64) >= matmul_min_kn()
 }
 
 /// Of the OFFLOADED full-M GEMMs ([`matmul_loop_offload`]), whether to run this one
@@ -598,16 +618,23 @@ pub fn run_matmul_loop_gpu(
     ctx: &mut crate::context::CoreContext,
 ) -> Result<(), String> {
     let (m, k, n) = (info.m as usize, info.k as usize, info.n as usize);
-    // OFFLOAD GATE: an `m == 1` decode GEMM below the work gate falls through (Err)
-    // to the interpreter's tiled Accelerate K-loop, faster on tiny weights and
-    // golden-faithful at [1,1] (m==1). `m > 1` is ALWAYS offloaded full-M here.
-    if !matmul_loop_offload(m, k, n) {
+    // OFFLOAD GATE: a PLAIN `m == 1` decode GEMM below the work gate falls through
+    // (Err) to the interpreter's tiled Accelerate K-loop, faster on tiny contiguous
+    // weights and golden-faithful at [1,1] (m==1). `m > 1` and ALL transpose-B
+    // GEMMs are ALWAYS offloaded full-M here (transpose-B's per-K-step interpreter
+    // B load is a slow strided gather — see `matmul_loop_offload`).
+    if !matmul_loop_offload(m, k, n, info.transpose_b) {
         return Err("metal: decode GEMM below the work gate — interpreter K-loop".into());
     }
     // BACKEND: NAX if the weight is big enough to amortize the GPU dispatch, else
     // AMX. Decided on `k·n` alone, so it's independent of M (both branches are
     // full-M-correct). An `m == 1` GEMM that passed the gate above is by definition
     // large, so decode never reaches the AMX branch — decode routing is unchanged.
+    //
+    // TRANSPOSE-B (B stored on-disk [n,k], contracted over its last axis) flows
+    // through the SAME gate: big k·n → NAX/simdgroup via the `KTIR_TRANSPOSE_B`
+    // pipeline (kernel reads [n,k] verbatim); small k·n → AMX `cblas` `CblasTrans`.
+    // Both are native, zero-copy. The gate is identical to plain matmul.
     let use_nax = matmul_loop_use_nax(k, n);
     let c = GEMM_ENGINE.with(|cell| -> Result<Vec<f32>, String> {
         let engine = cell.get_or_init(|| NaxGemm::new().ok());
@@ -617,20 +644,40 @@ pub fn run_matmul_loop_gpu(
         // resident activation tile is uploaded fresh (it changes every pass and
         // is NEVER cached).
         let ua = resolve_gemm_operand_unified(&info.a_root, m, k, ctx, engine)?;
-        // B is a contiguous whole tensor in the common case; for an N-tiled output
-        // (the lm_head column tiles) it is a strided COLUMN SLICE of a wider weight.
-        let ub = if info.n_off == 0 && info.b_stride == info.n {
+        // B operand, resolved VERBATIM (no transpose, no gather):
+        //   * transpose-B: the [n,k] weight, or its CONTIGUOUS row-slice for an
+        //     N-tile (rows [n_off, n_off+n) — a contiguous block, not a gather).
+        //   * plain: the [k,n] weight (contiguous) or a strided column slice.
+        let ub = if info.transpose_b {
+            resolve_gemm_bt_operand(&info.b_root, n, k, info.n_off, ctx, engine)?
+        } else if info.n_off == 0 && info.b_stride == info.n {
             resolve_gemm_operand_unified(&info.b_root, k, n, ctx, engine)?
         } else {
-            resolve_gemm_weight_slice(
-                &info.b_root, k, n, info.n_off, info.b_stride, ctx, engine,
-            )?
+            resolve_gemm_weight_slice(&info.b_root, k, n, info.n_off, info.b_stride, ctx, engine)?
         };
         let out = if use_nax {
+            // NAX / simdgroup GPU GEMM. `transpose_b` selects the [n,k]-staging
+            // pipeline; B (`ub`) is [n,k] for transpose-B, [k,n] otherwise — same
+            // length. `&ua`/`&ub` deref-coerce to &UnifiedBuffer.
             let mut uc = engine.unified(m * n)?;
-            // `&ua`/`&ub` deref-coerce `Rc<UnifiedBuffer>` -> `&UnifiedBuffer`.
-            engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+            engine.matmul_unified(
+                m,
+                k,
+                n,
+                &ua,
+                &ub,
+                &mut uc,
+                None,
+                Epilogue::NONE,
+                info.transpose_b,
+            )?;
             uc.as_slice().to_vec()
+        } else if info.transpose_b {
+            // AMX native transpose-B: B is [n,k], contract the last axis (`CblasTrans`,
+            // zero-copy). Full-M, no GPU dispatch, reads the resident f32 in place.
+            debug_assert_eq!(ua.as_slice().len(), m * k, "AMX A operand length");
+            debug_assert_eq!(ub.as_slice().len(), n * k, "AMX transpose-B operand length");
+            crate::blas::sgemm_rowmajor_bt(m, k, n, ua.as_slice(), ub.as_slice())
         } else {
             // AMX/Accelerate over the SAME resident f32 operands — full-M, no GPU
             // dispatch, no per-pass re-decode (ua/ub are host-visible f32 already).
@@ -641,14 +688,28 @@ pub fn run_matmul_loop_gpu(
             crate::blas::sgemm_rowmajor(m, k, n, ua.as_slice(), ub.as_slice())
         };
         // Diagnostic: cross-check the chosen backend against a CPU sgemm on the SAME
-        // operands. For NAX a diff >> f16 noise pinpoints a NaxGemm shape bug (vs a
-        // recognizer/operand bug, which would leave GPU==CPU here); for AMX it's the
-        // same primitive, so the diff is ~0 (a useful self-check that out is real).
+        // operands, matching the op's contraction (transB vs plain). For NAX a diff
+        // >> f16 noise pinpoints a NaxGemm shape bug; for AMX it's the same cblas
+        // primitive, so the diff is ~0 (a useful self-check that out is real).
         if std::env::var_os("KTIR_GEMM_CHECK").is_some() {
-            let cpu = crate::blas::sgemm_rowmajor(m, k, n, ua.as_slice(), ub.as_slice());
-            let d = out.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let cpu = if info.transpose_b {
+                crate::blas::sgemm_rowmajor_bt(m, k, n, ua.as_slice(), ub.as_slice())
+            } else {
+                crate::blas::sgemm_rowmajor(m, k, n, ua.as_slice(), ub.as_slice())
+            };
+            let d = out
+                .iter()
+                .zip(&cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             if d > 0.05 {
-                let be = if use_nax { "NAX" } else { "AMX" };
+                let be = if use_nax {
+                    "NAX"
+                } else if info.transpose_b {
+                    "AMX-bt"
+                } else {
+                    "AMX"
+                };
                 eprintln!("  [gemm-check] m={m} k={k} n={n}  {be} vs CPU max diff {d:.4}");
             }
         }
@@ -661,7 +722,11 @@ pub fn run_matmul_loop_gpu(
     let bytes = tile.size_bytes() as i64;
     ctx.set_value(&info.out_ssa, crate::ir::Value::Tile(tile));
     ctx.track_lx(&info.out_ssa, bytes)?;
-    let counter = if use_nax { &MATMUL_LOOP_GPU_COUNT } else { &MATMUL_LOOP_AMX_COUNT };
+    let counter = if use_nax {
+        &MATMUL_LOOP_GPU_COUNT
+    } else {
+        &MATMUL_LOOP_AMX_COUNT
+    };
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -708,7 +773,12 @@ fn resolve_gemm_operand_unified(
                 let hbm = ctx.hbm.borrow();
                 weight_fingerprint(&hbm, addr, n, DType::F16)
             };
-            let key = WeightKey { root: root.to_string(), len: n, fingerprint, col_off: 0 };
+            let key = WeightKey {
+                root: root.to_string(),
+                len: n,
+                fingerprint,
+                col_off: 0,
+            };
             // Fast path: a hit returns the cached buffer with no further HBM work.
             if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
                 WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -729,7 +799,9 @@ fn resolve_gemm_operand_unified(
             WEIGHT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(buf)
         }
-        other => Err(format!("metal: GEMM operand {root} is {other:?}, want tile/ptr")),
+        other => Err(format!(
+            "metal: GEMM operand {root} is {other:?}, want tile/ptr"
+        )),
     }
 }
 
@@ -782,12 +854,76 @@ fn resolve_gemm_weight_slice(
         let hbm = ctx.hbm.borrow();
         weight_fingerprint(&hbm, base, k * b_stride as usize, DType::F16)
     };
-    let key = WeightKey { root: root.to_string(), len: k * n, fingerprint, col_off };
+    let key = WeightKey {
+        root: root.to_string(),
+        len: k * n,
+        fingerprint,
+        col_off,
+    };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(buf);
     }
     let decoded = decode_slice(&ctx.hbm.borrow());
+    let buf = std::rc::Rc::new(engine.unified_from(&decoded)?);
+    WEIGHT_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= WEIGHT_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, buf.clone());
+    });
+    WEIGHT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(buf)
+}
+
+/// Resolve a TRANSPOSE-B weight operand B to a resident `[n, k]` f32
+/// [`UnifiedBuffer`] — its on-disk PyTorch `Linear` `[out, in]` layout, uploaded
+/// VERBATIM (no transpose). The GEMM then contracts the last axis via `transB`.
+/// For an N-tile, the slice is rows `[n_off, n_off+n)` of the weight, which is a
+/// CONTIGUOUS block (`n*k` elements at `n_off*k`) — so this is a plain contiguous
+/// read either way. Cached once per process (keyed by `col_off = n_off`).
+#[cfg(metal)]
+fn resolve_gemm_bt_operand(
+    root: &str,
+    n: usize,
+    k: usize,
+    n_off: i64,
+    ctx: &crate::context::CoreContext,
+    engine: &NaxGemm,
+) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let stick = match ctx.get_value(root)? {
+        crate::ir::Value::Index(s) => *s,
+        other => {
+            return Err(format!(
+                "metal: transpose-B weight {root} is {other:?}, want an HBM pointer"
+            ));
+        }
+    };
+    let bpe = DType::F16.bytes_per_elem() as i64;
+    // Contiguous [n,k] block: the N-tile is just rows [n_off, n_off+n) on disk.
+    let elem_off = n_off * k as i64;
+    let addr = stick * crate::memory::STICK_BYTES + elem_off * bpe;
+    let count = n * k;
+    if std::env::var_os("KTIR_NO_WEIGHT_CACHE").is_some() {
+        let decoded = ctx.hbm.borrow().read_decoded(addr, count, DType::F16);
+        return Ok(std::rc::Rc::new(engine.unified_from(&decoded)?));
+    }
+    let fingerprint = {
+        let hbm = ctx.hbm.borrow();
+        weight_fingerprint(&hbm, addr, count, DType::F16)
+    };
+    let key = WeightKey {
+        root: root.to_string(),
+        len: count,
+        fingerprint,
+        col_off: n_off,
+    };
+    if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(buf);
+    }
+    let decoded = ctx.hbm.borrow().read_decoded(addr, count, DType::F16);
     let buf = std::rc::Rc::new(engine.unified_from(&decoded)?);
     WEIGHT_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
@@ -902,7 +1038,7 @@ pub fn run_plain_matmul_gpu(
         let ua = engine.unified_from(&a.data)?;
         let ub = engine.unified_from(&b.data)?;
         let mut uc = engine.unified(m * n)?;
-        engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)?;
+        engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)?;
         Ok(uc.as_slice().to_vec())
     })?;
     if let Some(acc) = acc {
@@ -945,7 +1081,10 @@ fn recognize_reduce_combiner(op: &Operation) -> Option<ReduceCombiner> {
             .map(|o| o.op_type.clone())?,
     };
     match name.as_str() {
-        "arith.addf" => Some(ReduceCombiner { is_max: false, identity: 0.0 }),
+        "arith.addf" => Some(ReduceCombiner {
+            is_max: false,
+            identity: 0.0,
+        }),
         "arith.maximumf" | "arith.maxf" => Some(ReduceCombiner {
             is_max: true,
             identity: f32::NEG_INFINITY,
@@ -964,18 +1103,20 @@ fn recognize_reduce_combiner(op: &Operation) -> Option<ReduceCombiner> {
 /// Returns `Err` (unsupported combiner / shape / no device) so the caller falls
 /// back to the interpreter.
 #[cfg(metal)]
-pub fn run_reduce_gpu(
-    op: &Operation,
-    ctx: &mut crate::context::CoreContext,
-) -> Result<(), String> {
+pub fn run_reduce_gpu(op: &Operation, ctx: &mut crate::context::CoreContext) -> Result<(), String> {
     // Only `dimensions = [1]` over a 2-D input is handled (the softmax pattern).
     let dims = int_list_attr_vec(op, "dimensions").unwrap_or_default();
     if dims.as_slice() != [1] {
-        return Err(format!("metal: reduce dimensions {dims:?} != [1] — interpreter"));
+        return Err(format!(
+            "metal: reduce dimensions {dims:?} != [1] — interpreter"
+        ));
     }
-    let combiner = recognize_reduce_combiner(op)
-        .ok_or("metal: unsupported reduce combiner — interpreter")?;
-    let out_ssa = op.result.as_deref().ok_or("metal: reduce has no result SSA")?;
+    let combiner =
+        recognize_reduce_combiner(op).ok_or("metal: unsupported reduce combiner — interpreter")?;
+    let out_ssa = op
+        .result
+        .as_deref()
+        .ok_or("metal: reduce has no result SSA")?;
     let x = expect_resident_tile(ctx, &op.operands[0], "reduce ins")?;
     if x.shape.len() != 2 {
         return Err(format!("metal: reduce wants 2-D input, got {:?}", x.shape));
@@ -1038,8 +1179,16 @@ fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
         source,
         name: "row_reduce".to_string(),
         buffers: vec![
-            BufferBinding { name: "x".into(), is_output: false, dtype },
-            BufferBinding { name: "out".into(), is_output: true, dtype },
+            BufferBinding {
+                name: "x".into(),
+                is_output: false,
+                dtype,
+            },
+            BufferBinding {
+                name: "out".into(),
+                is_output: true,
+                dtype,
+            },
         ],
     }
 }
@@ -1102,8 +1251,16 @@ fn run_reduce_kernel(
     }
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(rows).max(1);
     enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize { width: rows, height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cb.commit();
@@ -1169,13 +1326,7 @@ pub fn run_transpose_gpu(
     // on the GPU. We pass the rank and the three index arrays as buffers.
     let src_in_strides: Vec<u32> = perm.iter().map(|&p| in_strides[p] as u32).collect();
     let out_strides_u: Vec<u32> = out_strides.iter().map(|&s| s as u32).collect();
-    let out = run_transpose_kernel(
-        &kernel,
-        &x.data,
-        out_len,
-        &out_strides_u,
-        &src_in_strides,
-    )?;
+    let out = run_transpose_kernel(&kernel, &x.data, out_len, &out_strides_u, &src_in_strides)?;
     let tile = crate::tile::Tile::compute(out, dtype, out_shape);
     let bytes = tile.size_bytes() as i64;
     ctx.set_value(out_ssa, crate::ir::Value::Tile(tile));
@@ -1216,8 +1367,16 @@ fn transpose_kernel(dtype: DType) -> MslKernel {
         source,
         name: "transpose_gather".to_string(),
         buffers: vec![
-            BufferBinding { name: "x".into(), is_output: false, dtype },
-            BufferBinding { name: "out".into(), is_output: true, dtype },
+            BufferBinding {
+                name: "x".into(),
+                is_output: false,
+                dtype,
+            },
+            BufferBinding {
+                name: "out".into(),
+                is_output: true,
+                dtype,
+            },
         ],
     }
 }
@@ -1291,8 +1450,16 @@ fn run_transpose_kernel(
     }
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(out_len).max(1);
     enc.dispatchThreads_threadsPerThreadgroup(
-        MTLSize { width: out_len, height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: out_len,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cb.commit();
@@ -1315,7 +1482,9 @@ fn expect_resident_tile(
 ) -> Result<crate::tile::Tile, String> {
     match ctx.get_value(name)? {
         crate::ir::Value::Tile(t) => Ok(t.clone()),
-        other => Err(format!("metal: {what} {name} is {other:?}, want a resident tile")),
+        other => Err(format!(
+            "metal: {what} {name} is {other:?}, want a resident tile"
+        )),
     }
 }
 
@@ -1343,14 +1512,20 @@ fn def_map_all(ops: &[Operation]) -> HashMap<String, &Operation> {
 /// GEMM (M from the A operand's full view/producer, not the per-iter tile), so a
 /// decode (M=1) and a prefill (M=8, grid/token-parallel) K-loop both collapse to
 /// one matmul. Tolerant of plumbing ops in the body (the `outs` init constant).
-fn recognize_matmul_loop(forop: &Operation, defs: &HashMap<String, &Operation>) -> Option<MatmulLoopInfo> {
+fn recognize_matmul_loop(
+    forop: &Operation,
+    defs: &HashMap<String, &Operation>,
+) -> Option<MatmulLoopInfo> {
     let body = forop.regions.first()?;
     // Exactly one matmul in the body.
-    let mut mms = body.iter().filter(|o| o.op_type == "linalg.matmul");
+    let mut mms = body
+        .iter()
+        .filter(|o| o.op_type == "linalg.matmul" || o.op_type == "linalg.matmul_transpose_b");
     let mm = mms.next()?;
     if mms.next().is_some() {
         return None;
     }
+    let transpose_b = mm.op_type == "linalg.matmul_transpose_b";
     let mm_res = mm.result.as_deref()?;
     // Single loop-carried accumulator.
     let iter_args = match forop.attributes.get("iter_args") {
@@ -1373,7 +1548,14 @@ fn recognize_matmul_loop(forop: &Operation, defs: &HashMap<String, &Operation>) 
     // A = ins[0], B = ins[1]; resolve each to its FULL tensor + resident root.
     let (a_root, a_shape) = matmul_operand_full(mm.operands.first()?, defs)?;
     let (b_root, b_shape) = matmul_operand_full(mm.operands.get(1)?, defs)?;
-    if a_shape.len() != 2 || b_shape.len() != 2 || a_shape[1] != b_shape[0] {
+    // Contraction axis: plain `matmul` is A[m,k]·B[k,n] (B's FIRST axis = k);
+    // `matmul_transpose_b` is A[m,k]·B[n,k]ᵀ (B's LAST axis = k, FIRST axis = n).
+    if a_shape.len() != 2 || b_shape.len() != 2 {
+        return None;
+    }
+    let b_full_n = if transpose_b { b_shape[0] } else { b_shape[1] };
+    let b_k = if transpose_b { b_shape[1] } else { b_shape[0] };
+    if a_shape[1] != b_k {
         return None;
     }
     // N-TILING. The loop tiles only the K dimension; the matmul's per-iteration
@@ -1402,16 +1584,23 @@ fn recognize_matmul_loop(forop: &Operation, defs: &HashMap<String, &Operation>) 
     // M-from-grid reconstruction is exactly what this recognizer is for.
     let mm_out = shape_attr_vec(Some(mm))?;
     let n_tile = *mm_out.last()?;
-    let b_full_n = b_shape[1];
     let (n, n_off, b_stride) = if n_tile == b_full_n {
-        // Plain (untiled) output: B is the whole contiguous tensor.
+        // Plain (untiled) output: B spans the whole N width.
         (b_full_n, 0, b_full_n)
+    } else if transpose_b {
+        // N-tiled transpose-B: the N axis is B's FIRST (row) axis, so the slice is
+        // a CONTIGUOUS block of `n_tile` rows of the `[n,k]` weight at the N-offset
+        // carried in the access tile's FIRST index.
+        let n_off = matmul_b_axis_offset(mm.operands.get(1)?, defs, /*last=*/ false)?;
+        if n_off < 0 || n_off + n_tile > b_full_n {
+            return None;
+        }
+        (n_tile, n_off, b_full_n)
     } else {
-        // N-tiled: B is a column slice. Only reconstructible when B is a weight
-        // `ktdp.load` (an HBM pointer we can strided-decode) — read the slice
-        // offset from the B access tile's column index. A non-weight (forwarded
-        // activation) N-tile can't be strided here, so reject (interpreter).
-        let n_off = matmul_b_col_offset(mm.operands.get(1)?, defs)?;
+        // N-tiled plain: B is a column slice of a wider weight; the offset is the
+        // access tile's last (column) index. A non-weight N-tile can't be strided
+        // here, so reject (interpreter).
+        let n_off = matmul_b_axis_offset(mm.operands.get(1)?, defs, /*last=*/ true)?;
         if n_off < 0 || n_off + n_tile > b_full_n {
             return None; // offset/width out of the weight — refuse to guess
         }
@@ -1426,26 +1615,33 @@ fn recognize_matmul_loop(forop: &Operation, defs: &HashMap<String, &Operation>) 
         out_ssa: forop.result.clone()?,
         n_off,
         b_stride,
+        transpose_b,
     })
 }
 
-/// The constant column (last-axis) offset of a matmul B operand's access tile, for
-/// an N-tiled weight load. `name` is the matmul's B operand (a `ktdp.load`); its
-/// access tile `construct_access_tile %view, %row, %col` carries the column index
-/// as its last index operand. Returns that index's `arith.constant` value, or
-/// `None` if B isn't a weight load or the column index isn't a static constant
-/// (a non-constant column index can't be reconstructed as a fixed slice).
-fn matmul_b_col_offset(name: &str, defs: &HashMap<String, &Operation>) -> Option<i64> {
+/// The constant N-axis offset of a matmul B operand's access tile, for an N-tiled
+/// weight load. `name` is the matmul's B operand (a `ktdp.load`); its access tile
+/// `construct_access_tile %view, %i0, %i1` carries the offset as one of its index
+/// operands. `last=true` reads the LAST index (plain `matmul`, B `[k,n]` — N is the
+/// column axis); `last=false` reads the FIRST index (`matmul_transpose_b`, B `[n,k]`
+/// — N is the row axis). Returns that index's `arith.constant` value, or `None` if
+/// B isn't a weight load or the index isn't a static constant.
+fn matmul_b_axis_offset(name: &str, defs: &HashMap<String, &Operation>, last: bool) -> Option<i64> {
     let d = defs.get(strip(name))?;
     if d.op_type != "ktdp.load" {
         return None; // forwarded activation N-tile: not handled
     }
     let tile = d.operands.first()?;
     let tile_op = defs.get(strip(tile))?;
-    // construct_access_tile operands: [view, idx0, idx1, ...]; the LAST is the
-    // column (innermost/N-axis) index for a 2-D weight view.
-    let col_idx = tile_op.operands.last()?;
-    let cd = defs.get(strip(col_idx))?;
+    // construct_access_tile operands: [view, idx0, idx1, ...]. The N-axis index is
+    // the last operand for a `[k,n]` view, the first index operand (after `view`)
+    // for a transposed `[n,k]` view.
+    let idx = if last {
+        tile_op.operands.last()?
+    } else {
+        tile_op.operands.get(1)?
+    };
+    let cd = defs.get(strip(idx))?;
     if cd.op_type != "arith.constant" {
         return None;
     }
@@ -1632,18 +1828,24 @@ fn build_uses(ops: &[Operation]) -> HashMap<String, HashSet<usize>> {
     fn note(op: &Operation, top_idx: usize, uses: &mut HashMap<String, HashSet<usize>>) {
         for operand in &op.operands {
             if operand.starts_with('%') {
-                uses.entry(strip(operand).to_string()).or_default().insert(top_idx);
+                uses.entry(strip(operand).to_string())
+                    .or_default()
+                    .insert(top_idx);
             }
         }
         for attr in op.attributes.values() {
             match attr {
                 Attr::Str(s) if s.starts_with('%') => {
-                    uses.entry(strip(s).to_string()).or_default().insert(top_idx);
+                    uses.entry(strip(s).to_string())
+                        .or_default()
+                        .insert(top_idx);
                 }
                 Attr::StrList(xs) => {
                     for x in xs {
                         if x.starts_with('%') {
-                            uses.entry(strip(x).to_string()).or_default().insert(top_idx);
+                            uses.entry(strip(x).to_string())
+                                .or_default()
+                                .insert(top_idx);
                         }
                     }
                 }
@@ -1773,15 +1975,14 @@ fn lower_map_value(
         // sub-expression keeps its precedence inside the parent op (e.g. SiLU's
         // `v2 / (1 + exp(-v2))` must not flatten to `v2 / 1 + exp(-v2)`). Mirrors
         // the parenthesizing in `lower_value`.
-        Some(d) if in_win => {
-            Ok(format!("({})", lower_map_compute(d, defs, in_window, live_ins, depth + 1)?))
-        }
+        Some(d) if in_win => Ok(format!(
+            "({})",
+            lower_map_compute(d, defs, in_window, live_ins, depth + 1)?
+        )),
         // A scalar constant (directly or via splat) reached as a plain operand
         // folds to its literal — it would be a `Value::Scalar` at runtime, not a
         // resident tile, so it must never become a live-in buffer.
-        _ if try_fold_scalar(name, defs).is_some() => {
-            Ok(try_fold_scalar(name, defs).unwrap())
-        }
+        _ if try_fold_scalar(name, defs).is_some() => Ok(try_fold_scalar(name, defs).unwrap()),
         // A non-constant SCALAR value (e.g. an `arith.maximumf : f16` from an
         // attention softmax's scalar max/sum reduction, or any non-tensor op
         // result) is a `Value::Scalar` at runtime — it can't be bound as a tile
@@ -1880,7 +2081,10 @@ fn lower_map_broadcast(
         live_ins.push(orig);
     }
     let buf = strip(input).to_string();
-    Ok(format!("{buf}[{}]", broadcast_index_expr(&out_shape, &expanded)))
+    Ok(format!(
+        "{buf}[{}]",
+        broadcast_index_expr(&out_shape, &expanded)
+    ))
 }
 
 /// Count of Map windows successfully offloaded to a fused GPU kernel (test /
@@ -1949,9 +2153,7 @@ pub fn map_gpu_min_elems() -> usize {
 /// gate) the window registers its TRIGGER (the last op index — run the kernel
 /// there) and all its op indices in the SKIP set; otherwise the window's ops are
 /// left to the interpreter. Returns `(trigger -> kernel, skip set)`.
-pub fn map_fusion_plan(
-    ops: &[Operation],
-) -> (HashMap<usize, MapRegionKernel>, HashSet<usize>) {
+pub fn map_fusion_plan(ops: &[Operation]) -> (HashMap<usize, MapRegionKernel>, HashSet<usize>) {
     // Build the function-wide def map and use map ONCE; share them across every
     // window's emit (the analysis is linear in ops, so per-window rebuilds would
     // make planning quadratic in a 35k-op fused model).
@@ -2239,7 +2441,10 @@ fn lower_broadcast(op: &Operation, defs: &HashMap<String, &Operation>) -> Result
         }
         expanded.insert(d, 1);
     }
-    Ok(format!("{buf}[{}]", broadcast_index_expr(&out_shape, &expanded)))
+    Ok(format!(
+        "{buf}[{}]",
+        broadcast_index_expr(&out_shape, &expanded)
+    ))
 }
 
 /// MSL index into a broadcast input: sum over axes whose expanded input size is
@@ -2314,11 +2519,10 @@ fn compose_compute_expr(
 ) -> Result<String, String> {
     let operand = |i: usize, r: &mut dyn FnMut(usize) -> Result<String, String>| r(i);
     // Binary element-wise float ops -> infix operator.
-    let binop = |sym: &str,
-                 r: &mut dyn FnMut(usize) -> Result<String, String>|
-     -> Result<String, String> {
-        Ok(format!("{} {} {}", operand(0, r)?, sym, operand(1, r)?))
-    };
+    let binop =
+        |sym: &str, r: &mut dyn FnMut(usize) -> Result<String, String>| -> Result<String, String> {
+            Ok(format!("{} {} {}", operand(0, r)?, sym, operand(1, r)?))
+        };
     // Unary math ops -> MSL intrinsic call.
     let unary = |func: &str,
                  r: &mut dyn FnMut(usize) -> Result<String, String>|
@@ -2329,12 +2533,16 @@ fn compose_compute_expr(
         "arith.subf" => binop("-", resolve),
         "arith.mulf" => binop("*", resolve),
         "arith.divf" => binop("/", resolve),
-        "arith.maximumf" | "arith.maxf" => {
-            Ok(format!("max({}, {})", operand(0, resolve)?, operand(1, resolve)?))
-        }
-        "arith.minimumf" | "arith.minf" => {
-            Ok(format!("min({}, {})", operand(0, resolve)?, operand(1, resolve)?))
-        }
+        "arith.maximumf" | "arith.maxf" => Ok(format!(
+            "max({}, {})",
+            operand(0, resolve)?,
+            operand(1, resolve)?
+        )),
+        "arith.minimumf" | "arith.minf" => Ok(format!(
+            "min({}, {})",
+            operand(0, resolve)?,
+            operand(1, resolve)?
+        )),
         "arith.negf" => Ok(format!("-{}", operand(0, resolve)?)),
         "arith.absf" | "math.absf" => unary("abs", resolve),
         "math.exp" => unary("exp", resolve),
@@ -2423,7 +2631,9 @@ struct MetalDispatch {
     queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     pipelines: HashMap<
         u64,
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+        objc2::rc::Retained<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        >,
     >,
 }
 
@@ -2442,7 +2652,9 @@ fn cached_dispatch(
     (
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
         objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+        objc2::rc::Retained<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        >,
     ),
     String,
 > {
@@ -2454,8 +2666,14 @@ fn cached_dispatch(
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
             let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
-            let queue = device.newCommandQueue().ok_or("metal: newCommandQueue nil")?;
-            *slot = Some(MetalDispatch { device, queue, pipelines: HashMap::new() });
+            let queue = device
+                .newCommandQueue()
+                .ok_or("metal: newCommandQueue nil")?;
+            *slot = Some(MetalDispatch {
+                device,
+                queue,
+                pipelines: HashMap::new(),
+            });
         }
         let d = slot.as_mut().unwrap();
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2972,7 +3190,7 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
         for (uint i = tid; i < TG_N * BK; i += TG_THREADS) {                   \
             uint n = i / BK, c = i % BK;                                       \
             uint gn = tn0 + n, gk = (kc) + c;                                  \
-            bp[i] = (gn < N && gk < K) ? half(b_in[gk * N + gn]) : half(0);\
+            bp[i] = (gn < N && gk < K) ? half(b_in[KTIR_TRANSPOSE_B ? (gn * K + gk) : (gk * N + gn)]) : half(0);\
         }                                                                      \
     } while (0)
 
@@ -3088,7 +3306,7 @@ inline float simd_epilogue(float v, float ev, uint binop, uint act) {
             uint gm = r0 + r, gkA = k0 + c;
             a_tg[i] = (gm < M && gkA < K) ? a_in[gm * K + gkA] : 0.0f;
             uint gkB = k0 + r, gn = c0 + c;
-            b_tg[i] = (gkB < K && gn < N) ? b_in[gkB * N + gn] : 0.0f;
+            b_tg[i] = (gkB < K && gn < N) ? b_in[KTIR_TRANSPOSE_B ? (gn * K + gkB) : (gkB * N + gn)] : 0.0f;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 fa, fb;
@@ -3220,7 +3438,15 @@ struct Scratch {
 #[cfg(metal)]
 pub struct NaxGemm {
     device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    /// Plain GEMM pipeline (B `[k,n]`). Covers BOTH active kernels: NAX `nax_matmul`
+    /// (M5+) or the simdgroup `matmul` (pre-M5) — whichever the device selects.
     pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    /// Transpose-B pipeline: the SAME kernel compiled with `KTIR_TRANSPOSE_B=1`, so
+    /// its B-staging reads the on-disk `[n,k]` weight verbatim (no copy/transpose).
+    /// `matmul_unified(.., transpose_b=true)` selects it — covering NAX AND simdgroup.
+    pipeline_bt: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
     queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
@@ -3264,21 +3490,36 @@ impl NaxGemm {
         } else {
             (SIMD_MATMUL_SRC, "matmul", 8usize, 8usize, 32usize)
         };
-        let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
-            .map_err(|e| format!("metal: GEMM compile failed: {e:?}"))?;
-        let function = library
-            .newFunctionWithName(&NSString::from_str(kname))
-            .ok_or("metal: GEMM kernel not found")?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| format!("metal: pipeline build failed: {e:?}"))?;
+        // Build a pipeline from `src` with `KTIR_TRANSPOSE_B` defined to `tb` (0 =
+        // plain B `[k,n]`, 1 = transpose-B reads B `[n,k]` verbatim). Prepending the
+        // `#define` compiles the SAME kernel two ways — no source duplication, no
+        // descriptor change (the B-staging index is the only difference).
+        let build = |tb: u32| -> Result<
+            objc2::rc::Retained<
+                objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+            >,
+            String,
+        > {
+            let full = format!("#define KTIR_TRANSPOSE_B {tb}\n{src}");
+            let library = device
+                .newLibraryWithSource_options_error(&NSString::from_str(&full), Some(&opts))
+                .map_err(|e| format!("metal: GEMM compile failed (tb={tb}): {e:?}"))?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str(kname))
+                .ok_or("metal: GEMM kernel not found")?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| format!("metal: pipeline build failed (tb={tb}): {e:?}"))
+        };
+        let pipeline = build(0)?;
+        let pipeline_bt = build(1)?;
         let queue = device
             .newCommandQueue()
             .ok_or("metal: newCommandQueue returned nil")?;
         Ok(Self {
             device,
             pipeline,
+            pipeline_bt,
             queue,
             scratch: std::cell::RefCell::new(Scratch::default()),
             block_m,
@@ -3429,6 +3670,11 @@ impl NaxGemm {
     /// are [`UnifiedBuffer`]s already resident in shared memory. Encodes their
     /// buffers directly — no host↔device fill or readback. `c` must be sized
     /// `m·n`. This is the copy-free path unified memory makes possible.
+    ///
+    /// `transpose_b`: when true, B is the on-disk `[n,k]` weight and the GEMM
+    /// contracts the last axis (`A·Bᵀ`) via the `KTIR_TRANSPOSE_B` pipeline — the
+    /// kernel's B-staging reads `[n,k]` verbatim (no host copy/transpose/gather).
+    /// `b.len` is `n·k` either way, so the size check is unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_unified(
         &self,
@@ -3440,6 +3686,7 @@ impl NaxGemm {
         c: &mut UnifiedBuffer,
         e: Option<&UnifiedBuffer>,
         epi: Epilogue,
+        transpose_b: bool,
     ) -> Result<(), String> {
         use objc2_metal::{
             MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
@@ -3447,7 +3694,11 @@ impl NaxGemm {
         use std::ffi::c_void;
         use std::ptr::NonNull;
         assert_eq!(a.len, m * k, "A must be m×k");
-        assert_eq!(b.len, k * n, "B must be k×n");
+        assert_eq!(
+            b.len,
+            k * n,
+            "B must be k×n (n×k for transpose_b — same length)"
+        );
         assert_eq!(c.len, m * n, "C must be m×n");
 
         let dims = [m as u32, n as u32, k as u32];
@@ -3457,7 +3708,11 @@ impl NaxGemm {
             .commandBuffer()
             .ok_or("metal: commandBuffer nil")?;
         let enc = cb.computeCommandEncoder().ok_or("metal: encoder nil")?;
-        enc.setComputePipelineState(&self.pipeline);
+        enc.setComputePipelineState(if transpose_b {
+            &self.pipeline_bt
+        } else {
+            &self.pipeline
+        });
         let e_mtl = e.unwrap_or(b); // dummy when binop==0 (never dereferenced)
         unsafe {
             enc.setBuffer_offset_atIndex(Some(&a.mtl), 0, 0);
@@ -4047,6 +4302,110 @@ kernel void mpp_probe(
         );
     }
 
+    /// Shape sweep shared by the transpose-B oracle tests: exact tile, ragged in
+    /// every dim, multi-K (K>16 and K not /16), wide N, tall M.
+    #[cfg(metal)]
+    const TRANSPOSE_B_SHAPES: [(usize, usize, usize); 7] = [
+        (16, 16, 32),
+        (1, 1, 1),
+        (17, 33, 5),
+        (48, 16, 64),
+        (50, 20, 70),
+        (7, 100, 3),
+        (100, 7, 3),
+    ];
+
+    /// THE silent-wrong-answer guard for NAX native transpose-B: the
+    /// `KTIR_TRANSPOSE_B` pipeline (B staged from on-disk `[n,k]`) must equal the
+    /// `A·Bᵀ` oracle. A wrong staging index would compute a plausible-but-wrong
+    /// product the GPU-vs-CPU self-check can't catch, so we pin it to the oracle.
+    #[test]
+    fn nax_matmul_unified_transpose_b_matches_oracle() {
+        let ctx = match NaxGemm::new() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("no Metal device — skipping NAX transpose-B test");
+                return;
+            }
+            Err(e) => panic!("NAX GEMM compile failed: {e}"),
+        };
+        for (m, k, n) in TRANSPOSE_B_SHAPES {
+            // a in 0..3, b in 0..4 — exact in f16; f32 accumulation keeps the
+            // integer dot products exact, so assert_eq is valid (as in the plain
+            // oracle test). B is stored [n,k] (on-disk Linear [out,in]).
+            let a: Vec<f32> = (0..m * k).map(|i| (i % 3) as f32).collect();
+            let b: Vec<f32> = (0..n * k).map(|i| (i % 4) as f32).collect();
+            let ua = ctx.unified_from(&a).unwrap();
+            let ub = ctx.unified_from(&b).unwrap();
+            let mut uc = ctx.unified(m * n).unwrap();
+            ctx.matmul_unified(
+                m,
+                k,
+                n,
+                &ua,
+                &ub,
+                &mut uc,
+                None,
+                Epilogue::NONE,
+                /*transpose_b=*/ true,
+            )
+            .unwrap();
+            let want = crate::blas::naive_sgemm_bt(m, k, n, &a, &b);
+            assert_eq!(
+                uc.as_slice(),
+                want.as_slice(),
+                "NAX transpose-B mismatch at ({m},{k},{n})"
+            );
+        }
+        eprintln!(
+            "NAX transpose-B (matmul_unified) matches the bt oracle across {} shapes ✓",
+            TRANSPOSE_B_SHAPES.len()
+        );
+    }
+
+    /// Same guard for the pre-NAX simdgroup "metal matmul" kernel (forced via
+    /// `new_simdgroup`), so transpose-B is covered on non-M5 GPUs too.
+    #[test]
+    fn simdgroup_matmul_unified_transpose_b_matches_oracle() {
+        let ctx = match NaxGemm::new_simdgroup() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("no Metal device — skipping simdgroup transpose-B test");
+                return;
+            }
+            Err(e) => panic!("simdgroup GEMM compile failed: {e}"),
+        };
+        for (m, k, n) in TRANSPOSE_B_SHAPES {
+            let a: Vec<f32> = (0..m * k).map(|i| (i % 3) as f32).collect();
+            let b: Vec<f32> = (0..n * k).map(|i| (i % 4) as f32).collect();
+            let ua = ctx.unified_from(&a).unwrap();
+            let ub = ctx.unified_from(&b).unwrap();
+            let mut uc = ctx.unified(m * n).unwrap();
+            ctx.matmul_unified(
+                m,
+                k,
+                n,
+                &ua,
+                &ub,
+                &mut uc,
+                None,
+                Epilogue::NONE,
+                /*transpose_b=*/ true,
+            )
+            .unwrap();
+            let want = crate::blas::naive_sgemm_bt(m, k, n, &a, &b);
+            assert_eq!(
+                uc.as_slice(),
+                want.as_slice(),
+                "simdgroup transpose-B mismatch at ({m},{k},{n})"
+            );
+        }
+        eprintln!(
+            "simdgroup transpose-B matches the bt oracle across {} shapes ✓",
+            TRANSPOSE_B_SHAPES.len()
+        );
+    }
+
     /// A batched matmul chain (one command buffer, one sync) computes the same
     /// result as the matmuls run separately, and amortizes the per-dispatch
     /// latency: a chain of N small matmuls should be far faster than N calls.
@@ -4212,7 +4571,7 @@ kernel void mpp_probe(
         let ua = ctx.unified_from(&a).unwrap();
         let ub = ctx.unified_from(&b).unwrap();
         let mut uc = ctx.unified(m * n).unwrap();
-        ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)
+        ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)
             .unwrap();
 
         // Correctness vs the copy-based path (same kernel, identical result).
@@ -4228,7 +4587,7 @@ kernel void mpp_probe(
         let it = 50;
         let t0 = std::time::Instant::now();
         for _ in 0..it {
-            ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE)
+            ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)
                 .unwrap();
         }
         let zc = t0.elapsed().as_secs_f64() / it as f64;
@@ -4561,13 +4920,17 @@ module {
         let kernel = emit_kernel(&module, "chain").expect("emit fused chain");
         // One kernel, three input buffers (a,b,c) + one output, deduped & ordered.
         let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["a_ptr", "b_ptr", "c_ptr", "out_ptr"], "fused buffer set");
+        assert_eq!(
+            names,
+            vec!["a_ptr", "b_ptr", "c_ptr", "out_ptr"],
+            "fused buffer set"
+        );
         assert_eq!(kernel.buffers.iter().filter(|b| b.is_output).count(), 1);
         // The whole DAG collapses into one assignment: exp(a*b) + c.
         assert!(
-            kernel.source.contains(
-                "out_ptr[gid] = (exp((a_ptr[gid] * b_ptr[gid]))) + c_ptr[gid];"
-            ),
+            kernel
+                .source
+                .contains("out_ptr[gid] = (exp((a_ptr[gid] * b_ptr[gid]))) + c_ptr[gid];"),
             "expected one fused expression, got:\n{}",
             kernel.source
         );
@@ -4610,7 +4973,9 @@ module {
         let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["a_ptr", "out_ptr"], "constant is not a buffer");
         assert!(
-            kernel.source.contains("out_ptr[gid] = half(((float(a_ptr[gid])) * ((2.0))));"),
+            kernel
+                .source
+                .contains("out_ptr[gid] = half(((float(a_ptr[gid])) * ((2.0))));"),
             "unexpected fused body:\n{}",
             kernel.source
         );
@@ -4670,7 +5035,10 @@ module {
     #[test]
     fn unfusable_op_forces_fallback() {
         let ops = vec![op("arith.mulf"), op("scf.for"), op("arith.addf")];
-        assert!(plan_kernels(&ops).is_err(), "bare scf.for must force a fallback");
+        assert!(
+            plan_kernels(&ops).is_err(),
+            "bare scf.for must force a fallback"
+        );
     }
 
     /// Build a K-loop matmul function: A is either a forwarded extract_slice of a
@@ -4685,25 +5053,52 @@ module {
             // fused fn the source is a preceding map/reduce region's output.
             Operation::new(Some("%src"), "tensor.empty", &[]).with_attr("shape", il(vec![m, k])),
             // B weight view over %wptr, shape [k,n].
-            Operation::new(Some("%vw"), "ktdp.construct_memory_view", &["%wptr"]).with_attr("shape", il(vec![k, n])),
+            Operation::new(Some("%vw"), "ktdp.construct_memory_view", &["%wptr"])
+                .with_attr("shape", il(vec![k, n])),
         ];
         let mut body = Vec::new();
         if a_via_slice {
             body.push(
-                Operation::new(Some("%a"), "tensor.extract_slice", &["%src"])
-                    .with_attr("slice_sizes", Attr::StrList(vec!["1".into(), k.to_string()])),
+                Operation::new(Some("%a"), "tensor.extract_slice", &["%src"]).with_attr(
+                    "slice_sizes",
+                    Attr::StrList(vec!["1".into(), k.to_string()]),
+                ),
             );
         } else {
             // A via a load of a [m,k] view over %aptr.
-            top.push(Operation::new(Some("%va"), "ktdp.construct_memory_view", &["%aptr"]).with_attr("shape", il(vec![m, k])));
-            body.push(Operation::new(Some("%at"), "ktdp.construct_access_tile", &["%va", "%pid", "%kk"]).with_attr("shape", il(vec![1, k])));
+            top.push(
+                Operation::new(Some("%va"), "ktdp.construct_memory_view", &["%aptr"])
+                    .with_attr("shape", il(vec![m, k])),
+            );
+            body.push(
+                Operation::new(
+                    Some("%at"),
+                    "ktdp.construct_access_tile",
+                    &["%va", "%pid", "%kk"],
+                )
+                .with_attr("shape", il(vec![1, k])),
+            );
             body.push(Operation::new(Some("%a"), "ktdp.load", &["%at"]));
         }
-        body.push(Operation::new(Some("%bt"), "ktdp.construct_access_tile", &["%vw", "%kk", "%c0"]).with_attr("shape", il(vec![k, n])));
+        body.push(
+            Operation::new(
+                Some("%bt"),
+                "ktdp.construct_access_tile",
+                &["%vw", "%kk", "%c0"],
+            )
+            .with_attr("shape", il(vec![k, n])),
+        );
         body.push(Operation::new(Some("%b"), "ktdp.load", &["%bt"]));
         body.push(Operation::new(Some("%cinit"), "arith.constant", &[]));
-        body.push(Operation::new(Some("%part"), "linalg.matmul", &["%a", "%b", "%cinit"]).with_attr("shape", il(vec![m, n])));
-        body.push(Operation::new(Some("%accnext"), "arith.addf", &["%acc", "%part"]));
+        body.push(
+            Operation::new(Some("%part"), "linalg.matmul", &["%a", "%b", "%cinit"])
+                .with_attr("shape", il(vec![m, n])),
+        );
+        body.push(Operation::new(
+            Some("%accnext"),
+            "arith.addf",
+            &["%acc", "%part"],
+        ));
         body.push(Operation::new(None, "scf.yield", &["%accnext"]));
         let mut forop = Operation::new(Some("%mm"), "scf.for", &["%c0", "%K", "%KB", "%azero"])
             .with_attr("iter_var", Attr::Str("%kk".into()))
@@ -4722,11 +5117,15 @@ module {
         assert_eq!(
             plan,
             vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
-                m: 8, k: 576, n: 576,
+                m: 8,
+                k: 576,
+                n: 576,
                 a_root: "%src".into(),
                 b_root: "%wptr".into(),
                 out_ssa: "%mm".into(),
-                n_off: 0, b_stride: 576,
+                n_off: 0,
+                b_stride: 576,
+                transpose_b: false,
             })],
             "prefill K-loop must collapse to a single [8,576]@[576,576] GEMM"
         );
@@ -4741,12 +5140,56 @@ module {
         assert_eq!(
             plan,
             vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
-                m: 1, k: 576, n: 576,
+                m: 1,
+                k: 576,
+                n: 576,
                 a_root: "%aptr".into(),
                 b_root: "%wptr".into(),
                 out_ssa: "%mm".into(),
-                n_off: 0, b_stride: 576,
+                n_off: 0,
+                b_stride: 576,
+                transpose_b: false,
             })]
+        );
+    }
+
+    #[test]
+    fn recognizes_transpose_b_matmul_kloop() {
+        // A transpose-B K-loop: body op is `linalg.matmul_transpose_b`, B's view is
+        // [n,k] (on-disk Linear [out,in]). The recognizer must set transpose_b=true,
+        // derive n from B's FIRST axis and k from its LAST (== A's k), n_off=0.
+        let (m, k, n) = (8, 576, 512);
+        let mut ops = matmul_loop_fn(true, m, k, n);
+        // Flip B's view shape [k,n] -> [n,k] (top-level %vw), and retype the matmul
+        // op (which lives INSIDE the scf.for body region) to matmul_transpose_b.
+        for op in ops.iter_mut() {
+            if op.result.as_deref() == Some("%vw") {
+                op.attributes
+                    .insert("shape".into(), Attr::IntList(vec![n, k]));
+            }
+            if op.op_type == "scf.for" {
+                for body_op in op.regions[0].iter_mut() {
+                    if body_op.op_type == "linalg.matmul" {
+                        body_op.op_type = "linalg.matmul_transpose_b".into();
+                    }
+                }
+            }
+        }
+        let plan = plan_kernels(&ops).unwrap();
+        assert_eq!(
+            plan,
+            vec![KernelRegion::MatmulLoop(MatmulLoopInfo {
+                m,
+                k,
+                n,
+                a_root: "%src".into(),
+                b_root: "%wptr".into(),
+                out_ssa: "%mm".into(),
+                n_off: 0,
+                b_stride: n,
+                transpose_b: true,
+            })],
+            "transpose-B K-loop must be recognized with transpose_b=true and [n,k] B"
         );
     }
 
@@ -4760,7 +5203,10 @@ module {
         let mut forop = Operation::new(Some("%r"), "scf.for", &["%c0", "%K", "%KB", "%azero"])
             .with_attr("iter_args", Attr::StrList(vec!["%acc".into()]));
         forop.regions = vec![std::mem::take(&mut body)];
-        assert!(plan_kernels(&[forop]).is_err(), "non-matmul loop must fall back");
+        assert!(
+            plan_kernels(&[forop]).is_err(),
+            "non-matmul loop must fall back"
+        );
     }
 
     #[test]
@@ -4821,7 +5267,9 @@ module {
         let names: Vec<&str> = kernel.buffers.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["a_ptr", "w_ptr", "out_ptr"]);
         assert!(
-            kernel.source.contains("out_ptr[gid] = a_ptr[gid] * w_ptr[(gid % 576)];"),
+            kernel
+                .source
+                .contains("out_ptr[gid] = a_ptr[gid] * w_ptr[(gid % 576)];"),
             "unexpected broadcast body:\n{}",
             kernel.source
         );
@@ -4963,13 +5411,18 @@ module {
         assert_eq!(matmul_min_kn(), GEMM_GPU_MIN_KN);
 
         // OFFLOAD GATE (full-M offload here vs interpreter scf.for fallback):
-        //   m == 1 (decode): offload only if k·n clears the gate.
-        assert!(!matmul_loop_offload(1, 576, 576)); // small decode GEMM -> interpreter
-        assert!(matmul_loop_offload(1, 576, 49152)); // decode lm_head (28M) -> offload
+        //   PLAIN m == 1 (decode): offload only if k·n clears the gate.
+        assert!(!matmul_loop_offload(1, 576, 576, false)); // small decode GEMM -> interpreter
+        assert!(matmul_loop_offload(1, 576, 49152, false)); // decode lm_head (28M) -> offload
         //   m > 1 (prefill): ALWAYS offloaded full-M, regardless of k·n — never the
         //   row-0 interpreter loop. THIS is what the AMX change relies on.
-        assert!(matmul_loop_offload(8, 576, 576)); // small prefill GEMM still offloads
-        assert!(matmul_loop_offload(32, 2048, 8192));
+        assert!(matmul_loop_offload(8, 576, 576, false)); // small prefill GEMM still offloads
+        assert!(matmul_loop_offload(32, 2048, 8192, false));
+        //   transpose-B: ALWAYS offloaded, even tiny m=1 — the interpreter's
+        //   per-K-step [n,k] B panel is a slow strided gather, so collapse it to one
+        //   AMX sgemm_bt (B read contiguous [n,k]). This is the decode 0.28→0.68 fix.
+        assert!(matmul_loop_offload(1, 576, 576, true)); // small decode transpose-B -> offload
+        assert!(matmul_loop_offload(1, 2048, 512, true)); // llama decode q/k/v (1M) -> offload
 
         // BACKEND (of the offloaded GEMMs): NAX iff k·n >= gate, else AMX.
         // smollm2 layer GEMMs (k·n 0.33M..0.88M) -> AMX (the win at M=8).

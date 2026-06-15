@@ -58,7 +58,10 @@ fn matmul_amx_vs_metal() {
     };
 
     // (m, k, n, iters): the per-kernel bench shape, then a prefill-scale shape.
-    for (m, k, n, iters) in [(64usize, 2048usize, 8192usize, 20usize), (512, 4096, 4096, 20)] {
+    for (m, k, n, iters) in [
+        (64usize, 2048usize, 8192usize, 20usize),
+        (512, 4096, 4096, 20),
+    ] {
         let a: Vec<f32> = (0..m * k).map(|i| f16((i % 13) as f32 * 0.01)).collect();
         let b: Vec<f32> = (0..k * n).map(|i| f16((i % 11) as f32 * 0.01)).collect();
         let flops = 2.0 * m as f64 * k as f64 * n as f64;

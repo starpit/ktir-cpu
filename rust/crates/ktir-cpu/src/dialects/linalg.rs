@@ -67,6 +67,11 @@ pub fn register(d: &mut Dispatch) {
     // variant. reduce is LC.ZERO (cost lives in its region's ops).
     d.register("linalg.matmul", LatencyCategory::ComputeFloat, matmul);
     d.register(
+        "linalg.matmul_transpose_b",
+        LatencyCategory::ComputeFloat,
+        matmul_transpose_b,
+    );
+    d.register(
         "linalg.batch_matmul",
         LatencyCategory::ComputeFloat,
         batch_matmul,
@@ -256,6 +261,48 @@ fn matmul(
     Ok(Some(Value::Tile(result)))
 }
 
+/// `%r = linalg.matmul_transpose_b ins(%A, %B) outs(%C)` -> `C + A·Bᵀ`, where
+/// `B` is stored `[n, k]` (the on-disk PyTorch `Linear` `[out, in]` layout). The
+/// contraction is over `k`, the last axis of BOTH operands — `xWᵀ` read directly,
+/// no weight transpose. This is the form the emitter uses so weights bind
+/// zero-copy and nothing is flipped at load or per forward.
+fn matmul_transpose_b(
+    op: &Operation,
+    ctx: &mut CoreContext,
+    _env: &ExecutionEnv,
+) -> Result<Option<Value>, String> {
+    let a = expect_tile(
+        ctx.get_value(&op.operands[0])?,
+        "linalg.matmul_transpose_b A",
+    )?
+    .clone();
+    let b = expect_tile(
+        ctx.get_value(&op.operands[1])?,
+        "linalg.matmul_transpose_b B",
+    )?
+    .clone();
+    let mut result = matmul2d_bt(&a, &b)?;
+
+    if op.operands.len() > 2
+        && let Value::Tile(c) = ctx.get_value(&op.operands[2])?
+    {
+        if c.shape != result.shape {
+            return Err(format!(
+                "linalg.matmul_transpose_b: outs shape {:?} != A·Bᵀ shape {:?}",
+                c.shape, result.shape
+            ));
+        }
+        for (r, &cv) in std::rc::Rc::make_mut(&mut result.data)
+            .iter_mut()
+            .zip(c.data.iter())
+        {
+            *r += cv;
+        }
+        result.dtype = c.dtype;
+    }
+    Ok(Some(Value::Tile(result)))
+}
+
 /// `%r = linalg.batch_matmul ins(%A, %B) outs(%C)` over the leading batch dim.
 fn batch_matmul(
     op: &Operation,
@@ -318,6 +365,28 @@ fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
     }
     let n = b.shape[1];
     let data = gemm(m, k, n, &a.data, &b.data);
+    Ok(Tile::compute(data, a.dtype, vec![m, n]))
+}
+
+/// `A[m,k] · B[n,k]ᵀ -> [m,n]`, contracting the last axis of both (transpose-B).
+/// B is stored `[n, k]`; no data is transposed — `sgemm_rowmajor_bt` reads B's
+/// rows directly (contiguous), so this is as fast as a plain GEMM.
+fn matmul2d_bt(a: &Tile, b: &Tile) -> Result<Tile, String> {
+    if a.shape.len() != 2 || b.shape.len() != 2 {
+        return Err(format!(
+            "linalg.matmul_transpose_b: expected 2-D operands, got {:?} and {:?}",
+            a.shape, b.shape
+        ));
+    }
+    let (m, k) = (a.shape[0], a.shape[1]);
+    if b.shape[1] != k {
+        return Err(format!(
+            "linalg.matmul_transpose_b: contraction dims disagree: {:?} · {:?}ᵀ",
+            a.shape, b.shape
+        ));
+    }
+    let n = b.shape[0];
+    let data = crate::blas::sgemm_rowmajor_bt(m, k, n, &a.data, &b.data);
     Ok(Tile::compute(data, a.dtype, vec![m, n]))
 }
 
@@ -1213,6 +1282,88 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("inner dims disagree"));
+    }
+
+    #[test]
+    fn matmul_transpose_b_basic() {
+        let mut ctx = single_core_context();
+        // A=[[1,2],[3,4]]. B stored [n,k]=[[5,7],[6,8]] (= Bᵀ of [[5,6],[7,8]]).
+        // A·Bᵀ contracts the LAST axis: C[m,n]=Σ_k A[m,k]·B[n,k] = [[19,22],[43,50]].
+        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        run(
+            &[Operation::new(
+                Some("%r"),
+                "linalg.matmul_transpose_b",
+                &["%a", "%b"],
+            )],
+            &mut ctx,
+        )
+        .unwrap();
+        let t = get_tile(&ctx, "%r");
+        assert_eq!(t.shape, vec![2, 2]);
+        assert_eq!(t.data.to_vec(), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn matmul_transpose_b_nonsquare_matches_plain() {
+        let mut ctx = single_core_context();
+        // A [2x3]; B stored [n,k]=[2x3]=[[7,9,11],[8,10,12]] (= Bᵀ of the [3x2] in
+        // matmul_nonsquare). A·Bᵀ must equal that plain result [58,64,139,154].
+        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]));
+        ctx.set_value(
+            "%b",
+            tile(vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0], vec![2, 3]),
+        );
+        run(
+            &[Operation::new(
+                Some("%r"),
+                "linalg.matmul_transpose_b",
+                &["%a", "%b"],
+            )],
+            &mut ctx,
+        )
+        .unwrap();
+        let t = get_tile(&ctx, "%r");
+        assert_eq!(t.shape, vec![2, 2]);
+        assert_eq!(t.data.to_vec(), vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn matmul_transpose_b_accumulates_outs() {
+        let mut ctx = single_core_context();
+        ctx.set_value("%a", tile(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]));
+        ctx.set_value("%b", tile(vec![5.0, 7.0, 6.0, 8.0], vec![2, 2]));
+        ctx.set_value("%c", tile(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]));
+        run(
+            &[Operation::new(
+                Some("%r"),
+                "linalg.matmul_transpose_b",
+                &["%a", "%b", "%c"],
+            )],
+            &mut ctx,
+        )
+        .unwrap();
+        let t = get_tile(&ctx, "%r");
+        assert_eq!(t.data.to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
+    }
+
+    #[test]
+    fn matmul_transpose_b_rejects_contraction_mismatch() {
+        let mut ctx = single_core_context();
+        // A [1x2] (k=2), B [n,k]=[1x3] (k=3) — last axes disagree.
+        ctx.set_value("%a", tile(vec![1.0, 2.0], vec![1, 2]));
+        ctx.set_value("%b", tile(vec![1.0, 2.0, 3.0], vec![1, 3]));
+        let err = run(
+            &[Operation::new(
+                Some("%r"),
+                "linalg.matmul_transpose_b",
+                &["%a", "%b"],
+            )],
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(err.contains("contraction dims disagree"));
     }
 
     #[test]

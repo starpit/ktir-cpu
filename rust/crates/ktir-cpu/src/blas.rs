@@ -79,6 +79,71 @@ pub fn naive_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f3
     c
 }
 
+/// `C(m×n) = A(m×k) · B(n×k)ᵀ` — the **transpose-B** GEMM, all row-major. `B` is
+/// stored `[n, k]` (the on-disk PyTorch `Linear` `[out, in]` layout); the
+/// contraction is over `k`, the LAST axis of BOTH operands, so each output is a
+/// dot product of an `A` row with a `B` row — both contiguous. This is `xWᵀ` read
+/// directly, with **no transpose of the weight data**. Routes to `cblas_sgemm`
+/// with `transB` (native, free) where available, else a naive loop.
+#[cfg(not(any(
+    target_os = "macos",
+    feature = "openblas",
+    feature = "mkl",
+    feature = "blis"
+)))]
+pub fn sgemm_rowmajor_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+    naive_sgemm_bt(m, k, n, a, b)
+}
+
+/// `C(m×n) = A(m×k) · B(n×k)ᵀ` via `cblas_sgemm` with `transB = CblasTrans`.
+#[cfg(any(
+    target_os = "macos",
+    feature = "openblas",
+    feature = "mkl",
+    feature = "blis"
+))]
+pub fn sgemm_rowmajor_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+    use cblas_sys::{CBLAS_LAYOUT, CBLAS_TRANSPOSE, cblas_sgemm};
+    let mut c = vec![0.0f32; m * n];
+    // SAFETY: a has m*k, b has n*k, c has m*n. B is transposed (op = CblasTrans),
+    // stored row-major [n,k] so its leading dimension is k. lda=k, ldb=k, ldc=n —
+    // all non-negative and matching the buffers.
+    unsafe {
+        cblas_sgemm(
+            CBLAS_LAYOUT::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasTrans,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+    c
+}
+
+/// Portable reference for the transpose-B GEMM (oracle for the cblas path).
+pub fn naive_sgemm_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc += a[i * k + kk] * b[j * k + kk];
+            }
+            c[i * n + j] = acc;
+        }
+    }
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +157,36 @@ mod tests {
             sgemm_rowmajor(2, 3, 2, &a, &b),
             vec![58.0, 64.0, 139.0, 154.0]
         );
+    }
+
+    #[test]
+    fn sgemm_bt_equals_sgemm_on_transposed_b() {
+        // A·Bᵀ where B is stored [n,k]. Build a contiguous [k,n] = Bᵀ and check
+        // sgemm_rowmajor_bt(A, B[n,k]) == sgemm_rowmajor(A, Bᵀ[k,n]).
+        let (m, k, n) = (3usize, 4usize, 5usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+        let b_nk: Vec<f32> = (0..n * k).map(|i| (i % 5) as f32 - 2.0).collect(); // [n,k]
+        // Bᵀ as contiguous [k,n]: bt[kk*n + j] = b_nk[j*k + kk].
+        let mut bt = vec![0.0f32; k * n];
+        for j in 0..n {
+            for kk in 0..k {
+                bt[kk * n + j] = b_nk[j * k + kk];
+            }
+        }
+        assert_eq!(
+            sgemm_rowmajor_bt(m, k, n, &a, &b_nk),
+            sgemm_rowmajor(m, k, n, &a, &bt),
+            "A·Bᵀ (transB over [n,k]) must equal A·(Bᵀ materialized [k,n])"
+        );
+    }
+
+    #[test]
+    fn naive_sgemm_bt_known_product() {
+        // A=[[1,2,3],[4,5,6]] (2×3), B stored [n,k]=[[1,0,0],[0,1,0]] (2×3).
+        // A·Bᵀ = [[1,2],[4,5]].
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        assert_eq!(naive_sgemm_bt(2, 3, 2, &a, &b), vec![1.0, 2.0, 4.0, 5.0]);
     }
 
     /// With a BLAS backend active, `cblas_sgemm` must agree with the naive oracle.

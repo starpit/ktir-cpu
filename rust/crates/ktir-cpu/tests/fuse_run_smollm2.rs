@@ -32,7 +32,9 @@ fn bundle_dir() -> Option<PathBuf> {
 
 fn bundle_dir_named(model: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".cache/cudaforge/ktir").join(model);
+    let dir = PathBuf::from(home)
+        .join(".cache/cudaforge/ktir")
+        .join(model);
     dir.join("manifest.json").is_file().then_some(dir)
 }
 
@@ -115,7 +117,14 @@ fn load_bundle(dir: &std::path::Path) -> Bundle {
         sources,
         results: HashSet::from([result_id]),
     };
-    Bundle { module, spec, shape, result_id, mask_id, n_nodes }
+    Bundle {
+        module,
+        spec,
+        shape,
+        result_id,
+        mask_id,
+        n_nodes,
+    }
 }
 
 /// Load a bundle's manifest + per-node MLIR, build the ProgramSpec, and fuse the
@@ -196,13 +205,23 @@ fn run_per_node_result(dir: &std::path::Path) -> Vec<f32> {
             let data = if is_out {
                 vec![0.0f32; rows * cols]
             } else {
-                buf.get(&tid).cloned().unwrap_or_else(|| panic!("node input {tid} not produced"))
+                buf.get(&tid)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("node input {tid} not produced"))
             };
-            args.push((name.clone(), Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 }));
+            args.push((
+                name.clone(),
+                Arg::Tensor {
+                    data,
+                    shape: vec![rows, cols],
+                    dtype: DType::F16,
+                },
+            ));
             arg_ids.push((name, tid, is_out));
         }
         let refs: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
-        let out = execute_function(module, func, &refs).unwrap_or_else(|e| panic!("per-node {func}: {e}"));
+        let out = execute_function(module, func, &refs)
+            .unwrap_or_else(|e| panic!("per-node {func}: {e}"));
         for (name, tid, is_out) in &arg_ids {
             if *is_out {
                 buf.insert(*tid, out.get(name).expect("output").data.clone());
@@ -227,8 +246,14 @@ fn run_segmented_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
     // Count the segments for the diagnostics the gates print (the production API
     // returns only the requested output tensors, not the plan shape).
     let segments = plan_segments(&b.module, &b.spec).expect("plan segments");
-    let n_fused = segments.iter().filter(|s| matches!(s, Segment::Fused(_))).count();
-    let n_native = segments.iter().filter(|s| matches!(s, Segment::Native(_))).count();
+    let n_fused = segments
+        .iter()
+        .filter(|s| matches!(s, Segment::Fused(_)))
+        .count();
+    let n_native = segments
+        .iter()
+        .filter(|s| matches!(s, Segment::Native(_)))
+        .count();
 
     // The program's SOURCES, keyed by the canonical `t{id}` name the production
     // API expects: true weights/inputs from t{id}.bin, and the attn mask as
@@ -251,7 +276,11 @@ fn run_segmented_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
         let (rows, cols, _) = b.shape[&m];
         owned.push((
             format!("t{m}"),
-            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data: vec![0.0f32; rows * cols],
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
@@ -271,8 +300,14 @@ fn run_segmented_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
 fn run_resident_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
     let b = load_bundle(dir);
     let segments = plan_segments(&b.module, &b.spec).expect("plan segments");
-    let n_fused = segments.iter().filter(|s| matches!(s, Segment::Fused(_))).count();
-    let n_native = segments.iter().filter(|s| matches!(s, Segment::Native(_))).count();
+    let n_fused = segments
+        .iter()
+        .filter(|s| matches!(s, Segment::Fused(_)))
+        .count();
+    let n_native = segments
+        .iter()
+        .filter(|s| matches!(s, Segment::Native(_)))
+        .count();
 
     let mut owned: Vec<(String, Arg)> = Vec::new();
     for (&id, &(rows, cols, is_src)) in &b.shape {
@@ -291,7 +326,11 @@ fn run_resident_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
         let (rows, cols, _) = b.shape[&m];
         owned.push((
             format!("t{m}"),
-            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data: vec![0.0f32; rows * cols],
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
@@ -318,7 +357,10 @@ fn run_resident_result(dir: &std::path::Path) -> (Vec<f32>, usize, usize) {
 #[ignore = "whole-model resident perf bench; needs the BUNDLE bundle. --ignored --nocapture"]
 fn resident_mspass() {
     let bundle = std::env::var("BUNDLE").unwrap_or_else(|_| "smollm2-135m".to_string());
-    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let iters: u32 = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let Some(dir) = bundle_dir_named(&bundle) else {
         eprintln!("{bundle} bundle absent — skipping");
         return;
@@ -342,7 +384,11 @@ fn resident_mspass() {
         let (rows, cols, _) = b.shape[&m];
         owned.push((
             format!("t{m}"),
-            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data: vec![0.0f32; rows * cols],
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
@@ -386,7 +432,10 @@ fn resident_mspass() {
 #[ignore = "whole-model perf bench; needs the BUNDLE bundle. --ignored --nocapture"]
 fn segmented_mspass() {
     let bundle = std::env::var("BUNDLE").unwrap_or_else(|_| "smollm2-135m".to_string());
-    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let iters: u32 = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let Some(dir) = bundle_dir_named(&bundle) else {
         eprintln!("{bundle} bundle absent — skipping");
         return;
@@ -414,7 +463,11 @@ fn segmented_mspass() {
         let (rows, cols, _) = b.shape[&m];
         owned.push((
             format!("t{m}"),
-            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data: vec![0.0f32; rows * cols],
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
@@ -451,7 +504,11 @@ fn segmented_mspass() {
 #[test]
 #[ignore = "resident-executor golden gate; needs the bundles. --ignored --nocapture"]
 fn resident_matches_golden() {
-    let attn = ["KTIR_GPU_PLAIN_MATMUL", "KTIR_GPU_REDUCE", "KTIR_GPU_TRANSPOSE"];
+    let attn = [
+        "KTIR_GPU_PLAIN_MATMUL",
+        "KTIR_GPU_REDUCE",
+        "KTIR_GPU_TRANSPOSE",
+    ];
     let mut any = false;
     let mut failures: Vec<String> = Vec::new();
     for bundle in [
@@ -483,7 +540,11 @@ fn resident_matches_golden() {
         let golden = read_f32(&dir.join("golden.bin"));
         assert_eq!(result.len(), golden.len(), "{bundle}: result length");
         let finite = result.iter().filter(|x| x.is_finite()).count();
-        let max_abs = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_abs = result
+            .iter()
+            .zip(&golden)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!(
             "  RESIDENT {bundle} ({n_fused} fused + {n_native} native): \
              {finite}/{} finite, max abs diff {max_abs:.5}",
@@ -500,7 +561,10 @@ fn resident_matches_golden() {
         eprintln!("no bundles present — skipping resident golden gate");
         return;
     }
-    assert!(failures.is_empty(), "resident golden failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "resident golden failures: {failures:?}"
+    );
 }
 
 /// PREFILL multi-core SPMD vs golden — the AUTHORITATIVE gate for cross-core
@@ -563,7 +627,11 @@ fn fused_run_inputs(dir: &std::path::Path) -> (IRModule, Vec<(String, Arg)>, u64
         };
         args.push((
             name.trim_start_matches('%').to_string(),
-            Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data,
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let mut module = IRModule::default();
@@ -597,9 +665,16 @@ fn time_fused(dir: &std::path::Path, iters: u32) -> f64 {
 #[test]
 #[ignore = "perf bench; needs the smollm2-135m[-prefill] bundles. --ignored --nocapture"]
 fn fused_attention_gpu_vs_cpu_mspass() {
-    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let iters: u32 = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     // Opt-in attention offloads (default OFF). Presence ENABLES.
-    let all = ["KTIR_GPU_PLAIN_MATMUL", "KTIR_GPU_REDUCE", "KTIR_GPU_TRANSPOSE"];
+    let all = [
+        "KTIR_GPU_PLAIN_MATMUL",
+        "KTIR_GPU_REDUCE",
+        "KTIR_GPU_TRANSPOSE",
+    ];
     let on = |k: &str| unsafe { std::env::set_var(k, "1") };
     let off = |k: &str| unsafe { std::env::remove_var(k) };
     for (model, dir_opt) in [
@@ -654,7 +729,10 @@ fn fused_attention_gpu_vs_cpu_mspass() {
 #[test]
 #[ignore = "perf bench; needs the smollm2-135m[-prefill] bundles. --ignored --nocapture"]
 fn fused_gpu_vs_cpu_mspass() {
-    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let iters: u32 = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     for (model, dir_opt) in [
         ("decode", bundle_dir()),
         ("prefill", bundle_dir_named("smollm2-135m-prefill")),
@@ -726,12 +804,22 @@ fn weight_cache_refreshes_on_changed_weights() {
                 return (name.clone(), arg.clone());
             };
             let data: Vec<f32> = data.iter().map(|x| x * 2.0).collect();
-            (name.clone(), Arg::Tensor { data, shape: shape.clone(), dtype: *dtype })
+            (
+                name.clone(),
+                Arg::Tensor {
+                    data,
+                    shape: shape.clone(),
+                    dtype: *dtype,
+                },
+            )
         })
         .collect();
 
     let misses_before = ktir_cpu::metal_backend::WEIGHT_CACHE_MISSES.load(Ordering::Relaxed);
-    let refs2: Vec<(&str, Arg)> = scaled.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let refs2: Vec<(&str, Arg)> = scaled
+        .iter()
+        .map(|(n, a)| (n.as_str(), a.clone()))
+        .collect();
     let out2 = execute_function_outputs(&module, "fused", &refs2, &[&result_ptr])
         .expect("pass 2")
         .get(&result_ptr)
@@ -787,7 +875,11 @@ fn run_fused_golden(dir: &std::path::Path, label: &str) -> (f32, Vec<f32>) {
         };
         args.push((
             name.trim_start_matches('%').to_string(),
-            Arg::Tensor { data, shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data,
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let arg_refs: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
@@ -832,14 +924,18 @@ fn smollm2_135m_fused_matches_golden() {
     };
     #[cfg(metal)]
     {
-        ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-        ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
     let (max_abs, _) = run_fused_golden(&dir, "SmolLM2-135M decode");
     #[cfg(metal)]
     {
-        let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
         eprintln!("  matmul K-loops offloaded to GPU GEMM: {gpu}");
         eprintln!("  map windows offloaded to fused GPU kernel: {maps}");
         // SIZE-GATED offload: decode is M=1, so its per-layer GEMMs/maps are tiny
@@ -847,10 +943,16 @@ fn smollm2_135m_fused_matches_golden() {
         // the big lm_head GEMM (k·n ≫ the work gate) goes to the GPU. So the proof
         // the Metal path is live is "at least one GEMM offloaded" (the lm_head),
         // not the old "all 200+" (which the gate now correctly keeps on AMX).
-        assert!(gpu >= 1, "expected at least the lm_head K-loop on GPU, {gpu} did");
+        assert!(
+            gpu >= 1,
+            "expected at least the lm_head K-loop on GPU, {gpu} did"
+        );
         let _ = maps; // decode windows are below the map size gate (expected 0)
     }
-    assert!(max_abs < 0.2, "decode fused diverges from golden by {max_abs}");
+    assert!(
+        max_abs < 0.2,
+        "decode fused diverges from golden by {max_abs}"
+    );
 }
 
 /// PREFILL (M=8) end-to-end vs golden: the real throughput target. PARTIAL
@@ -880,7 +982,11 @@ fn smollm2_135m_prefill_fused_matches_golden() {
     let golden = read_f32(&dir.join("golden.bin"));
     assert_eq!(fused.len(), golden.len(), "result length");
     let finite = fused.iter().filter(|x| x.is_finite()).count();
-    let golden_diff = fused.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let golden_diff = fused
+        .iter()
+        .zip(&golden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     assert_eq!(finite, fused.len(), "all result elements finite");
     let gpu = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(Relaxed);
     let amx = ktir_cpu::metal_backend::MATMUL_LOOP_AMX_COUNT.load(Relaxed);
@@ -889,7 +995,10 @@ fn smollm2_135m_prefill_fused_matches_golden() {
         "  SmolLM2-135M PREFILL SEGMENTED ({n_fused} fused segments + {n_native} native attn): \
          max abs diff {golden_diff:.5}"
     );
-    eprintln!("  prefill K-loops offloaded full-M: {gpu} NAX + {amx} AMX = {}", gpu + amx);
+    eprintln!(
+        "  prefill K-loops offloaded full-M: {gpu} NAX + {amx} AMX = {}",
+        gpu + amx
+    );
     eprintln!("  prefill map windows offloaded to fused GPU kernel: {maps}");
     // The fused [1,1] segments carry the GEMM offloads (NAX or AMX) + map windows;
     // the native attention nodes run at their [9,1] head-parallel grid via the
@@ -923,9 +1032,19 @@ fn smollm2_135m_prefill_fused_matches_golden() {
     // emulator's MULTI-CORE SPMD execution of prefill nodes reproduces golden's
     // generation. The segmented path also matches golden, so the two agree.
     let oracle = run_per_node_result(&dir);
-    let oracle_vs_golden = oracle.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    let fused_vs_oracle = fused.iter().zip(&oracle).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    eprintln!("  per-node multi-core oracle vs golden: {oracle_vs_golden:.5}; segmented vs oracle: {fused_vs_oracle:.5}");
+    let oracle_vs_golden = oracle
+        .iter()
+        .zip(&golden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let fused_vs_oracle = fused
+        .iter()
+        .zip(&oracle)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "  per-node multi-core oracle vs golden: {oracle_vs_golden:.5}; segmented vs oracle: {fused_vs_oracle:.5}"
+    );
     assert!(
         oracle_vs_golden < 0.05,
         "prefill per-node multi-core SPMD diverges from golden by {oracle_vs_golden} — cross-core execution is wrong"
@@ -954,9 +1073,13 @@ fn prefill_matmul_loops_all_recognized() {
         b.n_nodes,
         b.func.operations.len()
     );
-    assert!(total > 0, "expected matmul K-loops in the fused prefill function");
+    assert!(
+        total > 0,
+        "expected matmul K-loops in the fused prefill function"
+    );
     assert_eq!(
-        total, recognized,
+        total,
+        recognized,
         "every prefill K-loop must collapse to one GEMM (M=8) — {} unrecognized",
         total - recognized
     );
@@ -976,13 +1099,17 @@ fn map_fusion_plan_carves_windows() {
         return;
     }
     for which in ["smollm2-135m", "smollm2-135m-prefill"] {
-        let Some(d) = bundle_dir_named(which) else { continue };
+        let Some(d) = bundle_dir_named(which) else {
+            continue;
+        };
         let b = fuse_bundle(&d);
         let ops = &b.func.operations;
         let (triggers, skip) = ktir_cpu::metal_backend::map_fusion_plan(ops);
         eprintln!(
             "{which} fused ({} nodes -> 1 fn): {} map windows -> GPU kernels, {} op indices subsumed",
-            b.n_nodes, triggers.len(), skip.len()
+            b.n_nodes,
+            triggers.len(),
+            skip.len()
         );
         // element count per SSA result (product of its shape attr)
         let mut numel: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -993,7 +1120,9 @@ fn map_fusion_plan_carves_windows() {
                 {
                     m.insert(r.trim_start_matches('%').to_string(), s.iter().product());
                 }
-                for region in &op.regions { rec(region, m); }
+                for region in &op.regions {
+                    rec(region, m);
+                }
             }
         }
         rec(ops, &mut numel);
@@ -1008,7 +1137,10 @@ fn map_fusion_plan_carves_windows() {
                 let reads_gid = mrk.kernel.source.contains(&format!("{key}[gid]"));
                 if reads_gid && n != out_len {
                     if mism < 15 {
-                        eprintln!("  MISMATCH {which}: live_out {} reads {key}[gid] len={n} but out_len={out_len}", mrk.live_out);
+                        eprintln!(
+                            "  MISMATCH {which}: live_out {} reads {key}[gid] len={n} but out_len={out_len}",
+                            mrk.live_out
+                        );
                     }
                     mism += 1;
                 }
@@ -1038,11 +1170,16 @@ fn llama_3_2_1b_fused_matches_golden() {
     ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     let (max_abs, _) = run_fused_golden(&dir, "Llama-3.2-1B decode");
-    let gemms = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-    let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let gemms =
+        ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let maps =
+        ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!("  Llama-1B decode: {gemms} K-loop GEMMs + {maps} map windows on GPU");
     assert!(gemms > 0, "expected GPU GEMMs on the 1B model");
-    assert!(max_abs < 0.05, "Llama-1B decode fused diverges from golden by {max_abs}");
+    assert!(
+        max_abs < 0.05,
+        "Llama-1B decode fused diverges from golden by {max_abs}"
+    );
 }
 
 /// BIG-MODEL PREFILL correctness — the project's throughput target. The
@@ -1069,7 +1206,11 @@ fn llama_3_2_1b_prefill_fused_matches_golden() {
     ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.store(0, Relaxed);
     // Attention-island offloads are opt-in; enable so the native attention nodes
     // exercise the GPU attention path. SAFETY: serial test (--test-threads=1).
-    let attn = ["KTIR_GPU_PLAIN_MATMUL", "KTIR_GPU_REDUCE", "KTIR_GPU_TRANSPOSE"];
+    let attn = [
+        "KTIR_GPU_PLAIN_MATMUL",
+        "KTIR_GPU_REDUCE",
+        "KTIR_GPU_TRANSPOSE",
+    ];
     for k in attn {
         unsafe { std::env::set_var(k, "1") };
     }
@@ -1080,7 +1221,11 @@ fn llama_3_2_1b_prefill_fused_matches_golden() {
     let golden = read_f32(&dir.join("golden.bin"));
     assert_eq!(result.len(), golden.len(), "result length");
     let finite = result.iter().filter(|x| x.is_finite()).count();
-    let max_abs = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_abs = result
+        .iter()
+        .zip(&golden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     let gemms = ktir_cpu::metal_backend::MATMUL_LOOP_GPU_COUNT.load(Relaxed);
     let maps = ktir_cpu::metal_backend::MAP_REGION_GPU_COUNT.load(Relaxed);
     eprintln!(
@@ -1090,8 +1235,14 @@ fn llama_3_2_1b_prefill_fused_matches_golden() {
     );
     assert_eq!(finite, result.len(), "all result elements finite");
     // GPU offloads must still fire on the fused segments.
-    assert!(gemms > 0, "expected GPU GEMMs on the fused prefill segments, none fired");
-    assert!(maps > 0, "expected GPU map windows on the fused prefill segments, none fired");
+    assert!(
+        gemms > 0,
+        "expected GPU GEMMs on the fused prefill segments, none fired"
+    );
+    assert!(
+        maps > 0,
+        "expected GPU map windows on the fused prefill segments, none fired"
+    );
     assert!(
         max_abs < 0.05,
         "Llama-1B prefill segmented diverges from golden by {max_abs} — attention/fusion is wrong"
@@ -1104,12 +1255,18 @@ fn llama_3_2_1b_prefill_fused_matches_golden() {
 #[test]
 #[ignore = "big-model perf bench; needs the llama-3.2-1b[-prefill] bundles. --ignored --nocapture"]
 fn llama_3_2_1b_gpu_vs_cpu_mspass() {
-    let iters: u32 = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let iters: u32 = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     for (model, dir) in [
         ("decode", bundle_dir_named("llama-3.2-1b")),
         ("prefill", bundle_dir_named("llama-3.2-1b-prefill")),
     ] {
-        let Some(dir) = dir else { eprintln!("llama {model} absent — skipping"); continue };
+        let Some(dir) = dir else {
+            eprintln!("llama {model} absent — skipping");
+            continue;
+        };
         // SAFETY: single-threaded test toggling our own offload gates.
         unsafe {
             std::env::set_var("KTIR_NO_GPU_GEMM", "1");
@@ -1145,15 +1302,21 @@ fn lx_budget_split_preserves_golden() {
         return;
     };
     let b = load_bundle(&dir);
-    let tensor_bytes: HashMap<u64, usize> =
-        b.shape.iter().map(|(&id, &(r, c, _))| (id, r * c * 2)).collect(); // f16
+    let tensor_bytes: HashMap<u64, usize> = b
+        .shape
+        .iter()
+        .map(|(&id, &(r, c, _))| (id, r * c * 2))
+        .collect(); // f16
     let base = plan_segments(&b.module, &b.spec).expect("plan").len();
     let tiny = 40_000usize;
     let split = plan_segments_budgeted(&b.module, &b.spec, tiny, &tensor_bytes)
         .expect("plan budgeted")
         .len();
     eprintln!("  segments: {base} (no budget) -> {split} (budget {tiny}B)");
-    assert!(split > base, "a tiny LX budget should split runs into MORE segments");
+    assert!(
+        split > base,
+        "a tiny LX budget should split runs into MORE segments"
+    );
 
     // Execute under the tiny budget (env-overridden) and confirm golden holds.
     unsafe { std::env::set_var("KTIR_LX_FUSION_BUDGET", tiny.to_string()) };
@@ -1161,9 +1324,16 @@ fn lx_budget_split_preserves_golden() {
     unsafe { std::env::remove_var("KTIR_LX_FUSION_BUDGET") };
     let golden = read_f32(&dir.join("golden.bin"));
     assert_eq!(result.len(), golden.len(), "result length");
-    let diff = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let diff = result
+        .iter()
+        .zip(&golden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("  split-budget execute vs golden: max abs diff {diff:.5}");
-    assert!(diff < 0.05, "LX-split execution diverged from golden by {diff}");
+    assert!(
+        diff < 0.05,
+        "LX-split execution diverged from golden by {diff}"
+    );
 }
 
 /// TURNKEY entrypoint smoke test: drive the whole program through
@@ -1209,7 +1379,11 @@ fn program_execute_matches_golden() {
         let (rows, cols, _) = b.shape[&m];
         owned.push((
             format!("t{m}"),
-            Arg::Tensor { data: vec![0.0f32; rows * cols], shape: vec![rows, cols], dtype: DType::F16 },
+            Arg::Tensor {
+                data: vec![0.0f32; rows * cols],
+                shape: vec![rows, cols],
+                dtype: DType::F16,
+            },
         ));
     }
     let args: Vec<(&str, Arg)> = owned.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
@@ -1220,7 +1394,17 @@ fn program_execute_matches_golden() {
     let result = &out[&result_key].data;
     let golden = read_f32(&dir.join("golden.bin"));
     assert_eq!(result.len(), golden.len(), "result length");
-    let diff = result.iter().zip(&golden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    eprintln!("  program::execute ({} nodes) vs golden: max abs diff {diff:.5}", refs.len());
-    assert!(diff < 0.05, "turnkey program::execute diverges from golden by {diff}");
+    let diff = result
+        .iter()
+        .zip(&golden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "  program::execute ({} nodes) vs golden: max abs diff {diff:.5}",
+        refs.len()
+    );
+    assert!(
+        diff < 0.05,
+        "turnkey program::execute diverges from golden by {diff}"
+    );
 }

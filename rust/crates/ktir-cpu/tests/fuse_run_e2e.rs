@@ -93,15 +93,31 @@ fn spec() -> ProgramSpec {
             NodeSpec {
                 func: "a".into(),
                 bindings: vec![
-                    Binding { arg: "%in".into(), tensor: 1, is_output: false },
-                    Binding { arg: "%out".into(), tensor: 2, is_output: true },
+                    Binding {
+                        arg: "%in".into(),
+                        tensor: 1,
+                        is_output: false,
+                    },
+                    Binding {
+                        arg: "%out".into(),
+                        tensor: 2,
+                        is_output: true,
+                    },
                 ],
             },
             NodeSpec {
                 func: "b".into(),
                 bindings: vec![
-                    Binding { arg: "%in".into(), tensor: 2, is_output: false },
-                    Binding { arg: "%out".into(), tensor: 3, is_output: true },
+                    Binding {
+                        arg: "%in".into(),
+                        tensor: 2,
+                        is_output: false,
+                    },
+                    Binding {
+                        arg: "%out".into(),
+                        tensor: 3,
+                        is_output: true,
+                    },
                 ],
             },
         ],
@@ -111,11 +127,18 @@ fn spec() -> ProgramSpec {
 }
 
 fn tensor(data: Vec<f32>, shape: Vec<usize>) -> Arg {
-    Arg::Tensor { data, shape, dtype: DType::F16 }
+    Arg::Tensor {
+        data,
+        shape,
+        dtype: DType::F16,
+    }
 }
 
 fn out(map: &std::collections::HashMap<String, Output>, key: &str) -> Vec<f32> {
-    map.get(key).unwrap_or_else(|| panic!("missing output {key}")).data.clone()
+    map.get(key)
+        .unwrap_or_else(|| panic!("missing output {key}"))
+        .data
+        .clone()
 }
 
 #[test]
@@ -129,14 +152,20 @@ fn fused_tiled_edge_matches_per_node_oracle() {
     let a_out = execute_function(
         &module,
         "a",
-        &[("in", tensor(t1.clone(), vec![N])), ("out", tensor(vec![0.0; N], vec![N]))],
+        &[
+            ("in", tensor(t1.clone(), vec![N])),
+            ("out", tensor(vec![0.0; N], vec![N])),
+        ],
     )
     .expect("run @a");
     let t2 = out(&a_out, "out");
     let b_out = execute_function(
         &module,
         "b",
-        &[("in", tensor(t2, vec![N])), ("out", tensor(vec![0.0; TILE], vec![TILE]))],
+        &[
+            ("in", tensor(t2, vec![N])),
+            ("out", tensor(vec![0.0; TILE], vec![TILE])),
+        ],
     )
     .expect("run @b");
     let oracle = out(&b_out, "out");
@@ -148,18 +177,29 @@ fn fused_tiled_edge_matches_per_node_oracle() {
     // Structural: the tiled edge became an extract_slice; the intermediate's
     // store/load round-trip is gone (only the source load + result store remain).
     let count = |ty: &str| fused.operations.iter().filter(|o| o.op_type == ty).count();
-    assert_eq!(count("tensor.extract_slice"), 1, "tiled edge forwarded as a slice");
+    assert_eq!(
+        count("tensor.extract_slice"),
+        1,
+        "tiled edge forwarded as a slice"
+    );
     assert_eq!(count("ktdp.load"), 1, "only the source (t1) load remains");
     assert_eq!(count("ktdp.store"), 1, "only the result (t3) store remains");
     let arg_names: Vec<&str> = fused.arguments.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(arg_names, vec!["%t1_ptr", "%t3_ptr"], "no HBM pointer for t2");
+    assert_eq!(
+        arg_names,
+        vec!["%t1_ptr", "%t3_ptr"],
+        "no HBM pointer for t2"
+    );
 
     let mut fused_module = IRModule::default();
     fused_module.add_function(fused);
     let f_out = execute_function(
         &fused_module,
         "fused",
-        &[("t1_ptr", tensor(t1, vec![N])), ("t3_ptr", tensor(vec![0.0; TILE], vec![TILE]))],
+        &[
+            ("t1_ptr", tensor(t1, vec![N])),
+            ("t3_ptr", tensor(vec![0.0; TILE], vec![TILE])),
+        ],
     )
     .expect("run fused");
     let fused_res = out(&f_out, "t3_ptr");

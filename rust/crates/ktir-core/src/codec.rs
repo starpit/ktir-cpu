@@ -157,6 +157,130 @@ pub fn decode(bytes: &[u8], n: usize, dtype: DType) -> Vec<f32> {
     out
 }
 
+/// bfloat16 bytes (little-endian) -> f32 tile. bf16 is NOT a Spyre/KTIR HBM dtype
+/// (the hardware is f16) — this is a host-side convenience for ingesting bf16
+/// model weights (the stock Llama/SmolLM2 checkpoint format), which the caller
+/// then narrows to the f16 stick layout. bf16→f32 is EXACT and zero-arithmetic:
+/// a bf16 value is simply the high 16 bits of the f32 with the same sign,
+/// exponent, and 7 mantissa bits, so widening is `(bits as u32) << 16`. A short
+/// tail zero-pads (matches [`decode`]). The full-length fast path is SIMD; the
+/// short-tail / partial-byte case falls back to scalar.
+pub fn bf16_to_f32(bytes: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    if bytes.len() >= n * 2 {
+        bf16_to_f32_into(bytes, &mut out);
+    } else {
+        // Short input: per-element with the zero-pad fallback.
+        for (i, o) in out.iter_mut().enumerate() {
+            if let Some(c) = bytes.get(i * 2..i * 2 + 2) {
+                *o = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+            }
+        }
+    }
+    out
+}
+
+/// bf16 bytes (fully present) -> f32, batched. A bf16→f32 widen is a pure 16-bit
+/// left-shift into the f32 high half — no `vcvt` needed; NEON's widening shift
+/// `vshll_n_u16` lifts 4 u16 lanes to 4 u32 lanes in one instruction.
+#[cfg(target_arch = "aarch64")]
+fn bf16_to_f32_into(bytes: &[u8], out: &mut [f32]) {
+    use core::arch::aarch64::*;
+    let n = out.len();
+    debug_assert!(bytes.len() >= n * 2);
+    unsafe {
+        let (src, dst) = (bytes.as_ptr(), out.as_mut_ptr());
+        let mut i = 0;
+        while i + 8 <= n {
+            // Unaligned 8×u16 load -> two 4-lane widening shifts (<<16) -> 8×f32.
+            let h = vld1q_u16(src.add(i * 2).cast::<u16>());
+            let lo = vshll_n_u16::<16>(vget_low_u16(h));
+            let hi = vshll_n_u16::<16>(vget_high_u16(h));
+            vst1q_f32(dst.add(i), vreinterpretq_f32_u32(lo));
+            vst1q_f32(dst.add(i + 4), vreinterpretq_f32_u32(hi));
+            i += 8;
+        }
+        while i < n {
+            let (lo, hi) = (*src.add(i * 2), *src.add(i * 2 + 1));
+            *dst.add(i) = f32::from_bits((u16::from_le_bytes([lo, hi]) as u32) << 16);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn bf16_to_f32_into(bytes: &[u8], out: &mut [f32]) {
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = f32::from_bits((u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]) as u32) << 16);
+    }
+}
+
+/// bfloat16 bytes (little-endian) -> f16 bytes (little-endian) — the HBM stick
+/// layout. This is the path a bf16 weight takes into Spyre's f16 HBM: it does the
+/// REAL format conversion (bf16's 8e/7m → f16's 5e/10m, RNE, overflow→inf), but
+/// FUSED — it never materializes an intermediate `f32` tile. Conceptually it's
+/// bf16→f32 (exact `<<16`) → f32→f16 (round-to-nearest-even), done per element in
+/// registers, so the output is bit-identical to `encode(bf16_to_f32(..), F16)`
+/// without the extra full-length f32 buffer + second pass. A short input
+/// zero-pads (a zero bf16 narrows to a zero f16). Use this for ingest into an
+/// f16 stick; use [`bf16_to_f32`] only for the f32 oracle path.
+pub fn bf16_to_f16(bytes: &[u8], n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n * 2];
+    if bytes.len() >= n * 2 {
+        bf16_to_f16_into(bytes, &mut out);
+    } else {
+        for i in 0..n {
+            let v = match bytes.get(i * 2..i * 2 + 2) {
+                Some(c) => f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16),
+                None => 0.0,
+            };
+            let b = f32_to_f16_bits(v).to_le_bytes();
+            out[i * 2] = b[0];
+            out[i * 2 + 1] = b[1];
+        }
+    }
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn bf16_to_f16_into(bytes: &[u8], out: &mut [u8]) {
+    use core::arch::aarch64::*;
+    let n = out.len() / 2;
+    debug_assert!(bytes.len() >= n * 2);
+    unsafe {
+        let (src, dst) = (bytes.as_ptr(), out.as_mut_ptr());
+        let mut i = 0;
+        while i + 8 <= n {
+            // 8×bf16 -> two 4-lane (widen <<16 -> reinterpret f32 -> narrow f16).
+            let h = vld1q_u16(src.add(i * 2).cast::<u16>());
+            let lo = vcvt_f16_f32(vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(h))));
+            let hi = vcvt_f16_f32(vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(h))));
+            vst1_u16(dst.add(i * 2).cast::<u16>(), vreinterpret_u16_f16(lo));
+            vst1_u16(dst.add((i + 4) * 2).cast::<u16>(), vreinterpret_u16_f16(hi));
+            i += 8;
+        }
+        while i < n {
+            let v = f32::from_bits(
+                (u16::from_le_bytes([*src.add(i * 2), *src.add(i * 2 + 1)]) as u32) << 16,
+            );
+            let b = f32_to_f16_bits(v).to_le_bytes();
+            *dst.add(i * 2) = b[0];
+            *dst.add(i * 2 + 1) = b[1];
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn bf16_to_f16_into(bytes: &[u8], out: &mut [u8]) {
+    for i in 0..(out.len() / 2) {
+        let v = f32::from_bits((u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]) as u32) << 16);
+        let b = f32_to_f16_bits(v).to_le_bytes();
+        out[i * 2] = b[0];
+        out[i * 2 + 1] = b[1];
+    }
+}
+
 // ===========================================================================
 // f16 batch conversion — SIMD on aarch64 (hardware FP16), scalar elsewhere.
 //
@@ -356,6 +480,94 @@ mod tests {
         assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
         assert_eq!(f16_bits_to_f32(0x7c00), f32::INFINITY);
         assert_eq!(f16_bits_to_f32(0xfc00), f32::NEG_INFINITY);
+    }
+
+    // bf16 = the high 16 bits of an f32, so widening is exact and lossless.
+    #[test]
+    fn bf16_widens_known_values() {
+        // (bf16 bits, exact f32)
+        for (bits, want) in [
+            (0x0000u16, 0.0f32),
+            (0x8000, -0.0),
+            (0x3f80, 1.0),
+            (0xbf80, -1.0),
+            (0x4000, 2.0),
+            (0x4049, 3.140625), // bf16(pi)
+            (0x7f80, f32::INFINITY),
+            (0xff80, f32::NEG_INFINITY),
+        ] {
+            let got = bf16_to_f32(&bits.to_le_bytes(), 1)[0];
+            assert_eq!(got.to_bits(), want.to_bits(), "bf16 {bits:#06x}");
+        }
+    }
+
+    // The SIMD bf16 path must equal the spec definition `(bits as u32) << 16` for
+    // every one of the 65536 bf16 patterns. Odd `n` exercises the scalar tail
+    // after the 8-lane SIMD body.
+    #[test]
+    fn simd_bf16_matches_scalar_for_all_patterns() {
+        let bytes: Vec<u8> = (0..=u16::MAX).flat_map(|h| h.to_le_bytes()).collect();
+        let n = 1 << 16;
+        let got = bf16_to_f32(&bytes, n); // full-length SIMD path
+        for h in 0..=u16::MAX {
+            let want = f32::from_bits((h as u32) << 16);
+            if want.is_nan() {
+                assert!(got[h as usize].is_nan(), "bf16 {h:#06x}: want NaN");
+            } else {
+                assert_eq!(got[h as usize].to_bits(), want.to_bits(), "bf16 {h:#06x}");
+            }
+        }
+        // Odd-length slice: same values, exercises the tail.
+        let m = 65533;
+        let tail = bf16_to_f32(&bytes[..m * 2], m);
+        for (h, &got) in tail.iter().enumerate() {
+            let want = f32::from_bits(((h as u16) as u32) << 16);
+            if !want.is_nan() {
+                assert_eq!(got.to_bits(), want.to_bits(), "bf16 tail slot {h}");
+            }
+        }
+    }
+
+    // A short input zero-pads past its end (matches `decode`).
+    #[test]
+    fn bf16_zero_pads_short_input() {
+        let got = bf16_to_f32(&0x3f80u16.to_le_bytes(), 4); // one value, ask for 4
+        assert_eq!(got, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    // The FUSED bf16->f16 path (no f32 intermediate) must be bit-identical to the
+    // two-step `encode(bf16_to_f32(..), F16)` for every bf16 pattern — that's the
+    // whole point of fusing it. Odd length exercises the scalar tail.
+    #[test]
+    fn fused_bf16_to_f16_matches_two_step_for_all_patterns() {
+        let bytes: Vec<u8> = (0..=u16::MAX).flat_map(|h| h.to_le_bytes()).collect();
+        let n = 1 << 16;
+        let fused = bf16_to_f16(&bytes, n);
+        let two_step = encode(&bf16_to_f32(&bytes, n), DType::F16);
+        assert_eq!(fused, two_step, "fused bf16->f16 must equal bf16->f32->f16");
+
+        // And the produced f16 bytes decode back to the f16-rounded bf16 value.
+        let m = 4095; // odd-ish, hits the tail
+        let f16_bytes = bf16_to_f16(&bytes[..m * 2], m);
+        let back = decode(&f16_bytes, m, DType::F16);
+        for (h, &got) in back.iter().enumerate() {
+            let want = f16_bits_to_f32(f32_to_f16_bits(f32::from_bits(((h as u16) as u32) << 16)));
+            if !want.is_nan() {
+                assert_eq!(got.to_bits(), want.to_bits(), "fused bf16->f16 slot {h}");
+            }
+        }
+    }
+
+    // bf16 values outside f16's range must saturate to f16 infinity (not wrap):
+    // bf16 carries f32's full exponent, so e.g. 1e30 is representable in bf16 but
+    // overflows f16.
+    #[test]
+    fn bf16_to_f16_overflows_to_inf() {
+        let big = f32::from_bits(0x7149_0000); // bf16 ~ 1e30
+        let bf16_bits = (big.to_bits() >> 16) as u16;
+        let f16 = bf16_to_f16(&bf16_bits.to_le_bytes(), 1);
+        let v = decode(&f16, 1, DType::F16)[0];
+        assert_eq!(v, f32::INFINITY, "huge bf16 must saturate to f16 +inf");
     }
 
     #[test]

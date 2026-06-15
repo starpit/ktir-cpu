@@ -78,8 +78,11 @@ fn derive_shapes(
     let mut shapes: HashMap<u64, Vec<usize>> = HashMap::new();
     for node in &spec.nodes {
         let func = module.get_function(&node.func)?;
-        let arg_to_tensor: HashMap<&str, u64> =
-            node.bindings.iter().map(|b| (b.arg.as_str(), b.tensor)).collect();
+        let arg_to_tensor: HashMap<&str, u64> = node
+            .bindings
+            .iter()
+            .map(|b| (b.arg.as_str(), b.tensor))
+            .collect();
         collect_view_shapes(&func.operations, &arg_to_tensor, &mut shapes);
     }
     Ok(shapes)
@@ -146,7 +149,12 @@ pub fn execute_segmented(
     // segment's co-resident `[m, *]` intermediates within the per-core LX.
     let tensor_bytes: HashMap<u64, usize> = shapes
         .iter()
-        .map(|(&id, shp)| (id, shp.iter().product::<usize>() * DType::F16.bytes_per_elem()))
+        .map(|(&id, shp)| {
+            (
+                id,
+                shp.iter().product::<usize>() * DType::F16.bytes_per_elem(),
+            )
+        })
         .collect();
     let segments = plan_segments_budgeted(
         module,
@@ -164,11 +172,19 @@ pub fn execute_segmented(
         let tid = tensor_id_of_key(key)?;
         let (data, dtype) = match arg {
             Arg::Tensor { data, dtype, .. } => (data.clone(), *dtype),
-            Arg::TensorBytes { data, shape, dtype } => {
-                (crate::codec::decode(data, shape.iter().product(), *dtype), *dtype)
-            }
+            Arg::TensorBytes { data, shape, dtype } => (
+                crate::codec::decode(data, shape.iter().product(), *dtype),
+                *dtype,
+            ),
+            // bf16 host bytes: widen to f32 (exact); threaded as the f16 model dtype.
+            Arg::TensorBf16 { data, shape } => (
+                crate::codec::bf16_to_f32(data, shape.iter().product()),
+                DType::F16,
+            ),
             Arg::Scalar(_) => {
-                return Err(format!("scalar arg {key:?} unsupported in execute_segmented"));
+                return Err(format!(
+                    "scalar arg {key:?} unsupported in execute_segmented"
+                ));
             }
         };
         buf.insert(tid, (data, dtype));
@@ -220,13 +236,14 @@ pub fn execute_segmented(
                     };
                     call_args.push((bare, Arg::Tensor { data, shape, dtype }));
                 }
-                let refs: Vec<(&str, Arg)> =
-                    call_args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+                let refs: Vec<(&str, Arg)> = call_args
+                    .iter()
+                    .map(|(n, a)| (n.as_str(), a.clone()))
+                    .collect();
                 let want_refs: Vec<&str> = want.iter().map(|s| s.as_str()).collect();
                 let mut seg_module = IRModule::default();
                 seg_module.add_function(fs.func.clone());
-                let out =
-                    execute_function_outputs(&seg_module, &fs.func.name, &refs, &want_refs)?;
+                let out = execute_function_outputs(&seg_module, &fs.func.name, &refs, &want_refs)?;
                 for name in &want {
                     let tid = tensor_id_of_arg(name)?;
                     let o = out
@@ -258,8 +275,10 @@ pub fn execute_segmented(
                     };
                     call_args.push((name, Arg::Tensor { data, shape, dtype }));
                 }
-                let refs: Vec<(&str, Arg)> =
-                    call_args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+                let refs: Vec<(&str, Arg)> = call_args
+                    .iter()
+                    .map(|(n, a)| (n.as_str(), a.clone()))
+                    .collect();
                 let out = execute_function(module, &node.func, &refs)?;
                 for (name, tid) in &out_ids {
                     let o = out
@@ -297,9 +316,20 @@ pub fn execute_segmented(
             .get(&tid)
             .cloned()
             .ok_or_else(|| format!("requested output t{tid} was not produced"))?;
-        let shape = shapes.get(&tid).cloned().unwrap_or_else(|| vec![data.len()]);
+        let shape = shapes
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| vec![data.len()]);
         let raw = crate::codec::encode(&data, dtype);
-        result.insert(format!("t{tid}"), Output { data, shape, dtype, raw });
+        result.insert(
+            format!("t{tid}"),
+            Output {
+                data,
+                shape,
+                dtype,
+                raw,
+            },
+        );
     }
     Ok(result)
 }

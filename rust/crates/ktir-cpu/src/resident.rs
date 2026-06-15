@@ -103,12 +103,18 @@ fn collect_view_shapes(
 /// Derive `tensor_id -> element-shape` for every logical tensor the program
 /// touches (from each node's `construct_memory_view` shapes). Same derivation the
 /// segmented executor uses — the shapes live in the IR, no external manifest.
-fn derive_shapes(module: &IRModule, spec: &ProgramSpec) -> Result<HashMap<u64, Vec<usize>>, String> {
+fn derive_shapes(
+    module: &IRModule,
+    spec: &ProgramSpec,
+) -> Result<HashMap<u64, Vec<usize>>, String> {
     let mut shapes: HashMap<u64, Vec<usize>> = HashMap::new();
     for node in &spec.nodes {
         let func = module.get_function(&node.func)?;
-        let arg_to_tensor: HashMap<&str, u64> =
-            node.bindings.iter().map(|b| (b.arg.as_str(), b.tensor)).collect();
+        let arg_to_tensor: HashMap<&str, u64> = node
+            .bindings
+            .iter()
+            .map(|b| (b.arg.as_str(), b.tensor))
+            .collect();
         collect_view_shapes(&func.operations, &arg_to_tensor, &mut shapes);
     }
     Ok(shapes)
@@ -119,11 +125,23 @@ fn derive_shapes(module: &IRModule, spec: &ProgramSpec) -> Result<HashMap<u64, V
 /// Build once with [`ResidentExecutor::new`], write the source weights once with
 /// [`ResidentExecutor::set_source`] (or [`ResidentExecutor::set_sources`]), then
 /// call [`ResidentExecutor::run`] per pass. Weights are NEVER re-marshaled.
-pub struct ResidentExecutor {
+/// One program (e.g. prefill or decode) sharing the executor's resident weights.
+/// Holds its OWN module + planned segments + result tensor ids; binds the SHARED
+/// sticks by tensor id at run time, so the weights it reads were uploaded once.
+struct ResidentProgram {
     /// OWNED (not borrowed) so the executor holds its ENTIRE `Rc` graph
     /// exclusively — see the `unsafe impl Send` below.
     module: IRModule,
     segments: Vec<Segment>,
+    /// This program's final result tensor ids (for default readback).
+    results: std::collections::HashSet<u64>,
+}
+
+pub struct ResidentExecutor {
+    /// The programs sharing this executor's resident HBM. One entry for a single
+    /// program (`new`); prefill + decode share weights via `new_multi` so the
+    /// weight set is uploaded ONCE and both run against the same sticks.
+    programs: Vec<ResidentProgram>,
     shapes: HashMap<u64, Vec<usize>>,
     /// The one persistent HBM (and per-core LX). Sticks are allocated once and
     /// reused across every pass.
@@ -134,10 +152,8 @@ pub struct ResidentExecutor {
     /// tensor id -> element count (product of its derived shape).
     numel: HashMap<u64, usize>,
     /// Which tensor ids are program SOURCES (weights / mask / input) — written
-    /// once via `set_source`, NOT zeroed per pass.
+    /// once via `set_source`, NOT zeroed per pass. Union across all programs.
     sources: std::collections::HashSet<u64>,
-    /// The program's final result tensor ids (for default readback).
-    results: std::collections::HashSet<u64>,
     /// The model dtype the per-node oracle threads (F16). All sticks are sized and
     /// read back at this dtype.
     dtype: DType,
@@ -164,48 +180,77 @@ impl ResidentExecutor {
     /// passes). Sources are not yet written — call [`set_source`](Self::set_source)
     /// / [`set_sources`](Self::set_sources) before [`run`](Self::run).
     pub fn new(module: IRModule, spec: &ProgramSpec) -> Result<Self, String> {
-        let shapes = derive_shapes(&module, spec)?;
+        Self::new_multi(vec![(module, spec)])
+    }
+
+    /// Build an executor holding MULTIPLE programs that SHARE one resident weight
+    /// set — e.g. prefill + decode. Every program's segments bind the SAME HBM
+    /// sticks by tensor id, so the weights are uploaded ONCE (one `set_sources`)
+    /// and serve every program — no second load for the second program. Sticks are
+    /// allocated for the UNION of all programs' tensors; the HBM is sized for the
+    /// largest grid any program needs. `run_program(i, ..)` runs program `i` (in
+    /// declaration order); `run(..)` runs program 0.
+    pub fn new_multi(programs: Vec<(IRModule, &ProgramSpec)>) -> Result<Self, String> {
+        if programs.is_empty() {
+            return Err("resident: new_multi needs at least one program".into());
+        }
         let dtype = DType::F16;
         let bpe = dtype.bytes_per_elem();
-        // Plan segments under the LX live-set budget so a fused segment's
-        // co-resident intermediates never overflow the per-core LX (the MLP
-        // over-grouping that broke llama m=32). tensor_bytes = numel × f16 bytes.
-        let tensor_bytes: HashMap<u64, usize> = shapes
-            .iter()
-            .map(|(&id, shp)| (id, shp.iter().product::<usize>() * bpe))
-            .collect();
-        let segments = plan_segments_budgeted(
-            &module,
-            spec,
-            crate::memory::lx_fusion_budget(),
-            &tensor_bytes,
-        )?;
 
-        // The set of every tensor id any segment references (a pointer arg of a
-        // fused segment, or a binding of a native node). We allocate a stick for
-        // each so its address is fixed for the whole executor lifetime.
+        // Union of shapes + sources across programs; per-program planned segments.
+        // A stick is allocated for EVERY referenced tensor id so its address is
+        // fixed for the executor's lifetime, shared by all programs.
+        let mut shapes: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut sources: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for seg in &segments {
-            match seg {
-                Segment::Fused(fs) => {
-                    for (arg, _) in &fs.func.arguments {
-                        ids.insert(tensor_id_of_arg(arg)?);
+        let mut planned: Vec<(IRModule, Vec<Segment>, std::collections::HashSet<u64>)> =
+            Vec::with_capacity(programs.len());
+
+        for (module, spec) in programs {
+            let prog_shapes = derive_shapes(&module, spec)?;
+            for (&id, shp) in &prog_shapes {
+                shapes.entry(id).or_insert_with(|| shp.clone());
+            }
+            // Plan segments under the LX live-set budget (per program).
+            let tensor_bytes: HashMap<u64, usize> = prog_shapes
+                .iter()
+                .map(|(&id, shp)| (id, shp.iter().product::<usize>() * bpe))
+                .collect();
+            let segments = plan_segments_budgeted(
+                &module,
+                spec,
+                crate::memory::lx_fusion_budget(),
+                &tensor_bytes,
+            )?;
+            for seg in &segments {
+                match seg {
+                    Segment::Fused(fs) => {
+                        for (arg, _) in &fs.func.arguments {
+                            ids.insert(tensor_id_of_arg(arg)?);
+                        }
                     }
-                }
-                Segment::Native(node) => {
-                    for b in &node.bindings {
-                        ids.insert(b.tensor);
+                    Segment::Native(node) => {
+                        for b in &node.bindings {
+                            ids.insert(b.tensor);
+                        }
                     }
                 }
             }
-        }
-        // Also pin the requested-result tensors (a result might be produced by a
-        // node and threaded out without appearing as a pointer arg elsewhere).
-        for &r in &spec.results {
-            ids.insert(r);
+            for &r in &spec.results {
+                ids.insert(r);
+            }
+            sources.extend(spec.sources.iter().copied());
+            planned.push((module, segments, spec.results.clone()));
         }
 
-        let mem = SpyreMemoryHierarchy::new(largest_grid(&module, &segments));
+        // Size the HBM (LX-per-core array) for the largest grid across ALL programs.
+        let grid = planned
+            .iter()
+            .map(|(m, segs, _)| largest_grid(m, segs))
+            .max()
+            .unwrap_or(1);
+        let mem = SpyreMemoryHierarchy::new(grid);
+
         let mut stick: HashMap<u64, i64> = HashMap::new();
         let mut numel: HashMap<u64, usize> = HashMap::new();
         {
@@ -221,19 +266,23 @@ impl ResidentExecutor {
                 numel.insert(tid, n);
             }
         }
-        // The LX scratchpads are shared per-core resident memory (`mem` holds one
-        // per core); they are reset per core at the start of each segment run, so
-        // no per-pass HBM churn beyond the activation rewrites above.
+
+        let programs = planned
+            .into_iter()
+            .map(|(module, segments, results)| ResidentProgram {
+                module,
+                segments,
+                results,
+            })
+            .collect();
 
         Ok(ResidentExecutor {
-            module,
-            segments,
+            programs,
             shapes,
             mem,
             stick,
             numel,
-            sources: spec.sources.clone(),
-            results: spec.results.clone(),
+            sources,
             dtype,
         })
     }
@@ -249,21 +298,78 @@ impl ResidentExecutor {
             .get(&tensor)
             .ok_or_else(|| format!("set_source: t{tensor} is not a tensor this program uses"))?;
         let bytes = crate::codec::encode(data, self.dtype);
-        self.mem.hbm.borrow_mut().write_bytes(s * STICK_BYTES, &bytes);
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(s * STICK_BYTES, &bytes);
         Ok(())
+    }
+
+    /// Write one SOURCE tensor's already-typed bytes straight into its resident
+    /// HBM stick ONCE — the f32-free fast path. When `dtype` matches the model
+    /// dtype (the stick layout), the bytes are `write_bytes`-copied verbatim: no
+    /// `Vec<f32>`, no decode, no encode (mirrors Spyre's typed host→AIU DMA). This
+    /// is what a memory-mapped f16 safetensor wants — hand it the tensor's byte
+    /// slice and it lands in HBM with one copy. A mismatched `dtype` (e.g. an f32
+    /// host buffer, or a future widened source) falls back through f32: decode to
+    /// f32, re-encode to the stick dtype.
+    pub fn set_source_bytes(
+        &mut self,
+        tensor: u64,
+        bytes: &[u8],
+        dtype: DType,
+    ) -> Result<(), String> {
+        let s = *self.stick.get(&tensor).ok_or_else(|| {
+            format!("set_source_bytes: t{tensor} is not a tensor this program uses")
+        })?;
+        if dtype == self.dtype {
+            // Verbatim: typed bytes already match the stick layout.
+            self.mem
+                .hbm
+                .borrow_mut()
+                .write_bytes(s * STICK_BYTES, bytes);
+            Ok(())
+        } else {
+            // dtype crossing (e.g. f32 bytes into an f16 stick): go through f32.
+            let n = self
+                .numel
+                .get(&tensor)
+                .copied()
+                .unwrap_or(bytes.len() / dtype.bytes_per_elem());
+            let data = crate::codec::decode(bytes, n, dtype);
+            self.set_source(tensor, &data)
+        }
     }
 
     /// Write many sources at once (keyed by the canonical `t<id>` / `%t<id>` /
     /// `%t<id>_ptr` / bare `<id>` name). Unknown keys (a tensor this program does
     /// not reference) are skipped — the caller can hand the whole weight set.
+    ///
+    /// [`Arg::TensorBytes`] takes the f32-free byte path ([`set_source_bytes`]) —
+    /// for an all-f16 model the weights land in HBM with a single copy each, never
+    /// touching `Vec<f32>`. [`Arg::Tensor`] (host f32) still narrows on the way in.
     pub fn set_sources(&mut self, args: &[(&str, Arg)]) -> Result<(), String> {
         for (key, arg) in args {
             let tid = tensor_id_of_key(key)?;
             if !self.stick.contains_key(&tid) {
                 continue;
             }
-            let data = arg_to_f32(arg)?;
-            self.set_source(tid, &data)?;
+            match arg {
+                Arg::TensorBytes { data, dtype, .. } => {
+                    self.set_source_bytes(tid, data, *dtype)?;
+                }
+                Arg::Tensor { data, .. } => {
+                    // Host f32: narrowed to the stick dtype on the way in.
+                    self.set_source(tid, data)?;
+                }
+                Arg::TensorBf16 { data, shape } => {
+                    // bf16 host bytes -> f16 stick layout in ONE fused pass (no f32
+                    // intermediate), written straight into HBM like the f16 path.
+                    let f16 = crate::codec::bf16_to_f16(data, shape.iter().product());
+                    self.set_source_bytes(tid, &f16, DType::F16)?;
+                }
+                Arg::Scalar(_) => return Err("resident: scalar args unsupported".into()),
+            }
         }
         Ok(())
     }
@@ -286,14 +392,33 @@ impl ResidentExecutor {
     /// node at its native head-parallel grid — both against the SAME persistent
     /// HBM, so intermediates flow segment-to-segment with no marshal.
     pub fn run(&mut self, outputs: &[&str]) -> Result<HashMap<String, Output>, String> {
+        self.run_program(0, outputs)
+    }
+
+    /// Run program `idx` (declaration order in [`new_multi`]) for one forward pass.
+    /// All programs share the resident weights, so switching between prefill and
+    /// decode re-uploads NOTHING — only the per-pass input/mask change via
+    /// [`set_sources`](Self::set_sources) / [`set_input`](Self::set_input).
+    pub fn run_program(
+        &mut self,
+        idx: usize,
+        outputs: &[&str],
+    ) -> Result<HashMap<String, Output>, String> {
+        if idx >= self.programs.len() {
+            return Err(format!(
+                "resident: program {idx} out of range (have {})",
+                self.programs.len()
+            ));
+        }
         self.zero_non_sources();
 
         // KTIR_SEG_DIAG: accumulate fused (GPU GEMM/map) vs native (CPU-interpreter
         // attention) wall-time per pass — to see how much of e2e is the attention
         // islands still on the interpreter.
         let diag = std::env::var_os("KTIR_SEG_DIAG").is_some();
-        let (mut t_fused, mut t_native, mut n_fused, mut n_native) = (0.0f64, 0.0f64, 0usize, 0usize);
-        for seg in &self.segments {
+        let (mut t_fused, mut t_native, mut n_fused, mut n_native) =
+            (0.0f64, 0.0f64, 0usize, 0usize);
+        for seg in &self.programs[idx].segments {
             // Reset every core's LX scratchpad before each segment run. The
             // persistent `mem` reuses the SAME LX across segments/passes, but each
             // function run is a self-contained SPMD execution that bump-allocates
@@ -311,13 +436,15 @@ impl ResidentExecutor {
                     // Bind every pointer arg to its resident stick, and collect
                     // the boundary OUTPUTs to read back (so intermediates flow via
                     // HBM, not host).
-                    let mut input_ptrs: Vec<(String, Value)> = Vec::with_capacity(fs.func.arguments.len());
+                    let mut input_ptrs: Vec<(String, Value)> =
+                        Vec::with_capacity(fs.func.arguments.len());
                     for (arg_name, _) in &fs.func.arguments {
                         let tid = tensor_id_of_arg(arg_name)?;
                         let bare = arg_name.trim_start_matches('%').to_string();
-                        let s = *self.stick.get(&tid).ok_or_else(|| {
-                            format!("fused arg t{tid} has no resident stick")
-                        })?;
+                        let s = *self
+                            .stick
+                            .get(&tid)
+                            .ok_or_else(|| format!("fused arg t{tid} has no resident stick"))?;
                         input_ptrs.push((bare, Value::Index(s)));
                     }
                     // Read back only this segment's boundary outputs (selective —
@@ -340,9 +467,10 @@ impl ResidentExecutor {
                     )?;
                 }
                 Segment::Native(node) => {
-                    let func = self.module.get_function(&node.func)?;
+                    let func = self.programs[idx].module.get_function(&node.func)?;
                     let grid = func.grid;
-                    let mut input_ptrs: Vec<(String, Value)> = Vec::with_capacity(node.bindings.len());
+                    let mut input_ptrs: Vec<(String, Value)> =
+                        Vec::with_capacity(node.bindings.len());
                     let mut read: Vec<TensorMeta> = Vec::new();
                     for b in &node.bindings {
                         let name = b.arg.trim_start_matches('%').to_string();
@@ -354,13 +482,8 @@ impl ResidentExecutor {
                             read.push(self.meta_for(b.tensor)?);
                         }
                     }
-                    let _ = execute_function_in(
-                        &self.mem,
-                        &func.operations,
-                        grid,
-                        &input_ptrs,
-                        &read,
-                    )?;
+                    let _ =
+                        execute_function_in(&self.mem, &func.operations, grid, &input_ptrs, &read)?;
                 }
             }
             if diag {
@@ -387,20 +510,38 @@ impl ResidentExecutor {
         // Read back the requested outputs (default: the program results) from the
         // resident HBM.
         let want: Vec<u64> = if outputs.is_empty() {
-            let mut v: Vec<u64> = self.results.iter().copied().collect();
+            let mut v: Vec<u64> = self.programs[idx].results.iter().copied().collect();
             v.sort_unstable();
             v
         } else {
-            outputs.iter().map(|k| tensor_id_of_key(k)).collect::<Result<_, _>>()?
+            outputs
+                .iter()
+                .map(|k| tensor_id_of_key(k))
+                .collect::<Result<_, _>>()?
         };
-        let read: Vec<TensorMeta> = want.iter().map(|&tid| self.meta_for(tid)).collect::<Result<_, _>>()?;
+        let read: Vec<TensorMeta> = want
+            .iter()
+            .map(|&tid| self.meta_for(tid))
+            .collect::<Result<_, _>>()?;
         // One readback pass (decode the wanted sticks to host f32).
         let mut result = HashMap::new();
         for (name, stick, n, shape, dtype) in read {
             let nbytes = n * dtype.bytes_per_elem();
-            let bytes = self.mem.hbm.borrow().read_bytes(stick * STICK_BYTES, nbytes);
+            let bytes = self
+                .mem
+                .hbm
+                .borrow()
+                .read_bytes(stick * STICK_BYTES, nbytes);
             let data = crate::codec::decode(&bytes, n, dtype);
-            result.insert(name, Output { data, shape, dtype, raw: bytes });
+            result.insert(
+                name,
+                Output {
+                    data,
+                    shape,
+                    dtype,
+                    raw: bytes,
+                },
+            );
         }
         Ok(result)
     }
@@ -427,7 +568,10 @@ impl ResidentExecutor {
     /// Build the `(name, stick, numel, shape, dtype)` readback tuple for a tensor,
     /// keyed by the canonical `t<id>` name.
     fn meta_for(&self, tid: u64) -> Result<TensorMeta, String> {
-        let s = *self.stick.get(&tid).ok_or_else(|| format!("t{tid} has no resident stick"))?;
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("t{tid} has no resident stick"))?;
         let n = *self.numel.get(&tid).unwrap_or(&0);
         let shape = self.shapes.get(&tid).cloned().unwrap_or_else(|| vec![n]);
         Ok((format!("t{tid}"), s, n, shape, self.dtype))
@@ -448,17 +592,6 @@ fn largest_grid(module: &IRModule, segments: &[Segment]) -> usize {
         }
     }
     n.max(1)
-}
-
-/// Decode an [`Arg`] to host f32 (the form `set_source` writes).
-fn arg_to_f32(arg: &Arg) -> Result<Vec<f32>, String> {
-    match arg {
-        Arg::Tensor { data, .. } => Ok(data.clone()),
-        Arg::TensorBytes { data, shape, dtype } => {
-            Ok(crate::codec::decode(data, shape.iter().product(), *dtype))
-        }
-        Arg::Scalar(_) => Err("resident: scalar args unsupported".into()),
-    }
 }
 
 /// Execute a whole KTIR program with RESIDENT weights — the convenience

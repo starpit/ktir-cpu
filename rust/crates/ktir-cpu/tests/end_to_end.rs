@@ -106,6 +106,81 @@ fn tensor_bytes_input_matches_f32_path() {
     );
 }
 
+// RUST-ONLY: the bf16 ingest path (`Arg::TensorBf16`) narrows bf16 host bytes to
+// the f16 HBM stick in one fused pass. Spyre is f16-only, so the result must
+// equal feeding the same values pre-narrowed to f16 via `Arg::TensorBytes` — i.e.
+// ktir-cpu owning the bf16->f16 narrow changes nothing vs the caller doing it.
+#[test]
+fn tensor_bf16_input_matches_f16_path() {
+    let src = include_str!("../../../../examples/triton-ktir/vector_add_ktir.mlir");
+    let module = parse_module(src).expect("parse vector_add");
+    let n = 4096usize;
+    // Values chosen to be bf16-exact (small ints / halves) so the comparison is
+    // about the path, not bf16 rounding noise.
+    let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+    let y: Vec<f32> = (0..n).map(|i| (i % 5) as f32 * 0.5).collect();
+
+    // bf16 bytes = the high 16 bits of each f32.
+    let to_bf16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
+    let bf16_arg = |v: &[f32]| Arg::TensorBf16 {
+        data: to_bf16(v),
+        shape: vec![n],
+    };
+    let bf16_args = [
+        ("x_ptr", bf16_arg(&x)),
+        ("y_ptr", bf16_arg(&y)),
+        (
+            "output_ptr",
+            Arg::TensorBf16 {
+                data: vec![0u8; n * 2],
+                shape: vec![n],
+            },
+        ),
+        ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
+    ];
+
+    // Reference: the SAME values narrowed bf16->f16 on the host, fed as f16 bytes.
+    let to_f16_via_bf16 = |v: &[f32]| ktir_cpu::codec::bf16_to_f16(&to_bf16(v), v.len());
+    let f16_args = [
+        (
+            "x_ptr",
+            Arg::TensorBytes {
+                data: to_f16_via_bf16(&x),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "y_ptr",
+            Arg::TensorBytes {
+                data: to_f16_via_bf16(&y),
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        (
+            "output_ptr",
+            Arg::TensorBytes {
+                data: vec![0u8; n * 2],
+                shape: vec![n],
+                dtype: DType::F16,
+            },
+        ),
+        ("BLOCK_SIZE", Arg::Scalar(ktir_cpu::ir::Scalar::I64(128))),
+    ];
+
+    let got = execute_function(&module, "add_kernel", &bf16_args).expect("run bf16");
+    let want = execute_function(&module, "add_kernel", &f16_args).expect("run f16");
+    assert_eq!(
+        got["output_ptr"].raw, want["output_ptr"].raw,
+        "bf16 ingest must equal host-narrowed f16 ingest (byte-identical HBM)"
+    );
+}
+
 // RUST-ONLY (not a port of a Python test): the output side of the typed-bytes
 // feature — `Output.raw` is the undecoded f16 HBM bytes, and `data == decode(raw)`.
 // A typed host runner can thread `output.raw` straight into the next node's

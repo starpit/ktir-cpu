@@ -119,7 +119,8 @@ fn paged_tensor_indirect_scatter_gap() {
 // non-strict xfail tolerates an xpass, so a passing Rust run is compliant.
 // ===========================================================================
 
-const ADD_WITH_CONTROL_FLOW: &str = include_str!("../../../../examples/rfc/add-with-control-flow.mlir");
+const ADD_WITH_CONTROL_FLOW: &str =
+    include_str!("../../../../examples/rfc/add-with-control-flow.mlir");
 
 #[test]
 fn linalg_add_tensor_empty_runs() {

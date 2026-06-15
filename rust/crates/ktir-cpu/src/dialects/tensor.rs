@@ -834,7 +834,10 @@ mod tests {
         let mut ctx = single_core_context();
         // 4x4 with values 0..16, take [1,1][2,2][1,1] -> rows 1..2, cols 1..2.
         let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
-        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])));
+        ctx.set_value(
+            "%t",
+            Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])),
+        );
         let op = slice_op("%t", &["1", "1"], &[2, 2], &[1, 1]);
         run(&[op], &mut ctx).unwrap();
         let s = tile(&ctx, "%slice");
@@ -862,7 +865,10 @@ mod tests {
         // 4x4; the tiled K-loop edge passes its induction var as a dynamic row
         // offset and reads a 1x4 sub-tile.
         let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
-        ctx.set_value("%t", Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])));
+        ctx.set_value(
+            "%t",
+            Value::Tile(Tile::compute(data, DType::F32, vec![4, 4])),
+        );
         ctx.set_value("%k", Value::Index(2));
         let op = slice_op("%t", &["%k", "0"], &[1, 4], &[1, 1]);
         run(&[op], &mut ctx).unwrap();

@@ -104,15 +104,40 @@ impl Session {
         Ok(Self { exec })
     }
 
+    /// Build a session whose resident weights are SHARED across multiple programs
+    /// — the prefill and decode bundles, which use the SAME weights but different
+    /// shapes (M). The weight set is uploaded ONCE here; both programs run against
+    /// it with no second load. `programs` are in declaration order: `run_program(0,
+    /// ..)` runs the first, `run_program(1, ..)` the second, etc.
+    pub fn new_multi(
+        programs: Vec<(IRModule, &ProgramSpec)>,
+        weights: &[(&str, Arg)],
+    ) -> Result<Self, String> {
+        let mut exec = crate::resident::ResidentExecutor::new_multi(programs)?;
+        exec.set_sources(weights)?;
+        Ok(Self { exec })
+    }
+
     /// Overwrite source tensors in resident HBM (the per-pass input / mask).
     /// Sources you don't pass keep their resident bytes — so weights stay put.
     pub fn set_sources(&mut self, args: &[(&str, Arg)]) -> Result<(), String> {
         self.exec.set_sources(args)
     }
 
-    /// Run one forward pass and read back `outputs` (empty = the program results).
+    /// Run one forward pass of program 0 and read back `outputs` (empty = results).
     pub fn run(&mut self, outputs: &[&str]) -> Result<HashMap<String, Output>, String> {
         self.exec.run(outputs)
+    }
+
+    /// Run one forward pass of program `idx` (e.g. 0 = prefill, 1 = decode) against
+    /// the shared resident weights, reading back `outputs` (empty = that program's
+    /// results). Switching programs re-uploads no weights.
+    pub fn run_program(
+        &mut self,
+        idx: usize,
+        outputs: &[&str],
+    ) -> Result<HashMap<String, Output>, String> {
+        self.exec.run_program(idx, outputs)
     }
 }
 
