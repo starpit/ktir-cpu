@@ -60,6 +60,16 @@ path = "src/lib.rs"
 # dependency — see [dependencies] above — so tests reach it through the lib.)
 [dev-dependencies]
 serde_json = "1"
+# Real-model e2e (tests/e2e_real_forward.rs): fetch real weights from PUBLIC HF
+# repos (no HF_TOKEN) + read safetensors. Runs in default `cargo test` (NOT
+# env-gated); weights are fetched once via hf-hub and then cached in
+# ~/.cache/huggingface (content-addressed, immutable — not the scratchy bundle
+# cache). hf-hub default backend is blocking ureq.
+hf-hub = "0.3"
+safetensors = "0.4"
+# Vendored e2e fixtures (goldens + runtime inputs) are stored f16 + gzip -9 (Spyre
+# is f16; the `max_abs` band is looser than f16 precision). Already in the lock.
+flate2 = "1"
 
 # Profiling target for the real-model run. Plain `fn main` (no libtest harness).
 [[bench]]
