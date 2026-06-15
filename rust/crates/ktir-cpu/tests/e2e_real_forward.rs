@@ -424,3 +424,92 @@ fn smollm2_135m_prefill_real_forward() {
 fn llama_3_2_1b_prefill_real_forward() {
     real_forward_golden("llama-3.2-1b-prefill", "unsloth/Llama-3.2-1B-Instruct");
 }
+
+// ---------------------------------------------------------------------------
+// WHOLE-PREFILL e2e WALL-CLOCK A/B: the optimizer (head re-roll + flash, applied
+// at the execution entry) vs the unoptimized baseline (`KTIR_NO_ATTENTION_REWRITE`),
+// on the SAME real program / weights / inputs the golden test uses. Reports
+// best-of-N wall-clock for both and asserts the optimized output is argmax-faithful
+// to the baseline (so the speedup is real, not a correctness shortcut). `#[ignore]`
+// (heavy + needs HF weights); run: `--release --features metal --ignored --nocapture`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal")]
+fn time_prefill_opt_vs_baseline(fixture: &str, repo: &str) {
+    let dir = fixture_dir(fixture);
+    if !dir.join("golden.f16.gz").is_file() {
+        eprintln!("{fixture}: no vendored golden.f16.gz — skipping");
+        return;
+    }
+    let p = load_program(&dir);
+    let Some(w) = Weights::fetch(repo) else {
+        eprintln!("{fixture}: could not fetch {repo} (offline?) — skipping");
+        return;
+    };
+    let _ = &w.blobs;
+    let args = build_args(&dir, &p, &w);
+    let refs: Vec<(&str, Arg)> = args.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
+    let key = format!("t{}", p.result_id);
+    let runs = 3;
+
+    let run_once = || {
+        let t = std::time::Instant::now();
+        let out = ktir_cpu::segmented::execute_segmented(&p.module, &p.spec, &refs, &[&key])
+            .expect("execute_segmented");
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        (out.get(&key).expect("result").data.clone(), ms)
+    };
+
+    // BASELINE: rewrites disabled (raw unrolled per-query-row attention).
+    unsafe { std::env::set_var("KTIR_NO_ATTENTION_REWRITE", "1") };
+    let mut base_ms = f64::INFINITY;
+    let mut base_out = Vec::new();
+    for _ in 0..runs {
+        let (o, ms) = run_once();
+        base_ms = base_ms.min(ms);
+        base_out = o;
+    }
+    // OPTIMIZED: rewrites on (the default production path).
+    unsafe { std::env::remove_var("KTIR_NO_ATTENTION_REWRITE") };
+    let mut opt_ms = f64::INFINITY;
+    let mut opt_out = Vec::new();
+    for _ in 0..runs {
+        let (o, ms) = run_once();
+        opt_ms = opt_ms.min(ms);
+        opt_out = o;
+    }
+
+    let (m, vocab) = p.shape[&p.result_id];
+    let mut hits = 0usize;
+    for r in 0..m {
+        let row = r * vocab..(r + 1) * vocab;
+        if argmax(&base_out[row.clone()]) == argmax(&opt_out[row]) {
+            hits += 1;
+        }
+    }
+    let max_abs = base_out
+        .iter()
+        .zip(&opt_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "{fixture}: WHOLE-PREFILL e2e best-of-{runs}  baseline(no-rewrite) {base_ms:.1} ms | \
+         optimized {opt_ms:.1} ms | {:.2}x   (opt-vs-base argmax {hits}/{m} match, max-abs {max_abs:.4})",
+        base_ms / opt_ms
+    );
+    assert_eq!(hits, m, "{fixture}: optimized argmax diverges from the baseline");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "real-model whole-prefill wall-clock A/B (optimized vs baseline); needs metal + HF weights; run --release --ignored --nocapture"]
+fn time_smollm2_135m_prefill() {
+    time_prefill_opt_vs_baseline("smollm2-135m-prefill", "HuggingFaceTB/SmolLM2-135M");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "real-model whole-prefill wall-clock A/B (optimized vs baseline); needs metal + HF weights; run --release --ignored --nocapture"]
+fn time_llama_3_2_1b_prefill() {
+    time_prefill_opt_vs_baseline("llama-3.2-1b-prefill", "unsloth/Llama-3.2-1B-Instruct");
+}

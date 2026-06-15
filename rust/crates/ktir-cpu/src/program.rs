@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use crate::interpreter::{Arg, Output};
 use crate::ir::IRModule;
 use crate::parser::parse_module;
-use ktir_optimizer::fusion::{ProgramSpec, attention_needs_flash};
+use ktir_optimizer::fusion::ProgramSpec;
 
 /// Parse a program's per-node MLIR into ONE module (every `func.func` merged) so
 /// the optimizer sees the whole program. `node_mlir[i]` is the MLIR text for one
@@ -44,58 +44,13 @@ pub fn module_from_nodes(node_mlir: &[&str]) -> Result<IRModule, String> {
             module.add_function(f);
         }
     }
-    // ATTENTION REWRITES (Contract B — disjoint head-vs-cap partition). Both run
-    // BEFORE segmentation so BOTH run paths (segmented one-shot + resident
-    // session) see the rewrite.
-    //
-    // HEAD RE-ROLL (BELOW-cap path, TODO #1): the real unrolled per-head cached
-    // nodes (`grid=[H,1]`, m manually-unrolled query rows) are RE-ROLLED into one
-    // pass of whole-`[m,*]` tensor ops IFF the re-rolled `[m,cap]` scores tile
-    // FITS LX (`!attention_needs_flash`). This collapses ~100 ops/row × m rows
-    // into ~30 larger-tensor ops per core (a measured ~5–13× per-node wall-clock
-    // win on the real prefill nodes). Region-free, fail-safe to a no-op on any
-    // non-matching node.
-    //
-    // FLASH ATTENTION (ABOVE-cap path, TODO #2): a node whose `[m,cap]` scores
-    // tile would OVERFLOW LX is cap-tiled with online softmax instead. The two
-    // predicates are monotone-complementary, so a node receives AT MOST one
-    // rewrite (head re-roll keys on the unrolled multi-store idiom, flash on the
-    // single-store canonical idiom; the real nodes are unrolled multi-store →
-    // only the head pass matches them, and only below the cap).
-    apply_head_rewrite_pass(&mut module);
-    apply_flash_attention_pass(&mut module);
+    // NOTE: the attention IR rewrites (head re-roll, TODO #1; flash cap-tiling,
+    // TODO #2) are NOT applied here. They run at the EXECUTION ENTRY POINT
+    // (`segmented::apply_attention_rewrites`, called by `execute_segmented` and
+    // `ResidentExecutor`), so they fire for EVERY path that executes a module —
+    // including a caller that builds the module itself and runs `execute_segmented`
+    // directly (e.g. the real-model e2e harness), not just this turnkey builder.
     Ok(module)
-}
-
-/// Run the head re-roll rewrite over `module` using the SAME LX budget Contract B
-/// uses for flash attention, so the head (below-cap) and flash (above-cap)
-/// regimes stay disjoint. `KTIR_FLASH_ATTN_SCORES_BUDGET` overrides the scores
-/// budget identically (a tiny value FORCES the below-cap head pass off so flash
-/// owns everything — the same knob the FA golden uses).
-fn apply_head_rewrite_pass(module: &mut IRModule) {
-    let budget = std::env::var("KTIR_FLASH_ATTN_SCORES_BUDGET")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(crate::memory::lx_fusion_budget);
-    ktir_optimizer::head_rewrite::apply_head_rewrite(module, |scores_bytes| {
-        attention_needs_flash(scores_bytes, budget)
-    });
-}
-
-/// Run the flash-attention rewrite over `module` using the segmenter's LX budget
-/// as the cap threshold (Contract B). `KTIR_FLASH_ATTN_SCORES_BUDGET` overrides
-/// the scores-tile budget (bytes) the predicate compares against — a tiny value
-/// FORCES the pass to fire on recognized small attention nodes (the forced-fire
-/// golden), the default is the real `KTIR_LX_FUSION_BUDGET` budget so production
-/// behavior is unchanged.
-fn apply_flash_attention_pass(module: &mut IRModule) {
-    let budget = std::env::var("KTIR_FLASH_ATTN_SCORES_BUDGET")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(crate::memory::lx_fusion_budget);
-    ktir_optimizer::flash_attn::apply_flash_attention(module, |scores_bytes| {
-        attention_needs_flash(scores_bytes, budget)
-    });
 }
 
 /// Turnkey single-shot: parse all node MLIR into one module and run the whole

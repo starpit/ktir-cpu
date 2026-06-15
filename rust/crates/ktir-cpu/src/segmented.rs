@@ -138,12 +138,63 @@ fn collect_view_shapes(
 /// This is the production analogue of the per-node oracle: attention runs
 /// head-parallel at its native grid, and the fused `[1,1]` segments carry the
 /// map / GEMM / weight-cache GPU offloads.
+/// Apply the attention IR-rewrite optimizer passes (head re-roll, then flash
+/// cap-tiling) to `module` in place, under the LX scores budget Contract B uses.
+///
+/// Run at the EXECUTION ENTRY POINT (here + [`crate::resident::ResidentExecutor`])
+/// rather than in one specific module-builder, so the optimizer is GUARANTEED to
+/// run for *every* path that executes a module — the turnkey
+/// [`crate::program::execute`], a [`crate::program::Session`], AND a caller that
+/// built the module itself and calls [`execute_segmented`] directly (e.g. the
+/// real-model e2e harness). Both passes fail-safe to a no-op on any non-matching
+/// node and are idempotent (re-running on already-rewritten IR recognizes
+/// nothing), so a redundant application is harmless. `KTIR_FLASH_ATTN_SCORES_BUDGET`
+/// overrides the budget (a tiny value forces flash to own everything — the knob
+/// the FA golden uses).
+pub(crate) fn apply_attention_rewrites(module: &mut IRModule) {
+    // Baseline knob: skip the rewrites entirely (used to A/B the e2e wall-clock
+    // of the optimized vs unoptimized real prefill). Default OFF — production
+    // always optimizes.
+    if std::env::var_os("KTIR_NO_ATTENTION_REWRITE").is_some() {
+        if std::env::var_os("KTIR_REWRITE_VERBOSE").is_some() {
+            eprintln!("[ktir-optimizer] attention rewrites DISABLED (KTIR_NO_ATTENTION_REWRITE)");
+        }
+        return;
+    }
+    let budget = std::env::var("KTIR_FLASH_ATTN_SCORES_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(crate::memory::lx_fusion_budget);
+    // HEAD RE-ROLL (below-cap, TODO #1): unrolled per-query-row head-parallel
+    // attention -> whole-`[m,*]` tensor ops. FLASH (above-cap, TODO #2): cap-tile
+    // the re-rolled `[m,cap]` context block with online softmax. Disjoint via the
+    // shared `attention_needs_flash` predicate; head runs first so flash sees its
+    // re-rolled form.
+    let n_head = ktir_optimizer::head_rewrite::apply_head_rewrite(module, |scores_bytes| {
+        ktir_optimizer::fusion::attention_needs_flash(scores_bytes, budget)
+    });
+    let n_flash = ktir_optimizer::flash_attn::apply_flash_attention(module, |scores_bytes| {
+        ktir_optimizer::fusion::attention_needs_flash(scores_bytes, budget)
+    });
+    if std::env::var_os("KTIR_REWRITE_VERBOSE").is_some() {
+        eprintln!(
+            "[ktir-optimizer] attention rewrites @ execution entry: head re-roll fired on {n_head} node(s), flash cap-tiling fired on {n_flash} node(s) (budget={budget} bytes)"
+        );
+    }
+}
+
 pub fn execute_segmented(
     module: &IRModule,
     spec: &ProgramSpec,
     args: &[(&str, Arg)],
     outputs: &[&str],
 ) -> Result<HashMap<String, Output>, String> {
+    // Optimize at the execution entry (see `apply_attention_rewrites`): every
+    // executed module gets the attention rewrites, regardless of how it was built.
+    // We only borrow the caller's module and the rewrite mutates, so clone first.
+    let mut owned = module.clone();
+    apply_attention_rewrites(&mut owned);
+    let module = &owned;
     let shapes = derive_shapes(module, spec)?;
     // LX-budgeted segmentation (see `plan_segments_budgeted`): keep each fused
     // segment's co-resident `[m, *]` intermediates within the per-core LX.

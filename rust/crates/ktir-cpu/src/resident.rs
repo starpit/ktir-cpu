@@ -207,6 +207,11 @@ impl ResidentExecutor {
             Vec::with_capacity(programs.len());
 
         for (module, spec) in programs {
+            // Optimize at the execution entry (see
+            // `crate::segmented::apply_attention_rewrites`): every resident program
+            // gets the attention IR rewrites, applied ONCE here before planning.
+            let mut module = module;
+            crate::segmented::apply_attention_rewrites(&mut module);
             let prog_shapes = derive_shapes(&module, spec)?;
             for (&id, shp) in &prog_shapes {
                 shapes.entry(id).or_insert_with(|| shp.clone());
