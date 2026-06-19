@@ -136,6 +136,44 @@ pub fn is_attention_node(func: &IRFunction) -> bool {
     has_transpose && has_softmax_reduce
 }
 
+/// True when `func` is a DECODE (m=1) attention node — the single-token form
+/// whose grid is `[1,1]` (so [`is_attention_node`]'s grid clause excludes it) but
+/// whose body is the unrolled per-head two-block online softmax. Discriminator:
+/// grid `[1,1]`, a `linalg.transpose` (the K transpose) AND the softmax
+/// `linalg.reduce { arith.maximumf }`. Structural, not name/shape based. Used —
+/// by default, unless `KTIR_NO_FUSE_ATTN` is set — to ISOLATE the node into its
+/// own segment so the resident executor runs the fused CPU path, not the op storm.
+pub fn is_decode_attention_node(func: &IRFunction) -> bool {
+    let (gx, gy, gz) = func.grid;
+    if gx * gy * gz != 1 {
+        return false;
+    }
+    let mut has_transpose = false;
+    let mut has_softmax_reduce = false;
+    fn scan(ops: &[Operation], has_transpose: &mut bool, has_softmax_reduce: &mut bool) {
+        for op in ops {
+            if op.op_type == "linalg.transpose" {
+                *has_transpose = true;
+            }
+            if op.op_type == "linalg.reduce"
+                && (matches!(op.attributes.get("reduce_fn"), Some(Attr::Str(s)) if s == "arith.maximumf")
+                    || region_has_op(&op.regions, "arith.maximumf"))
+            {
+                *has_softmax_reduce = true;
+            }
+            for rg in &op.regions {
+                scan(rg, has_transpose, has_softmax_reduce);
+            }
+        }
+    }
+    scan(
+        &func.operations,
+        &mut has_transpose,
+        &mut has_softmax_reduce,
+    );
+    has_transpose && has_softmax_reduce
+}
+
 /// ROW-LOCALITY — is every cross-node tensor this node touches accessed only at
 /// the node's OWN compute-tile row? A node is grid=[H,1]: compute-tile `k` runs
 /// the body with `ktdp.get_compute_tile_id` ⇒ `k`. The node is **row-local** iff,
@@ -365,11 +403,23 @@ pub fn plan_segments_budgeted(
     lx_budget: usize,
     tensor_bytes: &HashMap<u64, usize>,
 ) -> Result<Vec<Segment>, String> {
-    // Per-node attention classification.
+    // Per-node attention classification. Nodes flagged here are kept as their own
+    // `Segment::Native` (run at their native grid, NOT collapsed into a fused
+    // [1,1] function). The head-parallel prefill form (grid > 1) is always
+    // isolated. The DECODE (m=1, grid [1,1]) form is ALSO isolated by default — so
+    // the resident executor can run the fused CPU attention for it (a measured
+    // decode win, golden-faithful). Set `KTIR_NO_FUSE_ATTN` to opt out: decode
+    // attention then stays folded into the fused segment (the decomposed oracle
+    // path), so the suite stays byte-identical to the pre-fusion baseline.
+    let fuse_decode_attn = std::env::var_os("KTIR_NO_FUSE_ATTN").is_none();
     let attn: Vec<bool> = spec
         .nodes
         .iter()
-        .map(|n| module.get_function(&n.func).map(is_attention_node))
+        .map(|n| {
+            module
+                .get_function(&n.func)
+                .map(|f| is_attention_node(f) || (fuse_decode_attn && is_decode_attention_node(f)))
+        })
         .collect::<Result<_, _>>()?;
 
     // For widening segment-local sources/results: which node indices produce /

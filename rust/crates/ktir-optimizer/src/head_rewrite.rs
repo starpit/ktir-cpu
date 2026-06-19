@@ -368,6 +368,537 @@ pub fn recognize_head_attention(func: &IRFunction) -> Option<HeadAttnIsland> {
     cfg
 }
 
+// ===========================================================================
+// DECODE (m=1) recognition — the head loop is in the BODY, not the grid
+// ===========================================================================
+
+/// A recognized m=1 (decode) head-parallel attention island.
+///
+/// The decode form is a single `grid = [1,1]` function whose body is `H`
+/// MANUALLY-UNROLLED identical head blocks (one query row, `m == 1`). Heads are
+/// distinguished by per-head `qcol = h*hdc` / `kvcol = (h/gqac)*hdc` arith
+/// constants on their access tiles (NOT by `get_compute_tile_id`). This carries
+/// the SAME logical config as [`HeadAttnIsland`] plus the head count and the
+/// recovered per-head column-offset regularity, so the fused CPU executor can
+/// reproduce the decomposed path's exact arithmetic per head.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodeAttnIsland {
+    /// Q pointer arg (view0), `[1, H*d]`.
+    pub q_arg: String,
+    /// O pointer arg (view1), `[1, H*d]` — the `is_output` tensor.
+    pub o_arg: String,
+    /// Context mask pointer arg (view2), `[1, cap]` (loaded once, shared).
+    pub mask_arg: String,
+    /// Context K pointer arg (view5), `[cap, kv_cols]`.
+    pub kc_arg: String,
+    /// Diagonal (current-token) K pointer arg (view6), `[1, kv_cols]`.
+    pub kd_arg: String,
+    /// Context V pointer arg (view7), `[cap, kv_cols]`.
+    pub vc_arg: String,
+    /// Diagonal (current-token) V pointer arg (view8), `[1, kv_cols]`.
+    pub vd_arg: String,
+    /// Q/O view column width `H*d`.
+    pub q_cols: i64,
+    /// KV view column width (`num_kv_heads * d`).
+    pub kv_cols: i64,
+    /// Context KV length (`cap` axis) == view5 rows.
+    pub cap: i64,
+    /// Head dim.
+    pub d: i64,
+    /// Head count == number of stores.
+    pub h: i64,
+    /// GQA divisor (`kv_head = head / gqac`).
+    pub gqac: i64,
+    /// Per-head column stride (`hdc == d`).
+    pub hdc: i64,
+    /// `1/sqrt(d)` scale.
+    pub scale: f32,
+    /// Storage dtype string (e.g. `"f16"`).
+    pub dtype: String,
+}
+
+/// Recognize the m=1 (decode) unrolled head-parallel attention idiom in `func`.
+///
+/// Sibling to [`recognize_head_attention`] for the single-query-row decode form.
+/// Returns `Some(island)` only when ALL structural invariants hold (fail-safe):
+///   1. `grid = (1, 1, 1)` (decode is single-token, single-core);
+///   2. no top-level `scf.*` control flow;
+///   3. one or more `ktdp.store`s, each a self-contained two-block head whose
+///      back-walk matches the QKᵀ / online-softmax / AV signature with a CONTEXT
+///      block (mask-added, Kc/Vc `[cap, d]`) and a DIAGONAL block (no mask, Kd/Vd
+///      `[1, d]`), Q the SAME load for both;
+///   4. all heads share scale / mask / gqac / hdc / views, and the recovered
+///      per-head offsets follow `qcol_h = h*hdc`, `kvcol_h = (h/gqac)*hdc` EXACTLY
+///      over `h = 0..H` (the structural regularity, not a model-specific shape).
+///
+/// Any deviation yields `None`, leaving the node decomposed (the oracle).
+pub fn recognize_head_attention_decode(func: &IRFunction) -> Option<DecodeAttnIsland> {
+    // (1) grid = [1,1,1].
+    let (gx, gy, gz) = func.grid;
+    if gx != 1 || gy != 1 || gz != 1 {
+        return None;
+    }
+    // (2) no top-level control flow.
+    if func.operations.iter().any(|op| {
+        matches!(
+            op.op_type.as_str(),
+            "scf.for" | "scf.if" | "scf.while" | "scf.parallel" | "scf.forall"
+        )
+    }) {
+        return None;
+    }
+
+    // Index ops by result SSA. Resolve index values that are either direct
+    // `arith.constant` or `arith.addi`/`arith.muli`/`arith.divui` of resolved
+    // operands (the decode form computes `kc = kcs + kvcol`).
+    let mut views: HashMap<String, ViewInfo> = HashMap::new();
+    let mut tiles: HashMap<String, TileInfo> = HashMap::new();
+    let mut load_src: HashMap<String, LoadChain> = HashMap::new();
+    let mut def: HashMap<String, &Operation> = HashMap::new();
+    let mut int_const: HashMap<String, i64> = HashMap::new();
+
+    for op in &func.operations {
+        match op.op_type.as_str() {
+            "ktdp.construct_memory_view" => {
+                if let (Some(res), Some(arg)) = (&op.result, op.operands.first()) {
+                    views.insert(
+                        res.clone(),
+                        ViewInfo {
+                            arg: arg.clone(),
+                            shape: shape_attr(op),
+                            dtype: dtype_attr(op),
+                        },
+                    );
+                }
+            }
+            "ktdp.construct_access_tile" => {
+                if let (Some(res), Some(view)) = (&op.result, op.operands.first()) {
+                    tiles.insert(
+                        res.clone(),
+                        TileInfo {
+                            view: view.clone(),
+                            shape: shape_attr(op),
+                            indices: op.operands[1..].to_vec(),
+                        },
+                    );
+                }
+            }
+            "ktdp.load" => {
+                if let (Some(res), Some(tile)) = (&op.result, op.operands.first())
+                    && let Some(ti) = tiles.get(tile)
+                    && let Some(vi) = views.get(&ti.view)
+                {
+                    load_src.insert(
+                        res.clone(),
+                        LoadChain {
+                            arg: vi.arg.clone(),
+                            view_shape: vi.shape.clone(),
+                            tile_shape: ti.shape.clone(),
+                            dtype: vi.dtype.clone(),
+                        },
+                    );
+                }
+            }
+            "arith.constant" => {
+                if let (Some(res), Some(Attr::Int(v))) = (&op.result, op.attributes.get("value")) {
+                    int_const.insert(res.clone(), *v);
+                }
+            }
+            _ => {}
+        }
+        if let Some(res) = &op.result {
+            def.insert(res.clone(), op);
+        }
+    }
+
+    // Resolve an index SSA value through constants + addi/muli/divui chains.
+    fn resolve_index(
+        ssa: &str,
+        int_const: &HashMap<String, i64>,
+        def: &HashMap<String, &Operation>,
+        depth: usize,
+    ) -> Option<i64> {
+        if depth > 16 {
+            return None;
+        }
+        if let Some(v) = int_const.get(ssa) {
+            return Some(*v);
+        }
+        let op = def.get(ssa)?;
+        let a = op.operands.first()?;
+        let b = op.operands.get(1)?;
+        let av = resolve_index(a, int_const, def, depth + 1)?;
+        let bv = resolve_index(b, int_const, def, depth + 1)?;
+        match op.op_type.as_str() {
+            "arith.addi" => Some(av + bv),
+            "arith.muli" => Some(av * bv),
+            "arith.divui" if bv != 0 => Some(av.div_euclid(bv)),
+            _ => None,
+        }
+    }
+
+    // (4) GQA divisor: the per-head `kvcol = (h/gqac)*hdc` is baked as constants in
+    // decode (no `divui` SSA), so recover gqac/hdc from the per-head offset
+    // regularity below — start with hdc = d once we know d.
+
+    // (3) one store per head.
+    let stores: Vec<&Operation> = func
+        .operations
+        .iter()
+        .filter(|o| o.op_type == "ktdp.store")
+        .collect();
+    let h = stores.len() as i64;
+    if h < 1 {
+        return None;
+    }
+
+    // Recover each head block. Collect (qcol, kvcol) and the row-invariant config.
+    let mut cfg: Option<DecodeAttnIsland> = None;
+    let mut offsets: Vec<(i64, i64)> = Vec::with_capacity(h as usize);
+
+    for store in &stores {
+        let hm = recognize_head_decode(store, &tiles, &load_src, &def, &int_const, &resolve_index)?;
+        offsets.push((hm.qcol, hm.kvcol));
+        match &cfg {
+            None => cfg = Some(hm.island),
+            Some(prev) => {
+                if *prev != hm.island {
+                    return None;
+                }
+            }
+        }
+    }
+    let mut island = cfg?;
+    island.h = h;
+
+    // (4) Verify the per-head offset regularity STRUCTURALLY: sorting heads by
+    // qcol, qcol_h MUST equal h*hdc and kvcol_h MUST equal (h/gqac)*hdc for a
+    // single hdc and gqac. hdc = d (head dim). Derive gqac from the kvcol pattern
+    // and require an exact match (fail-safe to None otherwise).
+    let hdc = island.d;
+    island.hdc = hdc;
+    if hdc <= 0 {
+        return None;
+    }
+    offsets.sort_by_key(|&(q, _)| q);
+    // qcol_h must be exactly h*hdc with no duplicates.
+    for (idx, &(q, _)) in offsets.iter().enumerate() {
+        if q != idx as i64 * hdc {
+            return None;
+        }
+    }
+    // Recover gqac from the first kvcol step: the number of consecutive heads that
+    // share a kv head. kvcol_h = (h / gqac) * hdc. gqac = number of leading heads
+    // whose kvcol == 0 (the first kv head's group size). Then verify the whole
+    // sequence matches (h/gqac)*hdc.
+    let gqac = {
+        let mut g = 0i64;
+        for &(_, kv) in &offsets {
+            if kv == 0 {
+                g += 1;
+            } else {
+                break;
+            }
+        }
+        g
+    };
+    if gqac < 1 {
+        return None;
+    }
+    for (idx, &(_, kv)) in offsets.iter().enumerate() {
+        if kv != (idx as i64 / gqac) * hdc {
+            return None;
+        }
+    }
+    island.gqac = gqac;
+
+    // kv_cols must accommodate the highest kv head's slice.
+    let max_kvcol = offsets.iter().map(|&(_, kv)| kv).max().unwrap_or(0);
+    if max_kvcol + hdc > island.kv_cols {
+        return None;
+    }
+    // q_cols must accommodate the highest head's slice.
+    if (h - 1) * hdc + hdc > island.q_cols {
+        return None;
+    }
+
+    Some(island)
+}
+
+/// One recognized decode head block: its column offsets and the (head-invariant)
+/// island config it implies.
+struct HeadDecodeMatch {
+    qcol: i64,
+    kvcol: i64,
+    island: DecodeAttnIsland,
+}
+
+/// Walk back from one head's `ktdp.store` and prove the decode two-block
+/// online-softmax signature, returning the head's column offsets and the implied
+/// island config. Returns `None` on any structural deviation (fail-safe).
+#[allow(clippy::too_many_arguments)]
+fn recognize_head_decode(
+    store: &Operation,
+    tiles: &HashMap<String, TileInfo>,
+    load_src: &HashMap<String, LoadChain>,
+    def: &HashMap<String, &Operation>,
+    int_const: &HashMap<String, i64>,
+    resolve_index: &impl Fn(
+        &str,
+        &HashMap<String, i64>,
+        &HashMap<String, &Operation>,
+        usize,
+    ) -> Option<i64>,
+) -> Option<HeadDecodeMatch> {
+    // store %oa, %o_tile (O[1, d] at [0, qcol]).
+    let stored_val = store.operands.first()?;
+    let o_tile_ssa = store.operands.get(1)?;
+    let o_tile = tiles.get(o_tile_ssa)?;
+    let o_view = o_tile.view.clone();
+    // qcol = second index operand (the column offset); first index is the row (0).
+    let qcol = resolve_index(o_tile.indices.get(1)?, int_const, def, 0)?;
+
+    // oa = arith.addf(ov_context, ov_diag).
+    let add = def.get(stored_val)?;
+    if add.op_type != "arith.addf" {
+        return None;
+    }
+    let ovc = add.operands.first()?;
+    let ovd = add.operands.get(1)?;
+
+    // Context AV: ov_context = linalg.matmul(Wc, Vc), Vc loaded [cap, d].
+    let avc = def.get(ovc)?;
+    if avc.op_type != "linalg.matmul" {
+        return None;
+    }
+    let wc = avc.operands.first()?;
+    let vc_loaded = avc.operands.get(1)?;
+    let vc = load_src.get(vc_loaded)?;
+
+    // Diagonal AV: ov_diag = linalg.matmul(Wd, Vd), Vd loaded [1, d].
+    let avd = def.get(ovd)?;
+    if avd.op_type != "linalg.matmul" {
+        return None;
+    }
+    let wd = avd.operands.first()?;
+    let vd_loaded = avd.operands.get(1)?;
+    let vd = load_src.get(vd_loaded)?;
+
+    // Wc = divf(exp_c, gs_bcast), Wd = divf(exp_d, gs_bcast).
+    let (exp_c, _gsc) = trace_divf(wc, def)?;
+    let (exp_d, _gsd) = trace_divf(wd, def)?;
+
+    // exp_c = math.exp(sub_c); sub_c = subf(scm_c, gm_bcast).
+    let scm_c = trace_exp_sub(&exp_c, def)?;
+    let sd = trace_exp_sub(&exp_d, def)?;
+
+    // CONTEXT scores: scm_c = addf(scaled_c, mask).
+    let scm_op = def.get(&scm_c)?;
+    if scm_op.op_type != "arith.addf" {
+        return None;
+    }
+    let scaled_c = scm_op.operands.first()?;
+    let mask_loaded = scm_op.operands.get(1)?;
+    let mask_chain = load_src.get(mask_loaded)?;
+
+    // scaled_c = mulf(raw_c, scale_splat).
+    let (raw_c, scale) = trace_scale(scaled_c, def)?;
+    // raw_c = matmul(Q, transpose(Kc)); Kc [cap, d].
+    let (q_loaded_c, kc) = trace_qk(&raw_c, def, load_src)?;
+
+    // DIAGONAL scores: sd = mulf(raw_d, scale_splat) — NO mask add (single token).
+    let (raw_d, scale_d) = trace_scale(&sd, def)?;
+    if (scale - scale_d).abs() > 1e-4 {
+        return None;
+    }
+    let (q_loaded_d, kd) = trace_qk(&raw_d, def, load_src)?;
+
+    // Q must be the SAME load arg for both blocks.
+    let q_c = load_src.get(&q_loaded_c)?;
+    let q_d = load_src.get(&q_loaded_d)?;
+    if q_c.arg != q_d.arg {
+        return None;
+    }
+
+    // kvcol: the K context tile's column index (second index operand of its tile).
+    // Re-find the context K access tile via the transpose -> load -> tile chain.
+    let kvcol = {
+        // raw_c = matmul(Q, kt); kt = transpose(kc_loaded); kc_loaded came from a
+        // load whose tile's column index is kvcol.
+        let mm = def.get(&raw_c)?;
+        let kt = def.get(mm.operands.get(1)?)?;
+        let kc_loaded = kt.operands.first()?;
+        // find the access tile feeding this load
+        let load_op = def.get(kc_loaded)?;
+        let tile_ssa = load_op.operands.first()?;
+        let ti = tiles.get(tile_ssa)?;
+        resolve_index(ti.indices.get(1)?, int_const, def, 0)?
+    };
+
+    // ---- shape checks ----
+    // Q/O view [1, q_cols]; q_cols = H*d. d = head-dim from the Q tile width.
+    let q_shape = &q_c.view_shape;
+    if q_shape.len() != 2 || q_shape[0] != 1 {
+        return None;
+    }
+    let q_cols = q_shape[1];
+    let d = q_c.tile_shape.get(1).copied()?;
+    if d <= 0 || q_cols % d != 0 {
+        return None;
+    }
+    // Context K/V view [cap, kv_cols].
+    if kc.view_shape.len() != 2 || vc.view_shape != kc.view_shape {
+        return None;
+    }
+    let cap = kc.view_shape[0];
+    let kv_cols = kc.view_shape[1];
+    if cap <= 0 || kv_cols % d != 0 {
+        return None;
+    }
+    // Context K/V access tiles read the full [cap, d] head slice.
+    if kc.tile_shape != [cap, d] || vc.tile_shape != [cap, d] {
+        return None;
+    }
+    // Diagonal K/V view [1, kv_cols]; access tile [1, d] (single current token).
+    if kd.view_shape != [1, kv_cols] || vd.view_shape != [1, kv_cols] {
+        return None;
+    }
+    if kd.tile_shape != [1, d] || vd.tile_shape != [1, d] {
+        return None;
+    }
+    // Output view must equal the Q view [1, q_cols].
+    let o_arg = {
+        let vop = def.get(&o_view)?;
+        if vop.op_type != "ktdp.construct_memory_view" {
+            return None;
+        }
+        let os = shape_attr(vop);
+        if os != *q_shape {
+            return None;
+        }
+        vop.operands.first()?.clone()
+    };
+    // Mask view [1, cap].
+    if mask_chain.view_shape != [1, cap] {
+        return None;
+    }
+
+    let island = DecodeAttnIsland {
+        q_arg: q_c.arg.clone(),
+        o_arg,
+        mask_arg: mask_chain.arg.clone(),
+        kc_arg: kc.arg.clone(),
+        kd_arg: kd.arg.clone(),
+        vc_arg: vc.arg.clone(),
+        vd_arg: vd.arg.clone(),
+        q_cols,
+        kv_cols,
+        cap,
+        d,
+        h: 0, // filled by caller from store count
+        gqac: 1,
+        hdc: d,
+        scale,
+        dtype: q_c.dtype.clone(),
+    };
+
+    Some(HeadDecodeMatch {
+        qcol,
+        kvcol,
+        island,
+    })
+}
+
+impl DecodeAttnIsland {
+    /// Compute the fused m=1 attention into `o` (the `[1, q_cols]` output row), in
+    /// f32, reproducing the decomposed path's exact arithmetic per head:
+    /// per head `h` (`qcol = h*hdc`, `kvh = h/gqac`, `kvcol = kvh*hdc`):
+    ///   * `s_c[j] = scale * Σ_t Q[qcol+t]*Kc[j, kvcol+t] + mask[j]`  (j in 0..cap)
+    ///   * `s_d    = scale * Σ_t Q[qcol+t]*Kd[kvcol+t]`               (no mask)
+    ///   * `gm = max(max_j s_c[j], s_d)`; `e_c[j]=exp(s_c[j]-gm)`, `e_d=exp(s_d-gm)`
+    ///   * `Z = Σ_j e_c[j] + e_d`; `o[qcol+t] = (Σ_j e_c[j]*Vc[j,kvcol+t]
+    ///       + e_d*Vd[kvcol+t]) / Z`
+    ///
+    /// Inputs are ROW-MAJOR f32 buffers already decoded from HBM:
+    ///   * `q`:    `[q_cols]`            (the single query row)
+    ///   * `mask`: `[cap]`              (the shared context mask)
+    ///   * `kc`/`vc`: `[cap * kv_cols]` (context K/V, row-major `[cap, kv_cols]`)
+    ///   * `kd`/`vd`: `[kv_cols]`       (current-token K/V)
+    ///   * `o`:    `[q_cols]`           (output, written in place)
+    ///
+    /// f32 accumulation throughout — TIGHTER than the decomposed f16-intermediate
+    /// path, so well inside the golden band.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_f32(
+        &self,
+        q: &[f32],
+        mask: &[f32],
+        kc: &[f32],
+        kd: &[f32],
+        vc: &[f32],
+        vd: &[f32],
+        o: &mut [f32],
+    ) {
+        let d = self.d as usize;
+        let cap = self.cap as usize;
+        let kvw = self.kv_cols as usize;
+        let scale = self.scale;
+        for hh in 0..self.h as usize {
+            let qcol = hh * self.hdc as usize;
+            let kvh = hh / self.gqac as usize;
+            let kvcol = kvh * self.hdc as usize;
+            let qh = &q[qcol..qcol + d];
+
+            // CONTEXT scores s_c[j] (GEMV q·Kcᵀ over the kvcol column-slice) + mask.
+            let mut sc = vec![0.0f32; cap];
+            let mut gm = f32::NEG_INFINITY;
+            for j in 0..cap {
+                let krow = &kc[j * kvw + kvcol..j * kvw + kvcol + d];
+                let mut dot = 0.0f32;
+                for t in 0..d {
+                    dot += qh[t] * krow[t];
+                }
+                let s = scale * dot + mask[j];
+                sc[j] = s;
+                if s > gm {
+                    gm = s;
+                }
+            }
+            // DIAGONAL score s_d (single dot, no mask).
+            let kdrow = &kd[kvcol..kvcol + d];
+            let mut dot_d = 0.0f32;
+            for t in 0..d {
+                dot_d += qh[t] * kdrow[t];
+            }
+            let sd = scale * dot_d;
+            if sd > gm {
+                gm = sd;
+            }
+
+            // Online softmax over the two blocks (global max, exp, denominator).
+            let mut z = 0.0f32;
+            for s in sc.iter_mut() {
+                *s = (*s - gm).exp();
+                z += *s;
+            }
+            let ed = (sd - gm).exp();
+            z += ed;
+            let inv_z = 1.0f32 / z;
+
+            // OUTPUT o_h[t] = (Σ_j e_c[j]*Vc[j, kvcol+t] + e_d*Vd[kvcol+t]) / Z.
+            let oh = &mut o[qcol..qcol + d];
+            for t in 0..d {
+                let mut acc = 0.0f32;
+                for j in 0..cap {
+                    acc += sc[j] * vc[j * kvw + kvcol + t];
+                }
+                acc += ed * vd[kvcol + t];
+                oh[t] = acc * inv_z;
+            }
+        }
+    }
+}
+
 /// One recognized query-row block: its row offset and the (row-invariant) island
 /// config it implies. `recognize_head_attention` cross-checks the config across
 /// all rows and the row offsets cover `0..m-1`.
@@ -1152,5 +1683,411 @@ mod tests {
         let isl = smollm_island();
         // [8, 64] f16 = 8*64*2 = 1024 bytes.
         assert_eq!(isl.scores_bytes(), 8 * 64 * 2);
+    }
+
+    // ---- DECODE (m=1) recognition + fused compute ----
+
+    fn decode_island(h: i64, gqac: i64, d: i64, cap: i64) -> DecodeAttnIsland {
+        let kv_heads = h / gqac;
+        DecodeAttnIsland {
+            q_arg: "%q".into(),
+            o_arg: "%o".into(),
+            mask_arg: "%mask".into(),
+            kc_arg: "%kc".into(),
+            kd_arg: "%kd".into(),
+            vc_arg: "%vc".into(),
+            vd_arg: "%vd".into(),
+            q_cols: h * d,
+            kv_cols: kv_heads * d,
+            cap,
+            d,
+            h,
+            gqac,
+            hdc: d,
+            scale: 0.125,
+            dtype: "f16".into(),
+        }
+    }
+
+    /// Reference (independent) decode attention, computed head-by-head in f64.
+    fn ref_decode(
+        isl: &DecodeAttnIsland,
+        q: &[f32],
+        mask: &[f32],
+        kc: &[f32],
+        kd: &[f32],
+        vc: &[f32],
+        vd: &[f32],
+    ) -> Vec<f32> {
+        let d = isl.d as usize;
+        let cap = isl.cap as usize;
+        let kvw = isl.kv_cols as usize;
+        let scale = isl.scale as f64;
+        let mut o = vec![0.0f32; isl.q_cols as usize];
+        for hh in 0..isl.h as usize {
+            let qcol = hh * isl.hdc as usize;
+            let kvcol = (hh / isl.gqac as usize) * isl.hdc as usize;
+            let mut s = vec![0.0f64; cap + 1];
+            for j in 0..cap {
+                let mut dot = 0.0f64;
+                for t in 0..d {
+                    dot += q[qcol + t] as f64 * kc[j * kvw + kvcol + t] as f64;
+                }
+                s[j] = scale * dot + mask[j] as f64;
+            }
+            let mut dd = 0.0f64;
+            for t in 0..d {
+                dd += q[qcol + t] as f64 * kd[kvcol + t] as f64;
+            }
+            s[cap] = scale * dd; // diagonal, no mask
+            let gm = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = s.iter().map(|x| (x - gm).exp()).collect();
+            let z: f64 = e.iter().sum();
+            for t in 0..d {
+                let mut acc = 0.0f64;
+                for j in 0..cap {
+                    acc += e[j] * vc[j * kvw + kvcol + t] as f64;
+                }
+                acc += e[cap] * vd[kvcol + t] as f64;
+                o[qcol + t] = (acc / z) as f32;
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn fused_decode_compute_matches_reference() {
+        // GQA: H=4, gqac=2 (2 kv heads), d=3, cap=5.
+        let isl = decode_island(4, 2, 3, 5);
+        let qn = isl.q_cols as usize;
+        let kn = (isl.cap * isl.kv_cols) as usize;
+        let dn = isl.kv_cols as usize;
+        // Deterministic pseudo-random fill.
+        let f =
+            |i: usize, salt: usize| (((i * 2654435761 + salt * 40503) % 211) as f32) / 211.0 - 0.5;
+        let q: Vec<f32> = (0..qn).map(|i| f(i, 1)).collect();
+        let mask: Vec<f32> = (0..isl.cap as usize).map(|i| f(i, 2) * 4.0).collect();
+        let kc: Vec<f32> = (0..kn).map(|i| f(i, 3)).collect();
+        let kd: Vec<f32> = (0..dn).map(|i| f(i, 4)).collect();
+        let vc: Vec<f32> = (0..kn).map(|i| f(i, 5)).collect();
+        let vd: Vec<f32> = (0..dn).map(|i| f(i, 6)).collect();
+
+        let mut got = vec![0.0f32; qn];
+        isl.compute_f32(&q, &mask, &kc, &kd, &vc, &vd, &mut got);
+        let want = ref_decode(&isl, &q, &mask, &kc, &kd, &vc, &vd);
+        let max_abs = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 1e-5, "fused vs reference max_abs {max_abs}");
+    }
+
+    /// Build a synthetic decode-attention IR for `H` heads (gqac, d, cap) in the
+    /// EXACT op shape the real decode emit uses, so `recognize_head_attention_decode`
+    /// exercises the real recognition path (constants, addi-folded kvcol, the two-
+    /// block QKᵀ/softmax/AV chain).
+    fn build_decode_func(h: i64, gqac: i64, d: i64, cap: i64) -> IRFunction {
+        let kv_cols = (h / gqac) * d;
+        let q_cols = h * d;
+        let mut ops: Vec<Operation> = Vec::new();
+        let v = |n: &str| n.to_string();
+        ops.push(
+            Operation::new(Some("%c0"), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+        );
+        ops.push(mk_view("%view0", "%q", &[1, q_cols], "f16"));
+        ops.push(mk_view("%view1", "%o", &[1, q_cols], "f16"));
+        ops.push(mk_view("%view2", "%mask", &[1, cap], "f16"));
+        ops.push(mk_view("%view5", "%kc", &[cap, kv_cols], "f16"));
+        ops.push(mk_view("%view6", "%kd", &[1, kv_cols], "f16"));
+        ops.push(mk_view("%view7", "%vc", &[cap, kv_cols], "f16"));
+        ops.push(mk_view("%view8", "%vd", &[1, kv_cols], "f16"));
+        ops.push(
+            Operation::new(Some("%scale"), "arith.constant", &[])
+                .with_attr("value", Attr::Float(0.125)),
+        );
+        ops.push(
+            Operation::new(Some("%ninf"), "arith.constant", &[])
+                .with_attr("value", Attr::Float(-1.0e38)),
+        );
+        // shared mask load.
+        ops.push(
+            Operation::new(
+                Some("%macc"),
+                "ktdp.construct_access_tile",
+                &["%view2", "%c0", "%c0"],
+            )
+            .with_attr("shape", Attr::IntList(vec![1, cap])),
+        );
+        ops.push(Operation::new(Some("%mload"), "ktdp.load", &["%macc"]));
+        let mut id = 0usize;
+        let nm = |tag: &str, id: &mut usize| {
+            *id += 1;
+            format!("%{tag}{id}")
+        };
+        for hh in 0..h {
+            let qcol = hh * d;
+            let kvcol = (hh / gqac) * d;
+            let qc = nm("qcol", &mut id);
+            ops.push(
+                Operation::new(Some(&qc), "arith.constant", &[])
+                    .with_attr("value", Attr::Int(qcol)),
+            );
+            let kvc = nm("kvcol", &mut id);
+            ops.push(
+                Operation::new(Some(&kvc), "arith.constant", &[])
+                    .with_attr("value", Attr::Int(kvcol)),
+            );
+            // Q load.
+            let qacc = nm("qacc", &mut id);
+            ops.push(
+                Operation::new(
+                    Some(&qacc),
+                    "ktdp.construct_access_tile",
+                    &["%view0", "%c0", &qc],
+                )
+                .with_attr("shape", Attr::IntList(vec![1, d])),
+            );
+            let q = nm("q", &mut id);
+            ops.push(Operation::new(Some(&q), "ktdp.load", &[&qacc]));
+            // CONTEXT: Kc [cap,d] at [0, kvcol] (folded as addi(0, kvcol)).
+            let kcs = nm("kcs", &mut id);
+            ops.push(
+                Operation::new(Some(&kcs), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+            );
+            let kcc = nm("kcc", &mut id);
+            ops.push(Operation::new(Some(&kcc), "arith.addi", &[&kcs, &kvc]));
+            let kcacc = nm("kcacc", &mut id);
+            ops.push(
+                Operation::new(
+                    Some(&kcacc),
+                    "ktdp.construct_access_tile",
+                    &["%view5", "%c0", &kcc],
+                )
+                .with_attr("shape", Attr::IntList(vec![cap, d])),
+            );
+            let kc = nm("kc", &mut id);
+            ops.push(Operation::new(Some(&kc), "ktdp.load", &[&kcacc]));
+            let kct = nm("kct", &mut id);
+            ops.push(
+                Operation::new(Some(&kct), "linalg.transpose", &[&kc, &kc])
+                    .with_attr("permutation", Attr::IntList(vec![1, 0])),
+            );
+            let scr = nm("scr", &mut id);
+            ops.push(Operation::new(Some(&scr), "linalg.matmul", &[&q, &kct, &q]));
+            let scsp = nm("scsp", &mut id);
+            ops.push(mk_splat(&scsp, "%scale", &[1, cap], "f16"));
+            let scl = nm("scl", &mut id);
+            ops.push(Operation::new(Some(&scl), "arith.mulf", &[&scr, &scsp]));
+            let scm = nm("scm", &mut id);
+            ops.push(Operation::new(Some(&scm), "arith.addf", &[&scl, "%mload"]));
+            let mi = nm("mi", &mut id);
+            ops.push(mk_splat(&mi, "%ninf", &[1], "f16"));
+            let mx = nm("mx", &mut id);
+            ops.push(mk_reduce(&mx, &scm, &mi, "arith.maximumf"));
+            // DIAGONAL: Kd [1,d] at [0, kvcol].
+            let kds = nm("kds", &mut id);
+            ops.push(
+                Operation::new(Some(&kds), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+            );
+            let kdc = nm("kdc", &mut id);
+            ops.push(Operation::new(Some(&kdc), "arith.addi", &[&kds, &kvc]));
+            let kdacc = nm("kdacc", &mut id);
+            ops.push(
+                Operation::new(
+                    Some(&kdacc),
+                    "ktdp.construct_access_tile",
+                    &["%view6", "%c0", &kdc],
+                )
+                .with_attr("shape", Attr::IntList(vec![1, d])),
+            );
+            let kd = nm("kd", &mut id);
+            ops.push(Operation::new(Some(&kd), "ktdp.load", &[&kdacc]));
+            let kdt = nm("kdt", &mut id);
+            ops.push(
+                Operation::new(Some(&kdt), "linalg.transpose", &[&kd, &kd])
+                    .with_attr("permutation", Attr::IntList(vec![1, 0])),
+            );
+            let sdr = nm("sdr", &mut id);
+            ops.push(Operation::new(Some(&sdr), "linalg.matmul", &[&q, &kdt, &q]));
+            let sdsp = nm("sdsp", &mut id);
+            ops.push(mk_splat(&sdsp, "%scale", &[1, 1], "f16"));
+            let sdl = nm("sdl", &mut id);
+            ops.push(Operation::new(Some(&sdl), "arith.mulf", &[&sdr, &sdsp]));
+            let mdi = nm("mdi", &mut id);
+            ops.push(mk_splat(&mdi, "%ninf", &[1], "f16"));
+            let mxd = nm("mxd", &mut id);
+            ops.push(mk_reduce(&mxd, &sdl, &mdi, "arith.maximumf"));
+            // combine + exp + sums.
+            let gm = nm("gm", &mut id);
+            ops.push(Operation::new(Some(&gm), "arith.maximumf", &[&mx, &mxd]));
+            let gmb = nm("gmb", &mut id);
+            ops.push(mk_splat(&gmb, &gm, &[1, cap], "f16"));
+            let sh = nm("sh", &mut id);
+            ops.push(Operation::new(Some(&sh), "arith.subf", &[&scm, &gmb]));
+            let ex = nm("ex", &mut id);
+            ops.push(Operation::new(Some(&ex), "math.exp", &[&sh]));
+            let zi = nm("zi", &mut id);
+            ops.push(mk_splat(&zi, "%ninf", &[1], "f16"));
+            let su = nm("su", &mut id);
+            ops.push(mk_reduce(&su, &ex, &zi, "arith.addf"));
+            let gmbd = nm("gmbd", &mut id);
+            ops.push(mk_splat(&gmbd, &gm, &[1, 1], "f16"));
+            let shd = nm("shd", &mut id);
+            ops.push(Operation::new(Some(&shd), "arith.subf", &[&sdl, &gmbd]));
+            let exd = nm("exd", &mut id);
+            ops.push(Operation::new(Some(&exd), "math.exp", &[&shd]));
+            let zid = nm("zid", &mut id);
+            ops.push(mk_splat(&zid, "%ninf", &[1], "f16"));
+            let sud = nm("sud", &mut id);
+            ops.push(mk_reduce(&sud, &exd, &zid, "arith.addf"));
+            let gs = nm("gs", &mut id);
+            ops.push(Operation::new(Some(&gs), "arith.addf", &[&su, &sud]));
+            let gsb = nm("gsb", &mut id);
+            ops.push(mk_splat(&gsb, &gs, &[1, cap], "f16"));
+            let w = nm("w", &mut id);
+            ops.push(Operation::new(Some(&w), "arith.divf", &[&ex, &gsb]));
+            let gsbd = nm("gsbd", &mut id);
+            ops.push(mk_splat(&gsbd, &gs, &[1, 1], "f16"));
+            let wd = nm("wd", &mut id);
+            ops.push(Operation::new(Some(&wd), "arith.divf", &[&exd, &gsbd]));
+            // AV.
+            let vcs = nm("vcs", &mut id);
+            ops.push(
+                Operation::new(Some(&vcs), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+            );
+            let vcc = nm("vcc", &mut id);
+            ops.push(Operation::new(Some(&vcc), "arith.addi", &[&vcs, &kvc]));
+            let vcacc = nm("vcacc", &mut id);
+            ops.push(
+                Operation::new(
+                    Some(&vcacc),
+                    "ktdp.construct_access_tile",
+                    &["%view7", "%c0", &vcc],
+                )
+                .with_attr("shape", Attr::IntList(vec![cap, d])),
+            );
+            let vc = nm("vc", &mut id);
+            ops.push(Operation::new(Some(&vc), "ktdp.load", &[&vcacc]));
+            let ov = nm("ov", &mut id);
+            ops.push(Operation::new(Some(&ov), "linalg.matmul", &[&w, &vc, &w]));
+            let vds = nm("vds", &mut id);
+            ops.push(
+                Operation::new(Some(&vds), "arith.constant", &[]).with_attr("value", Attr::Int(0)),
+            );
+            let vdc = nm("vdc", &mut id);
+            ops.push(Operation::new(Some(&vdc), "arith.addi", &[&vds, &kvc]));
+            let vdacc = nm("vdacc", &mut id);
+            ops.push(
+                Operation::new(
+                    Some(&vdacc),
+                    "ktdp.construct_access_tile",
+                    &["%view8", "%c0", &vdc],
+                )
+                .with_attr("shape", Attr::IntList(vec![1, d])),
+            );
+            let vd = nm("vd", &mut id);
+            ops.push(Operation::new(Some(&vd), "ktdp.load", &[&vdacc]));
+            let ovd = nm("ovd", &mut id);
+            ops.push(Operation::new(
+                Some(&ovd),
+                "linalg.matmul",
+                &[&wd, &vd, &wd],
+            ));
+            let oa = nm("oa", &mut id);
+            ops.push(Operation::new(Some(&oa), "arith.addf", &[&ov, &ovd]));
+            let oacc = nm("oacc", &mut id);
+            ops.push(
+                Operation::new(
+                    Some(&oacc),
+                    "ktdp.construct_access_tile",
+                    &["%view1", "%c0", &qc],
+                )
+                .with_attr("shape", Attr::IntList(vec![1, d])),
+            );
+            ops.push(Operation::new(None, "ktdp.store", &[&oa, &oacc]));
+        }
+        ops.push(Operation::new(None, "func.return", &[]));
+        IRFunction {
+            name: "decode_attn".into(),
+            arguments: vec![
+                (v("%q"), "index".into()),
+                (v("%o"), "index".into()),
+                (v("%mask"), "index".into()),
+                (v("%kc"), "index".into()),
+                (v("%kd"), "index".into()),
+                (v("%vc"), "index".into()),
+                (v("%vd"), "index".into()),
+            ],
+            operations: ops,
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    #[test]
+    fn recognizes_decode_island_gqa() {
+        // smollm-shaped: H=9, gqac=3, d=64, cap=64.
+        let f = build_decode_func(9, 3, 64, 64);
+        let isl = recognize_head_attention_decode(&f).expect("decode island");
+        assert_eq!(isl.h, 9);
+        assert_eq!(isl.gqac, 3);
+        assert_eq!(isl.hdc, 64);
+        assert_eq!(isl.d, 64);
+        assert_eq!(isl.cap, 64);
+        assert_eq!(isl.q_cols, 9 * 64);
+        assert_eq!(isl.kv_cols, 3 * 64);
+        assert_eq!(isl.scale, 0.125);
+        assert_eq!(isl.q_arg, "%q");
+        assert_eq!(isl.o_arg, "%o");
+    }
+
+    #[test]
+    fn recognizes_decode_island_llama_gqa() {
+        // llama-shaped: H=32, gqac=4, d=64, cap=64.
+        let f = build_decode_func(32, 4, 64, 64);
+        let isl = recognize_head_attention_decode(&f).expect("decode island");
+        assert_eq!(isl.h, 32);
+        assert_eq!(isl.gqac, 4);
+    }
+
+    #[test]
+    fn decode_recognizer_rejects_grid_gt1() {
+        let mut f = build_decode_func(4, 2, 3, 5);
+        f.grid = (4, 1, 1);
+        assert!(recognize_head_attention_decode(&f).is_none());
+    }
+
+    #[test]
+    fn decode_recognizer_rejects_non_attention() {
+        // A plain copy func (no QKᵀ/softmax/AV) -> None.
+        let f = IRFunction {
+            name: "copy".into(),
+            arguments: vec![
+                ("%in".into(), "index".into()),
+                ("%out".into(), "index".into()),
+            ],
+            grid: (1, 1, 1),
+            return_type: None,
+            operations: vec![
+                mk_view("%vi", "%in", &[1, 64], "f16"),
+                Operation::new(
+                    Some("%ti"),
+                    "ktdp.construct_access_tile",
+                    &["%vi", "%c0", "%c0"],
+                )
+                .with_attr("shape", Attr::IntList(vec![1, 64])),
+                Operation::new(Some("%l"), "ktdp.load", &["%ti"]),
+                mk_view("%vo", "%out", &[1, 64], "f16"),
+                Operation::new(
+                    Some("%to"),
+                    "ktdp.construct_access_tile",
+                    &["%vo", "%c0", "%c0"],
+                )
+                .with_attr("shape", Attr::IntList(vec![1, 64])),
+                Operation::new(None, "ktdp.store", &["%l", "%to"]),
+            ],
+        };
+        assert!(recognize_head_attention_decode(&f).is_none());
     }
 }

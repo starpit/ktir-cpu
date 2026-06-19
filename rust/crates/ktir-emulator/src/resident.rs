@@ -275,6 +275,14 @@ pub struct ResidentExecutor {
     /// time `last_token_only` is enabled for a `run_program(idx)`. `[idx]` holds the
     /// rewritten `(segments, result-segment-index)` so the rewrite is done once.
     last_token_segs: std::cell::RefCell<HashMap<usize, Vec<Segment>>>,
+    /// Run isolated decode (m=1) attention segments via the fused CPU GEMV/softmax
+    /// path instead of the decomposed op storm. Read once at construction (the
+    /// planner gates the segment isolation on the same env var, so this only needs
+    /// to recognize+compute the now-Native node). Default `true` — the fused path
+    /// is a measured win (llama decode ~1.33x, smollm2 ~2.0x) and golden-faithful
+    /// (max-abs identical to the decomposed oracle). Set `KTIR_NO_FUSE_ATTN` to
+    /// opt out (falls back to the decomposed oracle path).
+    fuse_attn: bool,
 }
 
 // SAFETY: `ResidentExecutor` owns its ENTIRE object graph exclusively. The
@@ -427,7 +435,67 @@ impl ResidentExecutor {
             seg_keys: std::cell::RefCell::new(HashMap::new()),
             last_token_only: false,
             last_token_segs: std::cell::RefCell::new(HashMap::new()),
+            fuse_attn: std::env::var_os("KTIR_NO_FUSE_ATTN").is_none(),
         })
+    }
+
+    /// FUSED CPU m=1 ATTENTION. Resolve each island arg to its resident HBM stick
+    /// (via `node.bindings`: arg name → tensor id → stick → byte addr), decode the
+    /// f16 inputs to f32, run [`DecodeAttnIsland::compute_f32`], and write the f16
+    /// output row back to the O tensor's stick. Reproduces the decomposed path's
+    /// exact arithmetic per head with f32 accumulation (golden-faithful), at ~3·H
+    /// primitives instead of the ~1500-op decomposed storm.
+    fn run_fused_decode_attention(
+        &self,
+        node: &NodeSpec,
+        island: &ktir_optimizer::head_rewrite::DecodeAttnIsland,
+    ) -> Result<(), String> {
+        // arg name (e.g. "%t339_ptr") -> tensor id, from the node bindings.
+        let arg_tid: HashMap<&str, u64> = node
+            .bindings
+            .iter()
+            .map(|b| (b.arg.as_str(), b.tensor))
+            .collect();
+        let read_arg = |arg: &str, n: usize| -> Result<Vec<f32>, String> {
+            let tid = *arg_tid
+                .get(arg)
+                .ok_or_else(|| format!("fused attn: arg {arg} not bound"))?;
+            let s = *self
+                .stick
+                .get(&tid)
+                .ok_or_else(|| format!("fused attn: tensor t{tid} has no resident stick"))?;
+            let nbytes = n * self.dtype.bytes_per_elem();
+            let bytes = self.mem.hbm.borrow().read_bytes(s * STICK_BYTES, nbytes);
+            Ok(crate::codec::decode(&bytes, n, self.dtype))
+        };
+
+        let q_cols = island.q_cols as usize;
+        let cap = island.cap as usize;
+        let kv_cols = island.kv_cols as usize;
+        let q = read_arg(&island.q_arg, q_cols)?;
+        let mask = read_arg(&island.mask_arg, cap)?;
+        let kc = read_arg(&island.kc_arg, cap * kv_cols)?;
+        let kd = read_arg(&island.kd_arg, kv_cols)?;
+        let vc = read_arg(&island.vc_arg, cap * kv_cols)?;
+        let vd = read_arg(&island.vd_arg, kv_cols)?;
+
+        let mut o = vec![0.0f32; q_cols];
+        island.compute_f32(&q, &mask, &kc, &kd, &vc, &vd, &mut o);
+
+        // Write the output row back to the O tensor's stick as f16.
+        let o_tid = *arg_tid
+            .get(island.o_arg.as_str())
+            .ok_or_else(|| format!("fused attn: output arg {} not bound", island.o_arg))?;
+        let o_stick = *self
+            .stick
+            .get(&o_tid)
+            .ok_or_else(|| format!("fused attn: output t{o_tid} has no resident stick"))?;
+        let obytes = crate::codec::encode(&o, self.dtype);
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(o_stick * STICK_BYTES, &obytes);
+        Ok(())
     }
 
     /// Enable/disable LAST-TOKEN-ONLY mode. When ON, the final result-producing
@@ -688,26 +756,53 @@ impl ResidentExecutor {
                 }
                 Segment::Native(node) => {
                     let func = self.programs[idx].module.get_function(&node.func)?;
-                    let grid = func.grid;
-                    let mut input_ptrs: Vec<(String, Value)> =
-                        Vec::with_capacity(node.bindings.len());
-                    for b in &node.bindings {
-                        let name = b.arg.trim_start_matches('%').to_string();
-                        let s = *self.stick.get(&b.tensor).ok_or_else(|| {
-                            format!("native attn arg t{} has no resident stick", b.tensor)
-                        })?;
-                        input_ptrs.push((name, Value::Index(s)));
+                    // FUSED CPU m=1 ATTENTION (default ON; opt out via
+                    // KTIR_NO_FUSE_ATTN): when the native segment recognizes as the
+                    // decode (m=1) attention island, compute it directly with
+                    // BLAS-style GEMV + softmax + GEMV per head against resident HBM
+                    // — collapsing the ~1500-op decomposed storm to ~3·H primitives.
+                    // Default-on: the planner isolates this node into a Native
+                    // segment unless KTIR_NO_FUSE_ATTN is set (then it stays folded
+                    // in a Fused segment, decomposed — the oracle path), so
+                    // recognition here is the steady-state path for an isolated m=1
+                    // attention node. If recognition fails (a non-decode native
+                    // node), fall through to the decomposed grid run below.
+                    let fused = if self.fuse_attn {
+                        if let Some(island) =
+                            ktir_optimizer::head_rewrite::recognize_head_attention_decode(func)
+                        {
+                            self.run_fused_decode_attention(node, &island)?;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if fused {
+                        // computed in fused path; outputs already resident in HBM.
+                    } else {
+                        let grid = func.grid;
+                        let mut input_ptrs: Vec<(String, Value)> =
+                            Vec::with_capacity(node.bindings.len());
+                        for b in &node.bindings {
+                            let name = b.arg.trim_start_matches('%').to_string();
+                            let s = *self.stick.get(&b.tensor).ok_or_else(|| {
+                                format!("native attn arg t{} has no resident stick", b.tensor)
+                            })?;
+                            input_ptrs.push((name, Value::Index(s)));
+                        }
+                        // No per-segment read-back (outputs flow via HBM; see the
+                        // Fused arm) — the final read-back below decodes the results.
+                        let key = self.seg_plan_key(&func.operations);
+                        execute_function_in_exec_only(
+                            &self.mem,
+                            &func.operations,
+                            grid,
+                            &input_ptrs,
+                            Some(key),
+                        )?;
                     }
-                    // No per-segment read-back (outputs flow via HBM; see the Fused
-                    // arm) — the final read-back below decodes the requested results.
-                    let key = self.seg_plan_key(&func.operations);
-                    execute_function_in_exec_only(
-                        &self.mem,
-                        &func.operations,
-                        grid,
-                        &input_ptrs,
-                        Some(key),
-                    )?;
                 }
             }
             if diag || seg_prof {
