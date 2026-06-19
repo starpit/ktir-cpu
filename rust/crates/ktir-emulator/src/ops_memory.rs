@@ -1152,23 +1152,64 @@ fn decode_gather(raw: &[u8], offsets: &[i64], dtype: DType) -> Vec<f32> {
     if offsets.iter().enumerate().all(|(i, &o)| o == i as i64) {
         return decode(raw, dtype, offsets.len());
     }
-    let bpe = dtype.bytes_per_elem();
+    // Hoist the dtype dispatch OUT of the per-element loop: `dtype` is constant
+    // across the gather, so each tight loop below decodes one fixed element type
+    // (the f16 KV-gather is a u16->f32 loop with no per-element match). The
+    // `raw.get(..)` OOB-as-0.0 / short-pad semantics are preserved exactly.
     let mut out = Vec::with_capacity(offsets.len());
-    for &o in offsets {
-        let off = o as usize * bpe;
-        let v = match (dtype, raw.get(off..off + bpe)) {
-            (_, None) => 0.0,
-            (DType::F16, Some(c)) => {
-                crate::codec::f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]))
+    match dtype {
+        DType::F16 => {
+            for &o in offsets {
+                let off = o as usize * 2;
+                let v = match raw.get(off..off + 2) {
+                    Some(c) => crate::codec::f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])),
+                    None => 0.0,
+                };
+                out.push(v);
             }
-            (DType::F32, Some(c)) => f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-            (DType::I32, Some(c)) => i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32,
-            (DType::I64, Some(c)) => {
-                i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
+        }
+        DType::F32 => {
+            for &o in offsets {
+                let off = o as usize * 4;
+                let v = match raw.get(off..off + 4) {
+                    Some(c) => f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    None => 0.0,
+                };
+                out.push(v);
             }
-            (DType::Bool, Some(c)) => (c[0] != 0) as i32 as f32,
-        };
-        out.push(v);
+        }
+        DType::I32 => {
+            for &o in offsets {
+                let off = o as usize * 4;
+                let v = match raw.get(off..off + 4) {
+                    Some(c) => i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32,
+                    None => 0.0,
+                };
+                out.push(v);
+            }
+        }
+        DType::I64 => {
+            for &o in offsets {
+                let off = o as usize * 8;
+                let v = match raw.get(off..off + 8) {
+                    Some(c) => {
+                        i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
+                    }
+                    None => 0.0,
+                };
+                out.push(v);
+            }
+        }
+        DType::Bool => {
+            for &o in offsets {
+                let off = o;
+                let v = match raw.get(off as usize..off as usize + 1) {
+                    Some(c) => (c[0] != 0) as i32 as f32,
+                    None => 0.0,
+                };
+                out.push(v);
+            }
+        }
     }
     out
 }
@@ -1291,34 +1332,101 @@ fn flat_memory_offsets(
     stick_bytes: Option<i64>,
 ) -> (Vec<i64>, Option<usize>) {
     let bpe = dtype.bytes_per_elem() as i64;
-    let mut offsets = Vec::new();
     let mut sticks: Option<std::collections::HashSet<i64>> =
         stick_bytes.map(|_| std::collections::HashSet::new());
 
-    let mut emit = |coord: &[i64]| {
-        let o: i64 = coord.iter().zip(strides).map(|(&c, &s)| c * s).sum();
-        offsets.push(o);
-        if let (Some(set), Some(sb)) = (sticks.as_mut(), stick_bytes) {
-            set.insert((base_ptr + o * bpe) / sb);
-        }
-    };
-
     match coords {
         Some(cs) => {
-            for c in cs {
-                emit(c);
+            // Pre-size to the coord count; specialize the small-rank `coord·strides`
+            // dot (the KV reads are 2-D) to direct multiply-adds, skipping the
+            // iterator-zip-sum.
+            let mut offsets = Vec::with_capacity(cs.len());
+            match strides.len() {
+                2 => {
+                    let (s0, s1) = (strides[0], strides[1]);
+                    for c in cs {
+                        let o = c[0] * s0 + c[1] * s1;
+                        offsets.push(o);
+                        if let (Some(set), Some(sb)) = (sticks.as_mut(), stick_bytes) {
+                            set.insert((base_ptr + o * bpe) / sb);
+                        }
+                    }
+                }
+                3 => {
+                    let (s0, s1, s2) = (strides[0], strides[1], strides[2]);
+                    for c in cs {
+                        let o = c[0] * s0 + c[1] * s1 + c[2] * s2;
+                        offsets.push(o);
+                        if let (Some(set), Some(sb)) = (sticks.as_mut(), stick_bytes) {
+                            set.insert((base_ptr + o * bpe) / sb);
+                        }
+                    }
+                }
+                _ => {
+                    for c in cs {
+                        let o: i64 = c.iter().zip(strides).map(|(&c, &s)| c * s).sum();
+                        offsets.push(o);
+                        if let (Some(set), Some(sb)) = (sticks.as_mut(), stick_bytes) {
+                            set.insert((base_ptr + o * bpe) / sb);
+                        }
+                    }
+                }
             }
+            (offsets, sticks.map(|s| s.len()))
         }
         None => {
-            // np.ndindex(*shape): row-major, rightmost dim innermost.
-            ndindex(shape, &mut emit);
+            // np.ndindex(*shape): row-major, rightmost dim innermost. Pre-size to the
+            // exact element count and walk an INCREMENTAL ODOMETER — maintain the
+            // running offset by +stride[d] per innermost step and the carry fixups on
+            // wrap — instead of a per-element `coord·strides` dot. Empty/zero-extent
+            // shapes match `ndindex` (which emits nothing if any dim is 0, and a single
+            // scalar `0` for the rank-0 case).
+            let n: usize = shape.iter().product();
+            let mut offsets = Vec::with_capacity(n);
+            if shape.is_empty() {
+                // Rank-0: a single element at offset 0 (matches `ndindex(&[])`).
+                offsets.push(0);
+                if let (Some(set), Some(sb)) = (sticks.as_mut(), stick_bytes) {
+                    set.insert(base_ptr / sb);
+                }
+                return (offsets, sticks.map(|s| s.len()));
+            }
+            if n == 0 {
+                return (offsets, sticks.map(|s| s.len()));
+            }
+            let nd = shape.len();
+            let mut idx = vec![0i64; nd];
+            let mut off: i64 = 0;
+            loop {
+                offsets.push(off);
+                if let (Some(set), Some(sb)) = (sticks.as_mut(), stick_bytes) {
+                    set.insert((base_ptr + off * bpe) / sb);
+                }
+                // Advance the rightmost (innermost) axis; carry left, subtracting the
+                // wrapped axis's full span and adding the next axis's stride.
+                let mut d = nd;
+                loop {
+                    if d == 0 {
+                        return (offsets, sticks.map(|s| s.len()));
+                    }
+                    d -= 1;
+                    idx[d] += 1;
+                    off += strides[d];
+                    if (idx[d] as usize) < shape[d] {
+                        break;
+                    }
+                    idx[d] = 0;
+                    off -= strides[d] * shape[d] as i64;
+                }
+            }
         }
     }
-
-    (offsets, sticks.map(|s| s.len()))
 }
 
-/// Iterate the cartesian index space of `shape` in row-major order.
+/// Iterate the cartesian index space of `shape` in row-major order. Retained as
+/// the reference odometer the `flat_memory_offsets` incremental walk is checked
+/// against (its only callers are the unit tests below).
+#[cfg(test)]
 fn ndindex(shape: &[usize], f: &mut impl FnMut(&[i64])) {
     if shape.is_empty() {
         f(&[]);

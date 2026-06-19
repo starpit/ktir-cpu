@@ -1046,6 +1046,9 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
 }
 
 /// Convert a flat row-major index into a multi-index for `shape`.
+/// Only the unit tests (cross-checking the block-copy slice/concat) still use
+/// this — the hot paths walk contiguous spans, not per-element multi-indices.
+#[cfg(test)]
 fn unravel(mut lin: usize, shape: &[usize]) -> Vec<usize> {
     let strides = row_major_strides(shape);
     let mut idx = vec![0usize; shape.len()];
@@ -1111,6 +1114,11 @@ fn broadcast_to(data: &[f32], from_shape: &[usize], to_shape: &[usize]) -> Optio
 
 /// Slice `data` (logical `shape`) along `axis` for `[lo, hi)`. Returns the
 /// sliced flat data and its shape.
+///
+/// Row-major slicing along one axis is a sequence of contiguous block copies:
+/// everything to the right of `axis` (the `inner` block) stays contiguous in the
+/// source, so for each `(outer, j)` pair we `copy_from_slice` an `inner`-element
+/// run rather than gathering element-by-element (no per-element `unravel` + dot).
 fn slice_along(
     data: &[f32],
     shape: &[usize],
@@ -1120,14 +1128,21 @@ fn slice_along(
 ) -> (Vec<f32>, Vec<usize>) {
     let mut out_shape = shape.to_vec();
     out_shape[axis] = hi - lo;
-    let strides = row_major_strides(shape);
     let total: usize = out_shape.iter().product();
+
+    let src_axis = shape[axis];
+    let out_axis = hi - lo;
+    let inner: usize = shape[axis + 1..].iter().product();
+    let outer: usize = shape[..axis].iter().product();
+
     let mut out = vec![0.0f32; total];
-    for (lin, slot) in out.iter_mut().enumerate() {
-        let mut idx = unravel(lin, &out_shape);
-        idx[axis] += lo; // shift into the source's coordinate frame
-        let src: usize = idx.iter().zip(&strides).map(|(&c, &s)| c * s).sum();
-        *slot = data[src];
+    let src_row = src_axis * inner; // one outer-slab in the source
+    let dst_row = out_axis * inner; // one outer-slab in the output
+    for o in 0..outer {
+        let src_base = o * src_row + lo * inner;
+        let dst_base = o * dst_row;
+        let span = out_axis * inner;
+        out[dst_base..dst_base + span].copy_from_slice(&data[src_base..src_base + span]);
     }
     (out, out_shape)
 }
@@ -1145,26 +1160,29 @@ fn concat_along(a: &[f32], a_shape: &[usize], b: &[f32], axis: usize) -> Vec<f32
         .product();
     let b_extent = b.len().checked_div(outer).unwrap_or(0);
 
+    let a_axis = a_shape[axis];
+    let out_axis = a_axis + b_extent;
     let mut out_shape = a_shape.to_vec();
-    out_shape[axis] = a_shape[axis] + b_extent;
+    out_shape[axis] = out_axis;
     let total: usize = out_shape.iter().product();
-    let a_strides = row_major_strides(a_shape);
-    let mut b_shape = a_shape.to_vec();
-    b_shape[axis] = b_extent;
-    let b_strides = row_major_strides(&b_shape);
+
+    // Row-major concat along one axis is a per-outer-slab interleave of two
+    // contiguous blocks: a's `a_axis*inner` run followed by b's `b_extent*inner`
+    // run. Block-copy each (no per-element `unravel` + dot).
+    let inner: usize = a_shape[axis + 1..].iter().product();
+    let outer: usize = a_shape[..axis].iter().product();
+    let a_block = a_axis * inner;
+    let b_block = b_extent * inner;
+    let dst_row = out_axis * inner;
 
     let mut out = vec![0.0f32; total];
-    for (lin, slot) in out.iter_mut().enumerate() {
-        let idx = unravel(lin, &out_shape);
-        if idx[axis] < a_shape[axis] {
-            let src: usize = idx.iter().zip(&a_strides).map(|(&c, &s)| c * s).sum();
-            *slot = a[src];
-        } else {
-            let mut bidx = idx.clone();
-            bidx[axis] -= a_shape[axis];
-            let src: usize = bidx.iter().zip(&b_strides).map(|(&c, &s)| c * s).sum();
-            *slot = b[src];
-        }
+    for o in 0..outer {
+        let dst_base = o * dst_row;
+        let a_base = o * a_block;
+        out[dst_base..dst_base + a_block].copy_from_slice(&a[a_base..a_base + a_block]);
+        let b_base = o * b_block;
+        out[dst_base + a_block..dst_base + a_block + b_block]
+            .copy_from_slice(&b[b_base..b_base + b_block]);
     }
     out
 }

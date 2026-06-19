@@ -3513,9 +3513,10 @@ pub struct NaxGemm {
         >,
     >,
     /// f16-B (`KTIR_B_F16`) variants — same kernels, B read as `half` (the
-    /// `KTIR_F16_WEIGHTS` path). `None` on the simdgroup (pre-M5) tier. Selected by
-    /// `matmul_unified` when the B `UnifiedBuffer` is f16. Mirror the f32 set:
-    /// plain / transpose-B / small-M / small-M-transpose-B.
+    /// `KTIR_F16_WEIGHTS` path). The full-block plain / transpose-B variants are
+    /// built on BOTH tiers (so a pre-M5 device streams f16 weights too); the
+    /// small-M `*_sm_*` variants are NAX-only (the simdgroup kernel has no small-M
+    /// block). Selected by `matmul_unified` when the B `UnifiedBuffer` is f16.
     pipeline_f16b: Option<
         objc2::rc::Retained<
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
@@ -3572,8 +3573,10 @@ fn aot_metallib_bytes(stem: &str) -> Option<&'static [u8]> {
         "nax_matmul__tb1_sm1_f16b1" => lib!("nax_matmul__tb1_sm1_f16b1"),
         "nax_gemv__tb0" => lib!("nax_gemv__tb0"),
         "nax_gemv__tb1" => lib!("nax_gemv__tb1"),
-        "simd_matmul__tb0" => lib!("simd_matmul__tb0"),
-        "simd_matmul__tb1" => lib!("simd_matmul__tb1"),
+        "simd_matmul__tb0_f16b0" => lib!("simd_matmul__tb0_f16b0"),
+        "simd_matmul__tb1_f16b0" => lib!("simd_matmul__tb1_f16b0"),
+        "simd_matmul__tb0_f16b1" => lib!("simd_matmul__tb0_f16b1"),
+        "simd_matmul__tb1_f16b1" => lib!("simd_matmul__tb1_f16b1"),
         _ => return None,
     })
 }
@@ -3678,9 +3681,10 @@ impl NaxGemm {
         Self::compile(Some(false))
     }
 
-    /// Whether this engine compiled the f16-B GEMM pipelines (NAX devices only).
-    /// Callers must check this before handing `matmul_unified` an f16 B buffer — on
-    /// a non-NAX device the f16 variants are `None` and only f32 B is supported.
+    /// Whether this engine compiled the f16-B GEMM pipelines. Built on both the NAX
+    /// and simdgroup tiers (the full-block plain + transpose-B variants), so this is
+    /// true on every supported device; callers check it before handing
+    /// `matmul_unified` an f16 B buffer.
     pub fn has_f16_b_pipelines(&self) -> bool {
         self.pipeline_bt_f16b.is_some() && self.pipeline_f16b.is_some()
     }
@@ -3733,8 +3737,11 @@ impl NaxGemm {
             {
                 let stem = if stem_prefix == "nax_matmul" {
                     format!("nax_matmul__tb{tb}_sm{sm}_f16b{f16b}")
+                } else if stem_prefix == "simd_matmul" {
+                    // simd matmul varies by transpose_b and f16-B (no small-M block).
+                    format!("simd_matmul__tb{tb}_f16b{f16b}")
                 } else {
-                    // gemv / simd variants only vary by transpose_b.
+                    // gemv varies by transpose_b only.
                     format!("{stem_prefix}__tb{tb}")
                 };
                 // Ok(p) -> Some(p) (use the AOT pipeline); Err -> None (JIT fallback).
@@ -3864,17 +3871,22 @@ impl NaxGemm {
                     format!("metal: {kname} small-M f16b pipeline failed (tb={tb}): {e:?}")
                 })
         };
-        // f16-B GEMM variants — NAX-only (the simdgroup tier stays f32).
-        let (pipeline_f16b, pipeline_bt_f16b, pipeline_sm_f16b, pipeline_sm_bt_f16b) = if is_nax {
+        // f16-B GEMM variants — built on BOTH tiers so a pre-M5 device streams f16
+        // weights (half the bytes) instead of f32. The full-block plain/transpose-B
+        // variants exist on every tier; the small-M (`KTIR_SGS_M=1`) variants are
+        // NAX-only (the simdgroup kernel has no small-M block, like the f32 set).
+        let (pipeline_f16b, pipeline_bt_f16b) = (
+            Some(match aot(mm_prefix, kname, 0, 0, 1) {
+                Some(p) => p,
+                None => build_f16b(src, kname, 0)?,
+            }),
+            Some(match aot(mm_prefix, kname, 1, 0, 1) {
+                Some(p) => p,
+                None => build_f16b(src, kname, 1)?,
+            }),
+        );
+        let (pipeline_sm_f16b, pipeline_sm_bt_f16b) = if is_nax {
             (
-                Some(match aot(mm_prefix, kname, 0, 0, 1) {
-                    Some(p) => p,
-                    None => build_f16b(src, kname, 0)?,
-                }),
-                Some(match aot(mm_prefix, kname, 1, 0, 1) {
-                    Some(p) => p,
-                    None => build_f16b(src, kname, 1)?,
-                }),
                 Some(match aot(mm_prefix, kname, 0, 1, 1) {
                     Some(p) => p,
                     None => build_small_f16b(0)?,
@@ -3885,7 +3897,7 @@ impl NaxGemm {
                 }),
             )
         } else {
-            (None, None, None, None)
+            (None, None)
         };
         // GEMV kernel — plain MSL, device-tier-independent; built both B-layouts.
         let gemv_pipeline = match aot("nax_gemv", "nax_gemv", 0, 0, 0) {
@@ -4151,8 +4163,8 @@ impl NaxGemm {
         // not M-compute-bound (padded rows are nearly free), so the 32-tall block's
         // 4× fewer threads can HURT GPU occupancy. Kept as a vetted, gated path.
         // f16-B selection: when the B (weight) buffer is f16, use the `KTIR_B_F16`
-        // pipeline variant (B read as `half`). NAX-only — these variants are `None`
-        // on the simdgroup tier (which never gets an f16 B; the resolver gates that).
+        // pipeline variant (B read as `half`). The full-block f16-B variants exist on
+        // both tiers; only the small-M f16-B variants are NAX-only.
         let b_f16 = b.is_f16();
         let small = self.pick_small_m(m, n);
         // The f16-B and small-M variants are Option (None on tiers/configs that
@@ -5108,6 +5120,84 @@ kernel void mpp_probe(
         }
         eprintln!(
             "simdgroup transpose-B matches the bt oracle across {} shapes ✓",
+            TRANSPOSE_B_SHAPES.len()
+        );
+    }
+
+    /// f16-B on the pre-NAX simdgroup kernel: with the `KTIR_B_F16` read path the
+    /// simdgroup tier now streams f16 weights too. Forcing `new_simdgroup` on this
+    /// M5, an f16-B matmul (B read as `half`) must match the f32-B simdgroup result
+    /// within f16 tolerance — both plain (`A·B`) and transpose-B (`A·Bᵀ`). Also
+    /// pins `has_f16_b_pipelines()` true on the simdgroup tier (the gate the GEMM
+    /// resolver checks before handing the kernel an f16 B buffer).
+    #[test]
+    fn simdgroup_matmul_unified_f16_b_matches_f32() {
+        let ctx = match NaxGemm::new_simdgroup() {
+            Ok(c) => c,
+            Err(e) if e.contains("no Metal device") => {
+                eprintln!("no Metal device — skipping simdgroup f16-B test");
+                return;
+            }
+            Err(e) => panic!("simdgroup GEMM compile failed: {e}"),
+        };
+        assert!(
+            ctx.has_f16_b_pipelines(),
+            "simdgroup tier must compile the f16-B pipelines"
+        );
+        for &transpose_b in &[false, true] {
+            for (m, k, n) in TRANSPOSE_B_SHAPES {
+                // Signed, sub-unit values so the f16 rounding of B is exercised (not
+                // exactly representable like small ints) — proves the half read path.
+                let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+                let b: Vec<f32> = (0..n * k).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+                let ua = ctx.unified_from(&a).unwrap();
+                // f32-B reference (still the simdgroup kernel, B as f32).
+                let ub_f32 = ctx.unified_from(&b).unwrap();
+                let mut uc_f32 = ctx.unified(m * n).unwrap();
+                ctx.matmul_unified(
+                    m,
+                    k,
+                    n,
+                    &ua,
+                    &ub_f32,
+                    &mut uc_f32,
+                    None,
+                    Epilogue::NONE,
+                    transpose_b,
+                )
+                .unwrap();
+                // f16-B: B read as `half` via the KTIR_B_F16 pipeline.
+                let ub_f16 = ctx.unified_f16_from_f32(&b).unwrap();
+                assert!(ub_f16.is_f16(), "B buffer must be f16");
+                let mut uc_f16 = ctx.unified(m * n).unwrap();
+                ctx.matmul_unified(
+                    m,
+                    k,
+                    n,
+                    &ua,
+                    &ub_f16,
+                    &mut uc_f16,
+                    None,
+                    Epilogue::NONE,
+                    transpose_b,
+                )
+                .unwrap();
+                let f32_res = uc_f32.as_slice();
+                let f16_res = uc_f16.as_slice();
+                let max_abs = f32_res
+                    .iter()
+                    .zip(f16_res)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs < 0.02,
+                    "simdgroup f16-B vs f32-B mismatch at ({m},{k},{n}) tb={transpose_b}: \
+                     max abs {max_abs} > f16 tol"
+                );
+            }
+        }
+        eprintln!(
+            "simdgroup f16-B matches f32-B within f16 tol across {} shapes x {{plain, tb}} ✓",
             TRANSPOSE_B_SHAPES.len()
         );
     }

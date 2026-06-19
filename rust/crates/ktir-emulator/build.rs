@@ -53,7 +53,8 @@ struct Variant {
 
 /// The FULL variant matrix the runtime `NaxGemm::compile` builds — kept in lockstep
 /// with metal.rs. NAX matmul: 8 variants {transpose_b 0|1} x {full | small-M} x
-/// {f32 | f16-B}. nax_gemv: 2 {transpose_b 0|1}. simdgroup matmul: 2 {transpose_b 0|1}.
+/// {f32 | f16-B}. nax_gemv: 2 {transpose_b 0|1}. simdgroup matmul: 4 {transpose_b
+/// 0|1} x {f32 | f16-B}.
 fn variants() -> Vec<Variant> {
     use Variant as V;
     let mut v = Vec::new();
@@ -88,14 +89,21 @@ fn variants() -> Vec<Variant> {
             defines: Box::leak(vec![("KTIR_TRANSPOSE_B", tb)].into_boxed_slice()),
         });
     }
-    // simdgroup matmul — 2 variants.
+    // simdgroup matmul — 4 variants {transpose_b 0|1} x {f32 | f16-B} (no small-M).
     for &tb in &[0u32, 1] {
-        let stem: &'static str = Box::leak(format!("simd_matmul__tb{tb}").into_boxed_str());
-        v.push(V {
-            stem,
-            shader: SHADER_SIMD,
-            defines: Box::leak(vec![("KTIR_TRANSPOSE_B", tb)].into_boxed_slice()),
-        });
+        for &f16b in &[0u32, 1] {
+            let mut defs: Vec<(&'static str, u32)> = vec![("KTIR_TRANSPOSE_B", tb)];
+            if f16b == 1 {
+                defs.push(("KTIR_B_F16", 1));
+            }
+            let stem: &'static str =
+                Box::leak(format!("simd_matmul__tb{tb}_f16b{f16b}").into_boxed_str());
+            v.push(V {
+                stem,
+                shader: SHADER_SIMD,
+                defines: Box::leak(defs.into_boxed_slice()),
+            });
+        }
     }
     v
 }

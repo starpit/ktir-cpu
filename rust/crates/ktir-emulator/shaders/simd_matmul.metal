@@ -1,6 +1,19 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// B (weight) operand element type. Default f32; KTIR_B_F16=1 reads B as `half`
+// directly (the KTIR_F16_WEIGHTS path — half the bytes streamed). B is staged
+// into a `float` threadgroup tile either way (the half is widened on load), so
+// the matmul math is bit-identical; only the device load width changes.
+#ifndef KTIR_B_F16
+#define KTIR_B_F16 0
+#endif
+#if KTIR_B_F16
+typedef half  ktir_bt;
+#else
+typedef float ktir_bt;
+#endif
+
 inline float simd_epilogue(float v, float ev, uint binop, uint act) {
     switch (binop) {
         case 1: v = v + ev; break;  case 2: v = v * ev; break;
@@ -17,7 +30,7 @@ inline float simd_epilogue(float v, float ev, uint binop, uint act) {
 
 [[kernel]] void matmul(
     device const float* a_in [[buffer(0)]],
-    device const float* b_in [[buffer(1)]],
+    device const ktir_bt* b_in [[buffer(1)]],
     device float* c_out      [[buffer(2)]],
     constant uint3& dims     [[buffer(3)]],
     device const float* e_in [[buffer(4)]],
